@@ -1,0 +1,10 @@
+{
+    "extends": "$app/tsconfig",
+    "compilerOptions": {
+        "noImplicitOverride": true,
+        "noUncheckedIndexedAccess": true,
+        "sourceMap": true,
+        "strict": true
+    },
+    "include": ["src", "vite.config.ts", "playwright.config.ts"]
+}

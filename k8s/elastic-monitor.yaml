@@ -1,0 +1,559 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: elastic-monitor
+  namespace: elastic-system
+spec:
+  version: 8.19.22
+  podDisruptionBudget: {}
+  nodeSets:
+    - name: main
+      count: 1
+      config:
+        # Auto-delete legacy monitoring data after 7 days
+        xpack.monitoring.history.duration: 7d
+      # if not setting max_map_count in an init container, then use this setting
+      #node.store.allow_mmap: false
+      podTemplate:
+        spec:
+          containers:
+            - name: elasticsearch
+              env:
+                - name: ES_JAVA_OPTS
+                  value: -Xms3g -Xmx3g
+              resources:
+                requests:
+                  memory: 6Gi
+                  cpu: 1
+                limits:
+                  memory: 6Gi
+                  cpu: 1
+          # related to "node.store.allow_mmap: false" setting above
+          initContainers:
+            - name: sysctl
+              securityContext:
+                privileged: true
+                runAsUser: 0
+              command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 500Gi
+            storageClassName: managed-csi-premium
+
+---
+# Job to configure ILM retention policies and reset elastic password after ES is ready.
+# Requires a pre-existing secret: elastic-monitor-password (create once manually):
+#   kubectl create secret generic elastic-monitor-password -n elastic-system --from-literal=password=YOUR_PASSWORD
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: elastic-monitor-configure-ilm
+  namespace: elastic-system
+spec:
+  # Run daily to ensure policies stay applied (Fleet can override on upgrades)
+  schedule: "30 3 * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: configure-ilm
+              image: curlimages/curl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  ES_URL="https://elastic-monitor-es-http.elastic-system.svc:9200"
+                  RETENTION_DAYS=7
+
+                  echo "=== Configuring elastic-monitor ==="
+
+                  # Wait for ES to be ready (use ECK-generated password first)
+                  for i in $(seq 1 30); do
+                    if [ "$(curl -sk -o /dev/null -w '%{http_code}' -u "elastic:${ECK_PASSWORD}" "$ES_URL/_cluster/health")" = "200" ]; then
+                      AUTH="elastic:${ECK_PASSWORD}"
+                      echo "ES ready (ECK password)"
+                      break
+                    elif [ "$(curl -sk -o /dev/null -w '%{http_code}' -u "elastic:${STATIC_PASSWORD}" "$ES_URL/_cluster/health")" = "200" ]; then
+                      AUTH="elastic:${STATIC_PASSWORD}"
+                      echo "ES ready (static password)"
+                      break
+                    fi
+                    echo "Waiting for ES... ($i/30)"
+                    sleep 10
+                  done
+
+                  if [ -z "$AUTH" ]; then
+                    echo "ERROR: Could not connect to ES"
+                    exit 1
+                  fi
+
+                  # Ensure monitor-admin user exists with superuser role and static password
+                  echo "Creating/updating monitor-admin user..."
+                  UPSERT_RESP=$(curl -sk -w "\n%{http_code}" -u "$AUTH" -X POST "$ES_URL/_security/user/monitor-admin" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"password\": \"${STATIC_PASSWORD}\", \"roles\": [\"superuser\"], \"full_name\": \"Monitor Admin\"}")
+                  UPSERT_BODY=$(echo "$UPSERT_RESP" | sed '$d')
+                  UPSERT_CODE=$(echo "$UPSERT_RESP" | tail -1)
+                  if [ "$UPSERT_CODE" = "200" ]; then
+                    AUTH="monitor-admin:${STATIC_PASSWORD}"
+                    echo "monitor-admin user ready"
+                  else
+                    echo "WARNING: Failed to upsert monitor-admin (HTTP $UPSERT_CODE): $UPSERT_BODY"
+                  fi
+
+                  # Determine working auth
+                  if [ "$(curl -sk -o /dev/null -w '%{http_code}' -u "monitor-admin:${STATIC_PASSWORD}" "$ES_URL/_cluster/health")" = "200" ]; then
+                    AUTH="monitor-admin:${STATIC_PASSWORD}"
+                    echo "Using monitor-admin"
+                  elif [ "$(curl -sk -o /dev/null -w '%{http_code}' -u "elastic:${ECK_PASSWORD}" "$ES_URL/_cluster/health")" = "200" ]; then
+                    AUTH="elastic:${ECK_PASSWORD}"
+                    echo "Using ECK password"
+                  else
+                    echo "ERROR: No working auth"
+                    exit 1
+                  fi
+
+                  # 1. Create/update ILM policy with rollover + delete
+                  echo "Creating ILM policy: monitor-cleanup-${RETENTION_DAYS}d"
+                  curl -sk -u "$AUTH" -X PUT "$ES_URL/_ilm/policy/monitor-cleanup-${RETENTION_DAYS}d" \
+                    -H "Content-Type: application/json" -d '{
+                    "policy": {
+                      "phases": {
+                        "hot": {
+                          "actions": {
+                            "rollover": {
+                              "max_age": "1d",
+                              "max_primary_shard_size": "50gb"
+                            }
+                          }
+                        },
+                        "delete": {
+                          "min_age": "'${RETENTION_DAYS}d'",
+                          "actions": {
+                            "delete": {}
+                          }
+                        }
+                      }
+                    }
+                  }'
+                  echo ""
+
+                  # 2. Update built-in ILM policies that Fleet/monitoring use
+                  for POLICY in logs metrics synthetics .monitoring-8-ilm-policy; do
+                    echo "Updating built-in ILM policy: $POLICY"
+                    curl -sk -u "$AUTH" -X PUT "$ES_URL/_ilm/policy/$POLICY" \
+                      -H "Content-Type: application/json" -d '{
+                      "policy": {
+                        "phases": {
+                          "hot": {
+                            "actions": {
+                              "rollover": {
+                                "max_age": "1d",
+                                "max_primary_shard_size": "50gb"
+                              }
+                            }
+                          },
+                          "delete": {
+                            "min_age": "'${RETENTION_DAYS}d'",
+                            "actions": {
+                              "delete": {}
+                            }
+                          }
+                        }
+                      }
+                    }'
+                    echo ""
+                  done
+
+                  # 3. Apply policy to APM/OTel index templates via @custom component templates
+                  for TPL in traces-apm logs-apm metrics-apm traces-apm.rum; do
+                    echo "Updating component template: ${TPL}@custom"
+                    curl -sk -u "$AUTH" -X PUT "$ES_URL/_component_template/${TPL}@custom" \
+                      -H "Content-Type: application/json" -d '{
+                      "template": {
+                        "settings": {
+                          "index.lifecycle.name": "monitor-cleanup-'${RETENTION_DAYS}'d"
+                        }
+                      }
+                    }'
+                    echo ""
+                  done
+
+                  # 4. Set replicas=0 on all indices (single node)
+                  echo "Setting replicas=0"
+                  curl -sk -u "$AUTH" -X PUT "$ES_URL/_settings" \
+                    -H "Content-Type: application/json" -d '{"index.number_of_replicas": 0}'
+                  echo ""
+
+                  # 5. Apply policy to existing indices missing lifecycle
+                  echo "Applying policy to existing indices..."
+                  curl -sk -u "$AUTH" "$ES_URL/_cat/indices?h=index&format=json" | \
+                    grep -o '"index":"[^"]*"' | awk -F'"' '{print $4}' | \
+                    grep -v "^\.kibana\|^\.security\|^\.fleet\|^\.geoip\|^\.apm-custom\|^\.internal" | \
+                    while read idx; do
+                      curl -sk -u "$AUTH" -X PUT "$ES_URL/$idx/_settings" \
+                        -H "Content-Type: application/json" \
+                        -d '{"index.lifecycle.name": "monitor-cleanup-'${RETENTION_DAYS}'d"}' 2>/dev/null
+                    done
+                  echo ""
+
+                  echo "=== Configuration complete ==="
+              env:
+                - name: ECK_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: elastic-monitor-es-elastic-user
+                      key: elastic
+                      optional: true
+                - name: STATIC_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: elastic-monitor-password
+                      key: password
+
+---
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: kibana-monitor
+  namespace: elastic-system
+spec:
+  version: 8.19.22
+  count: 1
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
+  elasticsearchRef:
+    name: elastic-monitor
+  config:
+    server.publicBaseUrl: https://kibana.exceptionless.io
+    xpack.fleet.agents.elasticsearch.hosts:
+      ["https://elastic-monitor-es-http.elastic-system.svc:9200"]
+    xpack.fleet.agents.fleet_server.hosts:
+      ["https://fleet-server-agent-http.elastic-system.svc:8220"]
+    xpack.fleet.packages:
+      - name: system
+        version: latest
+      - name: elastic_agent
+        version: latest
+      - name: fleet_server
+        version: latest
+      - name: kubernetes
+        version: latest
+      - name: apm
+        version: latest
+    xpack.fleet.agentPolicies:
+      - name: Fleet Server on ECK policy
+        id: eck-fleet-server
+        namespace: default
+        advanced_settings:
+          agent_logging_level: warning
+        monitoring_enabled:
+          - logs
+          - metrics
+        unenroll_timeout: 900
+        package_policies:
+          - name: fleet_server-1
+            id: fleet_server-1
+            package:
+              name: fleet_server
+      - name: Elastic Agent on ECK policy
+        id: eck-agent
+        namespace: default
+        advanced_settings:
+          agent_logging_level: warning
+        monitoring_enabled:
+          - logs
+          - metrics
+        unenroll_timeout: 900
+        package_policies:
+          - package:
+              name: system
+            name: system-1
+          - package:
+              name: kubernetes
+            name: kubernetes-1
+          - package:
+              name: apm
+            name: apm-1
+            inputs:
+              - type: apm
+                enabled: true
+                vars:
+                  - name: host
+                    value: 0.0.0.0:8200
+
+---
+apiVersion: alb.networking.azure.io/v1
+kind: IngressExtension
+metadata:
+  name: elastic-monitor-http-to-https
+  namespace: elastic-system
+spec:
+  rules:
+    - host: kibana.exceptionless.io
+      requestRedirect:
+        statusCode: 301
+        scheme: https
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: elastic-monitor
+  namespace: elastic-system
+  annotations:
+    alb.networking.azure.io/alb-name: public-alb
+    alb.networking.azure.io/alb-namespace: kube-system
+    alb.networking.azure.io/alb-frontend: elastic-monitor-fe
+    cert-manager.io/cluster-issuer: cert-manager-webhook-dnsimple-production
+spec:
+  ingressClassName: azure-alb-external
+  tls:
+    - hosts:
+        - kibana.exceptionless.io
+      secretName: elastic-monitor-kibana-tls
+  rules:
+    - host: kibana.exceptionless.io
+      http:
+        paths:
+          - path: "/"
+            pathType: Prefix
+            backend:
+              service:
+                name: kibana-monitor-kb-http
+                port:
+                  number: 5601
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: elastic-monitor-http
+  namespace: elastic-system
+  annotations:
+    alb.networking.azure.io/alb-name: public-alb
+    alb.networking.azure.io/alb-namespace: kube-system
+    alb.networking.azure.io/alb-frontend: elastic-monitor-fe
+    alb.networking.azure.io/alb-ingress-extension: elastic-monitor-http-to-https
+spec:
+  ingressClassName: azure-alb-external
+  rules:
+    - host: kibana.exceptionless.io
+      http:
+        paths:
+          - path: "/"
+            pathType: Prefix
+            backend:
+              service:
+                name: kibana-monitor-kb-http
+                port:
+                  number: 5601
+
+---
+apiVersion: agent.k8s.elastic.co/v1alpha1
+kind: Agent
+metadata:
+  name: fleet-server
+  namespace: elastic-system
+spec:
+  version: 8.19.22
+  kibanaRef:
+    name: kibana-monitor
+  elasticsearchRefs:
+    - name: elastic-monitor
+  mode: fleet
+  fleetServerEnabled: true
+  policyID: eck-fleet-server
+  deployment:
+    replicas: 1
+    podTemplate:
+      spec:
+        serviceAccountName: fleet-server
+        automountServiceAccountToken: true
+        securityContext:
+          runAsUser: 0
+
+---
+apiVersion: agent.k8s.elastic.co/v1alpha1
+kind: Agent
+metadata:
+  name: elastic-agent
+  namespace: elastic-system
+spec:
+  version: 8.19.22
+  kibanaRef:
+    name: kibana-monitor
+  fleetServerRef:
+    name: fleet-server
+  mode: fleet
+  policyID: eck-agent
+  daemonSet:
+    podTemplate:
+      spec:
+        serviceAccountName: elastic-agent
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        automountServiceAccountToken: true
+        securityContext:
+          runAsUser: 0
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apm
+  namespace: elastic-system
+spec:
+  selector:
+    agent.k8s.elastic.co/name: elastic-agent
+  ports:
+    - protocol: TCP
+      port: 8200
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fleet-server
+  namespace: elastic-system
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - namespaces
+      - nodes
+    verbs:
+      - get
+      - watch
+      - list
+  - apiGroups: ["coordination.k8s.io"]
+    resources:
+      - leases
+    verbs:
+      - get
+      - create
+      - update
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fleet-server
+  namespace: elastic-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fleet-server
+subjects:
+  - kind: ServiceAccount
+    name: fleet-server
+    namespace: elastic-system
+roleRef:
+  kind: ClusterRole
+  name: fleet-server
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: elastic-agent
+  namespace: elastic-system
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - nodes
+      - namespaces
+      - events
+      - services
+      - configmaps
+      - persistentvolumeclaims
+      - persistentvolumes
+    verbs:
+      - get
+      - watch
+      - list
+  - apiGroups: ["storage.k8s.io"]
+    resources:
+      - storageclasses
+    verbs:
+      - get
+      - watch
+      - list
+  - apiGroups: ["coordination.k8s.io"]
+    resources:
+      - leases
+    verbs:
+      - get
+      - create
+      - update
+  - nonResourceURLs:
+      - "/metrics"
+    verbs:
+      - get
+  - apiGroups: ["extensions"]
+    resources:
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups: ["apps"]
+    resources:
+      - statefulsets
+      - deployments
+      - replicasets
+      - daemonsets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups: [""]
+    resources:
+      - nodes/stats
+    verbs:
+      - get
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs:
+      - get
+      - list
+      - watch
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastic-agent
+  namespace: elastic-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: elastic-agent
+subjects:
+  - kind: ServiceAccount
+    name: elastic-agent
+    namespace: elastic-system
+roleRef:
+  kind: ClusterRole
+  name: elastic-agent
+  apiGroup: rbac.authorization.k8s.io

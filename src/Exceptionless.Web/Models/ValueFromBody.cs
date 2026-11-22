@@ -1,13 +1,14 @@
-﻿using System;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 
-namespace Exceptionless.Web.Models {
-    [DebuggerDisplay("{Value}")]
-    public class ValueFromBody<T> {
-        public ValueFromBody(T value) {
-            Value = value;
-        }
+namespace Exceptionless.Web.Models;
 
-        public T Value { get; set; }
+[DebuggerDisplay("{Value}")]
+public record ValueFromBody<T>
+{
+    public ValueFromBody(T value)
+    {
+        Value = value;
     }
+
+    public T Value { get; set; }
 }

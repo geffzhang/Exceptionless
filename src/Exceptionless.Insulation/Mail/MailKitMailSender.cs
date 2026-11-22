@@ -1,67 +1,109 @@
-﻿using System;
-using System.Threading.Tasks;
-using Exceptionless.Core;
-using Exceptionless.Core.Extensions;
+﻿using System.Diagnostics;
+using Exceptionless.Core.Configuration;
 using Exceptionless.Core.Mail;
-using Foundatio.Utility;
+using MailKit;
 using MailKit.Net.Smtp;
 using MailKit.Security;
+using Microsoft.Extensions.Logging;
 using MimeKit;
 using MailMessage = Exceptionless.Core.Queues.Models.MailMessage;
 
-namespace Exceptionless.Insulation.Mail {
-    public class MailKitMailSender : IMailSender {
-        public async Task SendAsync(MailMessage model) {
-            var message = CreateMailMessage(model);
-            message.Headers.Add("X-Mailer-Machine", Environment.MachineName);
-            message.Headers.Add("X-Mailer-Date", SystemClock.UtcNow.ToString());
-            message.Headers.Add("X-Auto-Response-Suppress", "All");
-            message.Headers.Add("Auto-Submitted", "auto-generated");
+namespace Exceptionless.Insulation.Mail;
 
-            using (var client = new SmtpClient()) {
-                client.ServerCertificateValidationCallback = (s, c, h, e) => true;
+public class MailKitMailSender : IMailSender
+{
+    private readonly EmailOptions _emailOptions;
+    private readonly TimeProvider _timeProvider;
+    private readonly ILogger _logger;
 
-                await client.ConnectAsync(Settings.Current.SmtpHost, Settings.Current.SmtpPort, GetSecureSocketOption(Settings.Current.SmtpEncryption)).AnyContext();
+    public MailKitMailSender(EmailOptions emailOptions, TimeProvider timeProvider, ILoggerFactory loggerFactory)
+    {
+        _emailOptions = emailOptions;
+        _timeProvider = timeProvider;
+        _logger = loggerFactory.CreateLogger<MailKitMailSender>();
+    }
 
-                // Note: since we don't have an OAuth2 token, disable the XOAUTH2 authentication mechanism.
-                client.AuthenticationMechanisms.Remove("XOAUTH2");
+    public async Task SendAsync(MailMessage model)
+    {
+        string? host = _emailOptions.SmtpHost;
+        if (String.IsNullOrEmpty(host))
+            throw new Exception("Email Host is not configured");
 
-                if (!String.IsNullOrEmpty(Settings.Current.SmtpUser))
-                    await client.AuthenticateAsync(Settings.Current.SmtpUser, Settings.Current.SmtpPassword).AnyContext();
+        _logger.LogTrace("Creating Mail Message from model");
 
-                await client.SendAsync(message).AnyContext();
-                await client.DisconnectAsync(true).AnyContext();
-            }
+        var message = CreateMailMessage(model);
+        message.Headers.Add("X-Mailer-Machine", Environment.MachineName);
+        message.Headers.Add("X-Mailer-Date", _timeProvider.GetUtcNow().UtcDateTime.ToString());
+        message.Headers.Add("X-Auto-Response-Suppress", "All");
+        message.Headers.Add("Auto-Submitted", "auto-generated");
+
+        using var client = new SmtpClient(new ExtensionsProtocolLogger(_logger));
+        int port = _emailOptions.SmtpPort;
+        var encryption = GetSecureSocketOption(_emailOptions.SmtpEncryption);
+        _logger.LogTrace("Connecting to SMTP server: {SmtpHost}:{SmtpPort} using {Encryption}", host, port, encryption);
+
+        var sw = Stopwatch.StartNew();
+        await client.ConnectAsync(host, port, encryption);
+        _logger.LogTrace("Connected to SMTP server took {Duration:g}", sw.Elapsed);
+
+        // Note: since we don't have an OAuth2 token, disable the XOAUTH2 authentication mechanism.
+        client.AuthenticationMechanisms.Remove("XOAUTH2");
+
+        string? user = _emailOptions.SmtpUser;
+        if (!String.IsNullOrEmpty(user) && !String.IsNullOrEmpty(_emailOptions.SmtpPassword))
+        {
+            _logger.LogTrace("Authenticating {SmtpUser} to SMTP server", user);
+            sw.Restart();
+            await client.AuthenticateAsync(user, _emailOptions.SmtpPassword);
+            _logger.LogTrace("Authenticated to SMTP server took {Duration:g}", sw.Elapsed);
         }
 
-        private SecureSocketOptions GetSecureSocketOption(SmtpEncryption encryption) {
-            switch (encryption) {
-                case SmtpEncryption.StartTLS:
-                    return SecureSocketOptions.StartTls;
-                case SmtpEncryption.SSL:
-                    return SecureSocketOptions.SslOnConnect;
-                default:
-                    return SecureSocketOptions.Auto;
-            }
+        _logger.LogTrace("Sending message: to={To} subject={Subject}", message.To, message.Subject);
+        sw.Restart();
+        await client.SendAsync(message);
+        _logger.LogTrace("Sent Message took {Duration:g}", sw.Elapsed);
+
+        sw.Restart();
+        await client.DisconnectAsync(true);
+        _logger.LogTrace("Disconnected from SMTP server took {Duration:g}", sw.Elapsed);
+        sw.Stop();
+    }
+
+    private SecureSocketOptions GetSecureSocketOption(SmtpEncryption encryption)
+    {
+        switch (encryption)
+        {
+            case SmtpEncryption.StartTLS:
+                return SecureSocketOptions.StartTls;
+            case SmtpEncryption.SSL:
+                return SecureSocketOptions.SslOnConnect;
+            default:
+                return SecureSocketOptions.None;
         }
+    }
 
-        private MimeMessage CreateMailMessage(MailMessage notification) {
-            var message = new MimeMessage { Subject = notification.Subject };
-            var builder = new BodyBuilder();
+    private MimeMessage CreateMailMessage(MailMessage notification)
+    {
+        var message = new MimeMessage { Subject = notification.Subject };
+        var builder = new BodyBuilder();
 
-            if (!String.IsNullOrEmpty(notification.To))
-                message.To.AddRange(InternetAddressList.Parse(notification.To));
+        if (!String.IsNullOrEmpty(notification.To))
+            message.To.AddRange(InternetAddressList.Parse(notification.To));
 
-            if (!String.IsNullOrEmpty(notification.From))
-                message.From.AddRange(InternetAddressList.Parse(notification.From));
-            else
-                message.From.AddRange(InternetAddressList.Parse(Settings.Current.SmtpFrom));
+        if (!String.IsNullOrEmpty(notification.From))
+            message.From.AddRange(InternetAddressList.Parse(notification.From));
+        else if (!String.IsNullOrEmpty(_emailOptions.SmtpFrom))
+            message.From.AddRange(InternetAddressList.Parse(_emailOptions.SmtpFrom));
+        else
+            throw new ArgumentException("Email SmtpFrom not configured", nameof(notification));
 
-            if (!String.IsNullOrEmpty(notification.Body))
-                builder.HtmlBody = notification.Body;
+        if (!String.IsNullOrEmpty(notification.ReplyTo))
+            message.ReplyTo.AddRange(InternetAddressList.Parse(notification.ReplyTo));
 
-            message.Body = builder.ToMessageBody();
-            return message;
-        }
+        if (!String.IsNullOrEmpty(notification.Body))
+            builder.HtmlBody = notification.Body;
+
+        message.Body = builder.ToMessageBody();
+        return message;
     }
 }

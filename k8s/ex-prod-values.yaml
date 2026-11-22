@@ -1,0 +1,53 @@
+appMode: Production
+appScope: prod
+# Dedicated public-alb association subnet (ex-net-v6/ex-agc); update with gateway network changes.
+forwardedHeaders:
+  knownNetworks:
+    - 10.60.64.0/24
+app:
+  minReplicaCount: 2
+  maxReplicaCount: 5
+  defaultDomain: be.exceptionless.io
+  domains:
+    - be.exceptionless.io
+    - app.exceptionless.io
+    - app.exceptionless.com
+api:
+  minReplicaCount: 2
+  maxReplicaCount: 5
+  defaultDomain: collector.exceptionless.io
+  domains:
+    - collector.exceptionless.io
+    - collector.exceptionless.com
+    - api.exceptionless.io
+    - api.exceptionless.com
+    - config.exceptionless.io
+    - heartbeat.exceptionless.io
+jobs:
+  eventPosts:
+    minReplicaCount: 2
+    maxReplicaCount: 10
+  workitem:
+    minReplicaCount: 2
+    maxReplicaCount: 5
+
+config:
+  EX_ClientSetupShowServerUrl: "false"
+  EX_EnableSnapshotJobs: "true"
+  EX_SmtpFrom: "Exceptionless <noreply@exceptionless.io>"
+  EX_ContactEmailAddress: "support@exceptionless.com"
+  EX_TestEmailAddress: "test@exceptionless.io"
+  EX_EnableArchive: "false"
+  EX_Serilog__MinimumLevel__Default: "Warning"
+  EX_Apm__EnableLogs: "true"
+  EX_Apm__FullDetails: "true"
+  EX_OTEL_TRACES_SAMPLER: "parentbased_traceidratio"
+  EX_OTEL_TRACES_SAMPLER_ARG: "0.1"
+  EX_OTEL_LOG_LEVEL: "warn"
+
+ingress:
+  enabled: true
+  clusterIssuer: cert-manager-webhook-dnsimple-production
+  albName: public-alb
+  albNamespace: kube-system
+  appRequestTimeout: 3m

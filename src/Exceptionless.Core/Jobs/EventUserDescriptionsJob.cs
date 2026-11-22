@@ -1,59 +1,72 @@
-﻿using System;
-using System.Linq;
-using System.Threading.Tasks;
-using Exceptionless.Core.Extensions;
+﻿using Exceptionless.Core.Models;
+using Exceptionless.Core.Models.Data;
 using Exceptionless.Core.Queues.Models;
 using Exceptionless.Core.Repositories;
-using Exceptionless.Core.Repositories.Base;
-using Exceptionless.Core.Models.Data;
 using Foundatio.Jobs;
 using Foundatio.Queues;
+using Foundatio.Repositories.Exceptions;
+using Foundatio.Repositories.Extensions;
+using Foundatio.Resilience;
 using Microsoft.Extensions.Logging;
 
-#pragma warning disable 1998
+namespace Exceptionless.Core.Jobs;
 
-namespace Exceptionless.Core.Jobs {
-    [Job(Description = "Processes queued event user descriptions.", InitialDelay = "3s")]
-    public class EventUserDescriptionsJob : QueueJobBase<EventUserDescription> {
-        private readonly IEventRepository _eventRepository;
+[Job(Description = "Processes queued event user descriptions.", InitialDelay = "3s")]
+public class EventUserDescriptionsJob : QueueJobBase<EventUserDescription>
+{
+    private readonly IEventRepository _eventRepository;
 
-        public EventUserDescriptionsJob(IQueue<EventUserDescription> queue, IEventRepository eventRepository, ILoggerFactory loggerFactory = null) : base(queue, loggerFactory) {
-            _eventRepository = eventRepository;
+    public EventUserDescriptionsJob(IQueue<EventUserDescription> queue, IEventRepository eventRepository, TimeProvider timeProvider,
+        IResiliencePolicyProvider resiliencePolicyProvider, ILoggerFactory loggerFactory) : base(queue, timeProvider, resiliencePolicyProvider, loggerFactory)
+    {
+        _eventRepository = eventRepository;
+    }
+
+    protected override async Task<JobResult> ProcessQueueEntryAsync(QueueEntryContext<EventUserDescription> context)
+    {
+        var description = context.QueueEntry.Value;
+
+        _logger.LogTrace("Processing user description: id={0}", context.QueueEntry.Id);
+
+        try
+        {
+            await ProcessUserDescriptionAsync(description);
+            _logger.LogInformation("Processed user description: id={Id}", context.QueueEntry.Id);
+        }
+        catch (DocumentNotFoundException ex)
+        {
+            _logger.LogError(ex, "An event with this reference id {ReferenceId} has not been processed yet or was deleted. Queue Id: {Id}", ex.Id, context.QueueEntry.Id);
+            return JobResult.FromException(ex);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "An error occurred while processing the EventUserDescription {Id}: {Message}", context.QueueEntry.Id, ex.Message);
+            return JobResult.FromException(ex);
         }
 
-        protected override async Task<JobResult> ProcessQueueEntryAsync(QueueEntryContext<EventUserDescription> context) {
-            _logger.LogTrace("Processing user description: id={0}", context.QueueEntry.Id);
+        return JobResult.Success;
+    }
 
-            try {
-                await ProcessUserDescriptionAsync(context.QueueEntry.Value).AnyContext();
-                _logger.LogInformation("Processed user description: id={Id}", context.QueueEntry.Id);
-            } catch (DocumentNotFoundException ex){
-                _logger.LogError(ex, "An event with this reference id {ReferenceId} has not been processed yet or was deleted. Queue Id: {Id}", ex.Id, context.QueueEntry.Id);
-                return JobResult.FromException(ex);
-            } catch (Exception ex) {
-                _logger.LogError(ex, "An error occurred while processing the EventUserDescription {Id}: {Message}", context.QueueEntry.Id, ex.Message);
-                return JobResult.FromException(ex);
-            }
+    private async Task ProcessUserDescriptionAsync(EventUserDescription description)
+    {
+        var ev = (await _eventRepository.GetByReferenceIdAsync(description.ProjectId, description.ReferenceId)).Documents.FirstOrDefault();
+        if (ev is null)
+            throw new DocumentNotFoundException(description.ReferenceId);
 
-            return JobResult.Success;
+        var ud = new UserDescription
+        {
+            EmailAddress = description.EmailAddress,
+            Description = description.Description
+        };
+
+        if (description.Data is not null && description.Data.Count > 0)
+        {
+            ev.Data ??= new DataDictionary();
+            ev.Data.AddRange(description.Data);
         }
-        
-        private async Task ProcessUserDescriptionAsync(EventUserDescription description) {
-            var ev = (await _eventRepository.GetByReferenceIdAsync(description.ProjectId, description.ReferenceId).AnyContext()).Documents.FirstOrDefault();
-            if (ev == null)
-                throw new DocumentNotFoundException(description.ReferenceId);
 
-            var ud = new UserDescription {
-                EmailAddress = description.EmailAddress,
-                Description = description.Description
-            };
+        ev.SetUserDescription(ud);
 
-            if (description.Data.Count > 0)
-                ev.Data.AddRange(description.Data);
-
-            ev.SetUserDescription(ud);
-
-            await _eventRepository.SaveAsync(ev).AnyContext();
-        }
+        await _eventRepository.SaveAsync(ev);
     }
 }

@@ -1,0 +1,40 @@
+appMode: Staging
+appScope: dev
+# Dedicated public-alb association subnet (ex-net-v6/ex-agc); update with gateway network changes.
+forwardedHeaders:
+  knownNetworks:
+    - 10.60.64.0/24
+app:
+  image:
+    repository: exceptionless/app-ci
+  defaultDomain: dev-app.exceptionless.io
+  domains:
+    - dev-app.exceptionless.io
+api:
+  image:
+    repository: exceptionless/api-ci
+  defaultDomain: dev-collector.exceptionless.io
+  domains:
+    - dev-api.exceptionless.io
+    - dev-collector.exceptionless.io
+jobs:
+  image:
+    repository: exceptionless/job-ci
+
+config:
+  # Public client-scoped ingestion key for the hosted-dev Exceptionless project.
+  EX_ExceptionlessApiKey: "sdyW9LA7y2MbRGkdwTV8Ufdqw2250O0LGZuW1nV4"
+  EX_InternalProjectId: "6ac286ada7bf6e0001a886cf"
+  EX_EnableSnapshotJobs: "false"
+  EX_TestEmailAddress: "test@exceptionless.io"
+  EX_Serilog__MinimumLevel__Default: "Information"
+
+otel:
+  enabled: false
+
+ingress:
+  enabled: true
+  clusterIssuer: cert-manager-webhook-dnsimple-production
+  albName: public-alb
+  albNamespace: kube-system
+  appRequestTimeout: 3m

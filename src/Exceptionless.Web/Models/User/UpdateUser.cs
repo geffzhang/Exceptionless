@@ -1,8 +1,10 @@
-﻿using System;
+﻿using System.ComponentModel.DataAnnotations;
 
-namespace Exceptionless.Web.Models {
-    public class UpdateUser {
-        public string FullName { get; set; }
-        public bool EmailNotificationsEnabled { get; set; }
-    }
+namespace Exceptionless.Web.Models;
+
+public record UpdateUser
+{
+    [Required]
+    public string FullName { get; set; } = null!;
+    public bool EmailNotificationsEnabled { get; set; }
 }

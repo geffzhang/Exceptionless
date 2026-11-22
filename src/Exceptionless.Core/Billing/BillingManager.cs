@@ -1,251 +1,439 @@
-﻿using System;
-using System.Linq;
-using System.Threading.Tasks;
+﻿using Exceptionless.Core.Configuration;
 using Exceptionless.Core.Extensions;
+using Exceptionless.Core.Models;
 using Exceptionless.Core.Models.Billing;
 using Exceptionless.Core.Repositories;
-using Exceptionless.Core.Models;
-using Foundatio.Utility;
+using Exceptionless.Core.Services;
+using Exceptionless.DateTimeExtensions;
+using Foundatio.Caching;
+using Foundatio.Lock;
+using Foundatio.Repositories;
+using Foundatio.Repositories.Exceptions;
 
-namespace Exceptionless.Core.Billing {
-    public class BillingManager {
-        private readonly IOrganizationRepository _organizationRepository;
-        private readonly IProjectRepository _projectRepository;
-        private readonly IUserRepository _userRepository;
+namespace Exceptionless.Core.Billing;
 
-        public BillingManager(IOrganizationRepository organizationRepository, IProjectRepository projectRepository, IUserRepository userRepository) {
-            _organizationRepository = organizationRepository;
-            _projectRepository = projectRepository;
-            _userRepository = userRepository;
+public class BillingManager
+{
+    private static readonly TimeSpan BillingLockDuration = TimeSpan.FromMinutes(5);
+    private readonly ICacheClient _cacheClient;
+    private readonly ILockProvider _lockProvider;
+    private readonly IOrganizationRepository _organizationRepository;
+    private readonly IProjectRepository _projectRepository;
+    private readonly ITrialClaimRepository _trialClaimRepository;
+    private readonly IUserRepository _userRepository;
+    private readonly SystemSettingsService _systemSettingsService;
+    private readonly BillingPlans _plans;
+    private readonly BillingOptions _billingOptions;
+    private readonly TimeProvider _timeProvider;
+
+    public BillingManager(
+        ICacheClient cacheClient,
+        ILockProvider lockProvider,
+        IOrganizationRepository organizationRepository,
+        IProjectRepository projectRepository,
+        ITrialClaimRepository trialClaimRepository,
+        IUserRepository userRepository,
+        SystemSettingsService systemSettingsService,
+        BillingPlans plans,
+        AppOptions appOptions,
+        TimeProvider timeProvider)
+    {
+        _cacheClient = cacheClient;
+        _lockProvider = lockProvider;
+        _organizationRepository = organizationRepository;
+        _projectRepository = projectRepository;
+        _trialClaimRepository = trialClaimRepository;
+        _userRepository = userRepository;
+        _systemSettingsService = systemSettingsService;
+        _plans = plans;
+        _billingOptions = appOptions.BillingOptions;
+        _timeProvider = timeProvider;
+    }
+
+    public Task<ILock> AcquireOrganizationLockAsync(string organizationId)
+        => _lockProvider.AcquireAsync(GetOrganizationLockKey(organizationId), BillingLockDuration, TimeSpan.FromSeconds(30));
+
+    /// <summary>
+    /// Serializes creating Free or trial organizations and downgrades to Free for one owner, so concurrent requests
+    /// can't both pass the one-free-organization rule. It lasts as long as the billing lock because a downgrade holds
+    /// it across the same Stripe calls.
+    /// </summary>
+    public Task<ILock> AcquireOwnerFreeOrganizationLockAsync(string userId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(userId);
+
+        return _lockProvider.AcquireAsync(GetOwnerFreeOrganizationLockKey(userId), BillingLockDuration, TimeSpan.FromSeconds(30));
+    }
+
+    /// <summary>
+    /// Serializes trial starts for one mailbox, so two aliases of it can't both claim a trial at once.
+    /// </summary>
+    public Task<ILock> AcquireTrialEmailLockAsync(User user)
+    {
+        ArgumentNullException.ThrowIfNull(user);
+
+        return _lockProvider.AcquireAsync(GetTrialEmailLockKey(user.EmailAddress), BillingLockDuration, TimeSpan.FromSeconds(30));
+    }
+
+    public Task<ILock?> TryAcquireOrganizationLockAsync(string organizationId)
+        => _lockProvider.TryAcquireAsync(GetOrganizationLockKey(organizationId), BillingLockDuration, TimeSpan.Zero);
+
+    public async Task<bool> CanAddOrganizationAsync(User? user)
+    {
+        if (user is null)
+            return false;
+
+        var organizations = await GetFreeOrTrialOrganizationsCountedForAsync(user);
+        return organizations.Count is 0;
+    }
+
+    /// <summary>
+    /// A no-card trial is for a user who belongs to no organization and has no existing organizations they created,
+    /// whose mailbox hasn't claimed a trial in the last <see cref="BillingOptions.TrialClaimRetentionDays"/> days (under
+    /// another alias or a deleted account), and whose email isn't on a blocked disposable domain. Call it while holding
+    /// <see cref="AcquireTrialEmailLockAsync"/>.
+    /// </summary>
+    public async Task<bool> CanStartTrialAsync(User user)
+    {
+        ArgumentNullException.ThrowIfNull(user);
+
+        if (_billingOptions.TrialDays is <= 0 || user.OrganizationIds.Count is > 0)
+            return false;
+
+        if (user.TrialStartedUtc is { } trialStartedUtc && trialStartedUtc.IsAfter(GetTrialClaimCutoffUtc()))
+            return false;
+
+        var blockedEmailDomains = await _systemSettingsService.GetTrialBlockedEmailDomainsAsync();
+        if (TrialEmailAddress.IsBlockedDomain(user.EmailAddress, blockedEmailDomains))
+            return false;
+
+        var created = await _organizationRepository.CountAsync(q => q.FieldEquals(o => o.CreatedByUserId, user.Id));
+        if (created.Total is > 0)
+            return false;
+
+        var claim = await _trialClaimRepository.GetByIdAsync(TrialEmailAddress.GetClaimId(user.EmailAddress));
+        return !IsActiveClaim(claim);
+    }
+
+    public void StartTrial(Organization organization, User user)
+    {
+        ArgumentNullException.ThrowIfNull(organization);
+        ArgumentNullException.ThrowIfNull(user);
+
+        ApplyTrialPlan(organization, user);
+        user.TrialStartedUtc = _timeProvider.GetUtcNow().UtcDateTime;
+    }
+
+    /// <summary>
+    /// Tries to record the user's mailbox trial claim after confirming eligibility and before granting the trial, while
+    /// still holding <see cref="AcquireTrialEmailLockAsync"/>. The claim remains if subsequent organization creation
+    /// fails because the outcome of those writes may be uncertain.
+    /// </summary>
+    /// <returns>True only when this call created or renewed the mailbox claim; false when an active claim already exists.</returns>
+    public async Task<bool> TryClaimTrialAsync(User user)
+    {
+        ArgumentNullException.ThrowIfNull(user);
+
+        string claimId = TrialEmailAddress.GetClaimId(user.EmailAddress);
+        try
+        {
+            // Add is create-only: the normalized mailbox ID enforces uniqueness even without the lock.
+            await _trialClaimRepository.AddAsync(new TrialClaim { Id = claimId, CreatedUtc = _timeProvider.GetUtcNow().UtcDateTime });
+            return true;
         }
-
-        public async Task<bool> CanAddOrganizationAsync(User user) {
-            if (user == null)
+        catch (DuplicateDocumentException)
+        {
+            // Renew expired claims with a version check, so storage enforces uniqueness even if the mailbox lock is lost.
+            var claim = await _trialClaimRepository.GetByIdAsync(claimId);
+            if (IsActiveClaim(claim))
                 return false;
 
-            var organizations = (await _organizationRepository.GetByIdsAsync(user.OrganizationIds.ToArray()).AnyContext()).Where(o => o.PlanId == FreePlan.Id);
-            return !organizations.Any();
-        }
+            try
+            {
+                if (claim is null)
+                {
+                    // Cleanup removed the expired claim after the create failed; create-only admission still applies.
+                    await _trialClaimRepository.AddAsync(new TrialClaim { Id = claimId, CreatedUtc = _timeProvider.GetUtcNow().UtcDateTime });
+                }
+                else
+                {
+                    claim.CreatedUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                    await _trialClaimRepository.SaveAsync(claim);
+                }
 
-        public async Task<bool> CanAddUserAsync(Organization organization) {
-            if (String.IsNullOrWhiteSpace(organization?.Id))
+                return true;
+            }
+            catch (DocumentException ex) when (ex is DuplicateDocumentException or VersionConflictDocumentException)
+            {
                 return false;
-
-            long numberOfUsers = (await _userRepository.GetByOrganizationIdAsync(organization.Id).AnyContext()).Total + organization.Invites.Count;
-            return organization.MaxUsers <= -1 || numberOfUsers < organization.MaxUsers;
+            }
         }
+    }
 
-        public async Task<bool> CanAddProjectAsync(Project project) {
-            if (String.IsNullOrWhiteSpace(project?.OrganizationId))
-                return false;
+    /// <summary>
+    /// Removes trial claims older than <see cref="BillingOptions.TrialClaimRetentionDays"/>, so those mailboxes can trial again.
+    /// </summary>
+    public Task<long> RemoveExpiredTrialClaimsAsync()
+        => _trialClaimRepository.RemoveCreatedBeforeAsync(GetTrialClaimCutoffUtc());
 
-            var organization = await _organizationRepository.GetByIdAsync(project.OrganizationId).AnyContext();
-            if (organization == null)
-                return false;
+    private bool IsActiveClaim(TrialClaim? claim) => claim is not null && claim.CreatedUtc.IsAfter(GetTrialClaimCutoffUtc());
 
-            long projectCount = await _projectRepository.GetCountByOrganizationIdAsync(project.OrganizationId).AnyContext();
-            return organization.MaxProjects == -1 || projectCount < organization.MaxProjects;
-        }
+    private DateTime GetTrialClaimCutoffUtc() => _timeProvider.GetUtcNow().UtcDateTime.AddDays(-_billingOptions.TrialClaimRetentionDays);
 
-        public async Task<bool> HasPremiumFeaturesAsync(string organizationId) {
-            var organization = await _organizationRepository.GetByIdAsync(organizationId).AnyContext();
-            if (organization == null)
-                return false;
+    /// <summary>
+    /// Applies the trial plan and starts a full-length trial. Also used by admins to extend a trial.
+    /// </summary>
+    public void ApplyTrialPlan(Organization organization, User? user = null)
+    {
+        ArgumentNullException.ThrowIfNull(organization);
 
-            return organization.HasPremiumFeatures;
-        }
+        int trialDays = _billingOptions.TrialDays is > 0 ? _billingOptions.TrialDays : 14;
+        ApplyBillingPlan(organization, _plans.TrialPlan, user);
+        organization.TrialEndsUtc = _timeProvider.GetUtcNow().UtcDateTime.AddDays(trialDays);
+        organization.TrialReminderSentUtc = null;
+    }
 
-        public async Task<ChangePlanResult> CanDownGradeAsync(Organization organization, BillingPlan plan, User user) {
-            if (String.IsNullOrWhiteSpace(organization?.Id))
-                return ChangePlanResult.FailWithMessage("Invalid Organization");
+    public void EndTrial(Organization organization)
+    {
+        ArgumentNullException.ThrowIfNull(organization);
 
-            long currentNumberOfUsers = (await _userRepository.GetByOrganizationIdAsync(organization.Id).AnyContext()).Total + organization.Invites.Count;
-            int maxUsers = plan.MaxUsers != -1 ? plan.MaxUsers : Int32.MaxValue;
-            if (currentNumberOfUsers > maxUsers)
-                return ChangePlanResult.FailWithMessage($"Please remove {currentNumberOfUsers - maxUsers} user{((currentNumberOfUsers - maxUsers) > 0 ? "s" : String.Empty)} and try again.");
+        ApplyBillingPlan(organization, _plans.FreePlan);
+    }
 
-            int maxProjects = plan.MaxProjects != -1 ? plan.MaxProjects : Int32.MaxValue;
-            long projectCount = await _projectRepository.GetCountByOrganizationIdAsync(organization.Id).AnyContext();
-            if (projectCount > maxProjects)
-                return ChangePlanResult.FailWithMessage($"Please remove {projectCount - maxProjects} project{((projectCount - maxProjects) > 0 ? "s" : String.Empty)} and try again.");
+    public async Task<bool> CanAddUserAsync(Organization organization)
+    {
+        if (String.IsNullOrWhiteSpace(organization?.Id))
+            return false;
 
-            // Ensure the user can't be apart of more than one free plan.
-            if (String.Equals(plan.Id, FreePlan.Id) && user != null && (await _organizationRepository.GetByIdsAsync(user.OrganizationIds.ToArray()).AnyContext()).Any(o => String.Equals(o.PlanId, FreePlan.Id)))
+        if (organization.MaxUsers is BillingPlan.Unlimited)
+            return true;
+
+        var users = await _userRepository.GetByOrganizationIdAsync(organization.Id);
+        return users.Total + organization.Invites.Count < organization.MaxUsers;
+    }
+
+    public async Task<bool> CanAddProjectAsync(Project project)
+    {
+        if (String.IsNullOrWhiteSpace(project?.OrganizationId))
+            return false;
+
+        var organization = await _organizationRepository.GetByIdAsync(project.OrganizationId);
+        if (organization is null)
+            return false;
+
+        if (organization.MaxProjects is BillingPlan.Unlimited)
+            return true;
+
+        long projectCount = await _projectRepository.GetCountByOrganizationIdAsync(organization.Id);
+        return projectCount < organization.MaxProjects;
+    }
+
+    public async Task<bool> HasPremiumFeaturesAsync(string organizationId)
+    {
+        var organization = await _organizationRepository.GetByIdAsync(organizationId);
+        if (organization is null)
+            return false;
+
+        return organization.HasPremiumFeatures;
+    }
+
+    public async Task<ChangePlanResult> CanDownGradeAsync(Organization organization, BillingPlan plan, User? user)
+    {
+        if (String.IsNullOrWhiteSpace(organization?.Id))
+            return ChangePlanResult.FailWithMessage("Invalid Organization");
+
+        // Ensure the organization's owner can't own more than one free or trial organization, no matter which member downgrades it.
+        if (_plans.IsFreePlan(plan.Id) && user is not null)
+        {
+            bool hasOtherFreeOrTrialOrganization = await OwnerHasOtherFreeOrTrialOrganizationAsync(organization, user);
+            if (hasOtherFreeOrTrialOrganization)
                 return ChangePlanResult.FailWithMessage("You already have one free account. You are not allowed to create more than one free account.");
-
-            return new ChangePlanResult { Success = true };
         }
 
-        public static BillingPlan GetBillingPlan(string planId) {
-            return Plans.FirstOrDefault(p => String.Equals(p.Id, planId, StringComparison.OrdinalIgnoreCase));
+        string? limitError = await GetPlanLimitErrorAsync(organization, plan.MaxUsers, plan.MaxProjects);
+        if (limitError is not null)
+            return ChangePlanResult.FailWithMessage(limitError);
+
+        return new ChangePlanResult { Success = true };
+    }
+
+    private async Task<string?> GetPlanLimitErrorAsync(Organization organization, int maxUsers, int maxProjects)
+    {
+        if (maxUsers is >= 0)
+        {
+            var users = await _userRepository.GetByOrganizationIdAsync(organization.Id);
+            long excessUsers = users.Total + organization.Invites.Count - maxUsers;
+            if (excessUsers is > 0)
+                return $"Please remove {excessUsers} {(excessUsers is 1 ? "user or pending invitation" : "users or pending invitations")} and try again.";
         }
 
-        public static void ApplyBillingPlan(Organization organization, BillingPlan plan, User user = null, bool updateBillingPrice = true) {
-            organization.PlanId = plan.Id;
-            organization.PlanName = plan.Name;
-            organization.PlanDescription = plan.Description;
-            organization.BillingChangeDate = SystemClock.UtcNow;
-
-            if (updateBillingPrice)
-                organization.BillingPrice = plan.Price;
-
-            if (user != null)
-                organization.BillingChangedByUserId = user.Id;
-
-            organization.MaxUsers = plan.MaxUsers;
-            organization.MaxProjects = plan.MaxProjects;
-            organization.RetentionDays = plan.RetentionDays;
-            organization.MaxEventsPerMonth = plan.MaxEventsPerMonth;
-            organization.HasPremiumFeatures = plan.HasPremiumFeatures;
-
-            organization.SetMonthlyUsage(organization.GetCurrentMonthlyTotal(), organization.GetCurrentMonthlyBlocked(), organization.GetCurrentMonthlyTooBig());
+        if (maxProjects is >= 0)
+        {
+            long projectCount = await _projectRepository.GetCountByOrganizationIdAsync(organization.Id);
+            long excessProjects = projectCount - maxProjects;
+            if (excessProjects is > 0)
+                return $"Please remove {excessProjects} {(excessProjects is 1 ? "project" : "projects")} and try again.";
         }
 
-        public static BillingPlan FreePlan => new BillingPlan {
-            Id = "EX_FREE",
-            Name = "Free",
-            Description = "Free",
-            Price = 0,
-            MaxProjects = 1,
-            MaxUsers = 1,
-            RetentionDays = 3,
-            MaxEventsPerMonth = 3000,
-            HasPremiumFeatures = false
-        };
+        return null;
+    }
 
-        public static BillingPlan SmallPlan => new BillingPlan {
-            Id = "EX_SMALL",
-            Name = "Small",
-            Description = "Small ($15/month)",
-            Price = 15,
-            MaxProjects = 5,
-            MaxUsers = 10,
-            RetentionDays = 30,
-            MaxEventsPerMonth = 15000,
-            HasPremiumFeatures = true
-        };
+    public async Task<bool> UpdatePlanLimitSuspensionAsync(Organization organization)
+    {
+        if (organization.IsSuspended && organization.SuspensionCode is not SuspensionCode.PlanLimit)
+            return false;
 
-        public static BillingPlan SmallYearlyPlan => new BillingPlan {
-            Id = "EX_SMALL_YEARLY",
-            Name = "Small (Yearly)",
-            Description = "Small Yearly ($165/year - Save $15)",
-            Price = 165,
-            MaxProjects = 5,
-            MaxUsers = 10,
-            RetentionDays = 30,
-            MaxEventsPerMonth = 15000,
-            HasPremiumFeatures = true
-        };
+        string? error = await GetPlanLimitErrorAsync(organization, organization.MaxUsers, organization.MaxProjects);
+        if (error is null)
+        {
+            if (!organization.IsSuspended)
+                return false;
 
-        public static BillingPlan MediumPlan => new BillingPlan {
-            Id = "EX_MEDIUM",
-            Name = "Medium",
-            Description = "Medium ($49/month)",
-            Price = 49,
-            MaxProjects = 15,
-            MaxUsers = 25,
-            RetentionDays = 90,
-            MaxEventsPerMonth = 75000,
-            HasPremiumFeatures = true
-        };
+            organization.RemoveSuspension();
+            return true;
+        }
 
-        public static BillingPlan MediumYearlyPlan => new BillingPlan {
-            Id = "EX_MEDIUM_YEARLY",
-            Name = "Medium (Yearly)",
-            Description = "Medium Yearly ($539/year - Save $49)",
-            Price = 539,
-            MaxProjects = 15,
-            MaxUsers = 25,
-            RetentionDays = 90,
-            MaxEventsPerMonth = 75000,
-            HasPremiumFeatures = true
-        };
+        if (organization.IsSuspended && String.Equals(organization.SuspensionNotes, error, StringComparison.Ordinal))
+            return false;
 
-        public static BillingPlan LargePlan => new BillingPlan {
-            Id = "EX_LARGE",
-            Name = "Large",
-            Description = "Large ($99/month)",
-            Price = 99,
-            MaxProjects = -1,
-            MaxUsers = -1,
-            RetentionDays = 180,
-            MaxEventsPerMonth = 250000,
-            HasPremiumFeatures = true
-        };
+        organization.IsSuspended = true;
+        organization.SuspensionCode = SuspensionCode.PlanLimit;
+        organization.SuspensionDate = _timeProvider.GetUtcNow().UtcDateTime;
+        organization.SuspendedByUserId = StripeConstants.SystemUserId;
+        organization.SuspensionNotes = error;
+        return true;
+    }
 
-        public static BillingPlan LargeYearlyPlan => new BillingPlan {
-            Id = "EX_LARGE_YEARLY",
-            Name = "Large (Yearly)",
-            Description = "Large Yearly ($1,089/year - Save $99)",
-            Price = 1089,
-            MaxProjects = -1,
-            MaxUsers = -1,
-            RetentionDays = 180,
-            MaxEventsPerMonth = 250000,
-            HasPremiumFeatures = true
-        };
+    public async Task RecheckPlanLimitSuspensionAsync(string organizationId)
+    {
+        await using var billingLock = await AcquireOrganizationLockAsync(organizationId);
+        var organization = await _organizationRepository.GetByIdAsync(organizationId);
+        if (organization is null || organization.SuspensionCode is not SuspensionCode.PlanLimit)
+            return;
 
-        public static BillingPlan ExtraLargePlan => new BillingPlan {
-            Id = "EX_XL",
-            Name = "Extra Large",
-            Description = "Extra Large ($199/month)",
-            Price = 199,
-            MaxProjects = -1,
-            MaxUsers = -1,
-            RetentionDays = 180,
-            MaxEventsPerMonth = 1000000,
-            HasPremiumFeatures = true
-        };
+        bool changed = await UpdatePlanLimitSuspensionAsync(organization);
+        if (changed)
+            await _organizationRepository.SaveAsync(organization, command => command.Cache().Originals());
+    }
 
-        public static BillingPlan ExtraLargeYearlyPlan => new BillingPlan {
-            Id = "EX_XL_YEARLY",
-            Name = "Extra Large (Yearly)",
-            Description = "Extra Large Yearly ($2,189/year - Save $199)",
-            Price = 2189,
-            MaxProjects = -1,
-            MaxUsers = -1,
-            RetentionDays = 180,
-            MaxEventsPerMonth = 1000000,
-            HasPremiumFeatures = true
-        };
+    public BillingPlan? GetBillingPlan(string planId)
+    {
+        return _plans.Plans.FirstOrDefault(p => String.Equals(p.Id, planId, StringComparison.OrdinalIgnoreCase));
+    }
 
-        public static BillingPlan EnterprisePlan => new BillingPlan {
-            Id = "EX_ENT",
-            Name = "Enterprise",
-            Description = "Enterprise ($499/month)",
-            Price = 499,
-            MaxProjects = -1,
-            MaxUsers = -1,
-            RetentionDays = 180,
-            MaxEventsPerMonth = 3000000,
-            HasPremiumFeatures = true
-        };
+    public BillingPlan? GetBillingPlanByUpsellingRetentionPeriod(int retentionDays)
+    {
+        return _plans.Plans.Where(p => p.RetentionDays > retentionDays && p.Price > 0).OrderBy(p => p.RetentionDays).ThenBy(p => p.Price).FirstOrDefault();
+    }
 
-        public static BillingPlan EnterpriseYearlyPlan => new BillingPlan {
-            Id = "EX_ENT_YEARLY",
-            Name = "Enterprise (Yearly)",
-            Description = "Enterprise Yearly ($5,489/year - Save $499)",
-            Price = 5489,
-            MaxProjects = -1,
-            MaxUsers = -1,
-            RetentionDays = 180,
-            MaxEventsPerMonth = 3000000,
-            HasPremiumFeatures = true
-        };
+    public void ApplyBillingPlan(Organization organization, BillingPlan plan, User? user = null, bool updateBillingPrice = true)
+    {
+        organization.PlanId = plan.Id;
+        organization.PlanName = plan.Name;
+        organization.PlanDescription = plan.Description;
+        organization.BillingChangeDate = _timeProvider.GetUtcNow().UtcDateTime;
 
-        public static BillingPlan UnlimitedPlan => new BillingPlan {
-            Id = "EX_UNLIMITED",
-            Name = "Unlimited",
-            Description = "Unlimited",
-            IsHidden = true,
-            Price = 0,
-            MaxProjects = -1,
-            MaxUsers = -1,
-            RetentionDays = Settings.Current.MaximumRetentionDays,
-            MaxEventsPerMonth = -1,
-            HasPremiumFeatures = true
-        };
+        if (updateBillingPrice)
+            organization.BillingPrice = plan.Price;
 
-        public static readonly BillingPlan[] Plans = { FreePlan, SmallYearlyPlan, MediumYearlyPlan, LargeYearlyPlan, ExtraLargeYearlyPlan, EnterpriseYearlyPlan, SmallPlan, MediumPlan, LargePlan, ExtraLargePlan, EnterprisePlan, UnlimitedPlan };
+        if (user is not null)
+            organization.BillingChangedByUserId = user.Id;
+
+        organization.MaxUsers = plan.MaxUsers;
+        organization.MaxProjects = plan.MaxProjects;
+        organization.RetentionDays = plan.RetentionDays;
+        organization.MaxEventsPerMonth = plan.MaxEventsPerMonth;
+        organization.HasPremiumFeatures = plan.HasPremiumFeatures;
+
+        organization.GetCurrentUsage(_timeProvider).Limit = organization.GetMaxEventsPerMonthWithBonus(_timeProvider);
+    }
+
+    public void ApplyBonus(Organization organization, int bonusEvents, DateTime? expires = null)
+    {
+        organization.BonusEventsPerMonth = bonusEvents;
+        organization.BonusExpiration = expires;
+        organization.GetCurrentUsage(_timeProvider).Limit = organization.GetMaxEventsPerMonthWithBonus(_timeProvider);
+    }
+
+    internal void SetStripeSubscriptionId(Organization organization, string? subscriptionId)
+    {
+        ArgumentNullException.ThrowIfNull(organization);
+
+        if (String.Equals(organization.StripeSubscriptionId, subscriptionId, StringComparison.Ordinal))
+            return;
+
+        organization.StripeSubscriptionId = subscriptionId;
+        organization.StripeSubscriptionEventDate = null;
+    }
+
+    private async Task<bool> OwnerHasOtherFreeOrTrialOrganizationAsync(Organization organization, User actingUser)
+    {
+        // Organizations created before creators were recorded have no owner, so the member downgrading them is held to the rule.
+        var owner = actingUser;
+        if (organization.CreatedByUserId is not null && !String.Equals(organization.CreatedByUserId, actingUser.Id, StringComparison.Ordinal))
+            owner = await _userRepository.GetByIdAsync(organization.CreatedByUserId, o => o.Cache(false));
+
+        IReadOnlyCollection<Organization> counted;
+        if (owner is not null)
+            counted = await GetFreeOrTrialOrganizationsCountedForAsync(owner);
+        else
+            counted = await GetCreatedFreeOrTrialOrganizationsAsync(organization.CreatedByUserId!);
+        return counted.Any(o => !String.Equals(o.Id, organization.Id, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The free and trial organizations that count toward a user's one-free-organization limit: the ones they created,
+    /// plus, for organizations created before creators were recorded, the ones they're a member of.
+    /// </summary>
+    private async Task<IReadOnlyCollection<Organization>> GetFreeOrTrialOrganizationsCountedForAsync(User user)
+    {
+        var created = await GetCreatedFreeOrTrialOrganizationsAsync(user.Id);
+        if (user.OrganizationIds.Count is 0)
+            return created;
+
+        var organizations = await _organizationRepository.GetByIdsAsync(user.OrganizationIds.ToArray());
+        var withoutRecordedCreators = organizations.Where(o => o.CreatedByUserId is null && _plans.IsFreeOrTrialPlan(o.PlanId));
+        return created.Concat(withoutRecordedCreators).DistinctBy(o => o.Id).ToList();
+    }
+
+    /// <summary>
+    /// The free and trial organizations a user created, including ones they're no longer a member of. The
+    /// one-free-organization rule keeps this to a handful, so a single page is enough.
+    /// </summary>
+    private async Task<IReadOnlyCollection<Organization>> GetCreatedFreeOrTrialOrganizationsAsync(string userId)
+    {
+        var results = await _organizationRepository.FindAsync(q => q
+            .FieldEquals(o => o.CreatedByUserId, userId)
+            .FieldEquals(o => o.PlanId, _plans.FreePlan.Id, _plans.TrialPlan.Id), o => o.PageLimit(100));
+        return results.Documents;
+    }
+
+    /// <summary>
+    /// Counts an invite from a Free or trial organization toward the inviter's daily limit, and returns whether it's
+    /// within <see cref="BillingOptions.FreeInviteDailyLimit"/>.
+    /// </summary>
+    public async Task<bool> TryCountFreeInviteAsync(string userId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(userId);
+
+        var utcNow = _timeProvider.GetUtcNow().UtcDateTime;
+        long invites = await _cacheClient.IncrementAsync(GetFreeInviteCountCacheKey(userId, utcNow), 1, utcNow.Date.AddDays(1));
+        return invites <= _billingOptions.FreeInviteDailyLimit;
+    }
+
+    private static string GetFreeInviteCountCacheKey(string userId, DateTime utcNow)
+        => $"User:{userId}:free-invites:{utcNow:yyyyMMdd}";
+
+    private static string GetOwnerFreeOrganizationLockKey(string userId)
+        => $"User:{userId}:free-organization";
+
+    private static string GetTrialEmailLockKey(string emailAddress)
+        => $"Trial:{TrialEmailAddress.GetClaimId(emailAddress)}";
+
+    private static string GetOrganizationLockKey(string organizationId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(organizationId);
+
+        return $"Organization:{organizationId}:billing-plan";
     }
 }

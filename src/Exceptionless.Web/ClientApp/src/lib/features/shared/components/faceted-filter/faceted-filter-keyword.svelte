@@ -1,0 +1,127 @@
+<script lang="ts">
+    import { onDestroy } from 'svelte';
+
+    import * as FacetedFilter from '#comp/faceted-filter/index.ts';
+    import { Button } from '#comp/ui/button/index.ts';
+    import { Input } from '#comp/ui/input/index.ts';
+    import * as Popover from '#comp/ui/popover/index.ts';
+    import Separator from '#comp/ui/separator/separator.svelte';
+
+    interface Props {
+        changed: (value?: string) => void;
+        hidden?: boolean;
+        open: boolean;
+        remove: () => void;
+        title: string;
+        toggleHidden?: () => void;
+        value?: string;
+    }
+
+    let { changed, hidden = false, open = $bindable(), remove, title = 'Raw Filter', toggleHidden, value }: Props = $props();
+
+    const DEBOUNCE_MS = 500;
+    const FILTERING_DOCUMENTATION_HREF = 'https://exceptionless.com/docs/filtering-and-searching/';
+
+    // eslint-disable-next-line svelte/prefer-writable-derived
+    let updatedValue = $state<string | undefined>();
+    let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+
+    onDestroy(() => clearTimeout(debounceTimer));
+
+    $effect.pre(() => {
+        updatedValue = value;
+    });
+
+    export function onClearFilter() {
+        updatedValue = undefined;
+    }
+
+    function applyAndClose() {
+        clearTimeout(debounceTimer);
+        const normalized = updatedValue?.trim() || undefined;
+        if (normalized !== value) {
+            changed(normalized);
+        }
+
+        open = false;
+    }
+
+    function cancelAndClose() {
+        clearTimeout(debounceTimer);
+        updatedValue = value;
+        open = false;
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            applyAndClose();
+        } else if (event.key === 'Escape') {
+            event.preventDefault();
+            cancelAndClose();
+        }
+    }
+
+    function onEscapeKeydown(e: KeyboardEvent) {
+        e.preventDefault();
+        cancelAndClose();
+    }
+
+    function onOpenChange(isOpen: boolean) {
+        if (!isOpen) {
+            applyAndClose();
+        }
+    }
+
+    function scheduleApply() {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            const normalized = updatedValue?.trim() || undefined;
+            if (normalized !== value) {
+                changed(normalized);
+            }
+        }, DEBOUNCE_MS);
+    }
+</script>
+
+<Popover.Root bind:open {onOpenChange}>
+    <Popover.Trigger>
+        {#snippet child({ props })}
+            <Button {...props} class="gap-x-1 px-3" size="lg" variant="outline" aria-describedby={`${title}-help`}>
+                {title}
+                <Separator class="mx-2" orientation="vertical" />
+                {#if value}
+                    <FacetedFilter.BadgeValue>{value}</FacetedFilter.BadgeValue>
+                {:else}
+                    <FacetedFilter.BadgeValue>No Value</FacetedFilter.BadgeValue>
+                {/if}
+            </Button>
+        {/snippet}
+    </Popover.Trigger>
+    <Popover.Content align="start" class="p-0" side="bottom" trapFocus={false} {onEscapeKeydown} onFocusOutside={(e) => e.preventDefault()}>
+        <div class="p-2">
+            <Input
+                bind:value={updatedValue}
+                placeholder={title}
+                type="text"
+                aria-label={`Filter by ${title}`}
+                aria-describedby={`${title}-help`}
+                onkeydown={handleKeyDown}
+                oninput={scheduleApply}
+                autofocus={open}
+                spellcheck="false"
+                autocomplete="off"
+            />
+        </div>
+        <div id={`${title}-help`} class="sr-only">Type a raw filter expression. Enter applies, Escape cancels.</div>
+        <FacetedFilter.Actions
+            clear={onClearFilter}
+            helpHref={FILTERING_DOCUMENTATION_HREF}
+            helpLabel="Open filtering documentation"
+            {hidden}
+            {remove}
+            showClear={!!updatedValue?.trim()}
+            {toggleHidden}
+        />
+    </Popover.Content>
+</Popover.Root>

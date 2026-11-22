@@ -1,70 +1,79 @@
-﻿using System;
-using System.Collections.Generic;
-using Exceptionless.Core.Pipeline;
-using Exceptionless.Core.Extensions;
+﻿using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Models;
+using Exceptionless.Core.Pipeline;
+using Foundatio.Serializer;
+using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Plugins.Formatting {
-    [Priority(40)]
-    public sealed class UsageFormattingPlugin : FormattingPluginBase {
-        private bool ShouldHandle(PersistentEvent ev) {
-            return ev.IsFeatureUsage();
-        }
+namespace Exceptionless.Core.Plugins.Formatting;
 
-        public override SummaryData GetStackSummaryData(Stack stack) {
-            if (!stack.SignatureInfo.ContainsKeyWithValue("Type", Event.KnownTypes.FeatureUsage))
-                return null;
+[Priority(40)]
+public sealed class UsageFormattingPlugin : FormattingPluginBase
+{
+    public UsageFormattingPlugin(ITextSerializer serializer, AppOptions options, ILoggerFactory loggerFactory) : base(serializer, options, loggerFactory) { }
 
-            return new SummaryData { TemplateKey = "stack-feature-summary", Data = new Dictionary<string, object>() };
-        }
+    private bool ShouldHandle(PersistentEvent ev)
+    {
+        return ev.IsFeatureUsage();
+    }
 
-        public override string GetStackTitle(PersistentEvent ev) {
-            if (!ShouldHandle(ev))
-                return null;
+    public override SummaryData? GetStackSummaryData(Stack stack)
+    {
+        if (!stack.SignatureInfo.ContainsKeyWithValue("Type", Event.KnownTypes.FeatureUsage))
+            return null;
 
-            return !String.IsNullOrEmpty(ev.Source) ? ev.Source : "(Unknown)";
-        }
+        return new SummaryData { Id = stack.Id, TemplateKey = "stack-feature-summary", Data = new Dictionary<string, object>() };
+    }
 
-        public override SummaryData GetEventSummaryData(PersistentEvent ev) {
-            if (!ShouldHandle(ev))
-                return null;
+    public override string? GetStackTitle(PersistentEvent ev)
+    {
+        if (!ShouldHandle(ev))
+            return null;
 
-            var data = new Dictionary<string, object> { { "Source", ev.Source } };
-            AddUserIdentitySummaryData(data, ev.GetUserIdentity());
+        return !String.IsNullOrEmpty(ev.Source) ? ev.Source : "(Unknown)";
+    }
 
-            return new SummaryData { TemplateKey = "event-feature-summary", Data = data };
-        }
+    public override SummaryData? GetEventSummaryData(PersistentEvent ev)
+    {
+        if (!ShouldHandle(ev))
+            return null;
 
-        public override MailMessageData GetEventNotificationMailMessageData(PersistentEvent ev, bool isCritical, bool isNew, bool isRegression) {
-            if (!ShouldHandle(ev))
-                return null;
+        var data = new Dictionary<string, object?> { { "Source", ev.Source } };
+        AddUserIdentitySummaryData(data, ev.GetUserIdentity(_serializer, _logger));
 
-            string subject = String.Concat("Feature: ", ev.Source).Truncate(120);
-            var data = new Dictionary<string, object> {
-                { "Source", ev.Source.Truncate(60) }
+        return new SummaryData { Id = ev.Id, TemplateKey = "event-feature-summary", Data = data };
+    }
+
+    public override MailMessageData? GetEventNotificationMailMessageData(PersistentEvent ev, bool isCritical, bool isNew, bool isRegression)
+    {
+        if (!ShouldHandle(ev))
+            return null;
+
+        string subject = String.Concat("Feature: ", ev.Source).Truncate(120);
+        var data = new Dictionary<string, object?> {
+                { "Source", ev.Source?.Truncate(60) }
             };
 
-            return new MailMessageData { Subject = subject, Data = data };
-        }
+        return new MailMessageData { Subject = subject, Data = data };
+    }
 
-        public override SlackMessage GetSlackEventNotification(PersistentEvent ev, Project project, bool isCritical, bool isNew, bool isRegression) {
-            if (!ShouldHandle(ev))
-                return null;
+    public override SlackMessage? GetSlackEventNotification(PersistentEvent ev, Project project, bool isCritical, bool isNew, bool isRegression)
+    {
+        if (!ShouldHandle(ev))
+            return null;
 
-            var attachment = new SlackMessage.SlackAttachment(ev) {
-                Fields = new List<SlackMessage.SlackAttachmentFields> {
-                    new SlackMessage.SlackAttachmentFields {
-                        Title = "Source",
-                        Value = ev.Source.Truncate(60)
-                    }
-                }
-            };
+        var attachment = new SlackMessage.SlackAttachment(ev, _serializer, _logger)
+        {
+            Fields =
+            [
+                new() { Title = "Source", Value = ev.Source?.Truncate(60) }
+            ]
+        };
 
-            AddDefaultSlackFields(ev, attachment.Fields, false);
-            string subject = $"[{project.Name}] Feature: *{GetSlackEventUrl(ev.Id, ev.Source).Truncate(120)}*";
-            return new SlackMessage(subject) {
-                Attachments = new List<SlackMessage.SlackAttachment> { attachment }
-            };
-        }
+        AddDefaultSlackFields(ev, attachment.Fields, false);
+        string subject = $"[{project.Name}] Feature: *{GetSlackEventUrl(ev.Id, ev.Source).Truncate(120)}*";
+        return new SlackMessage(subject)
+        {
+            Attachments = [attachment]
+        };
     }
 }

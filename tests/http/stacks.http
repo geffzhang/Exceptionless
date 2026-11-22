@@ -1,0 +1,46 @@
+@apiUrl = http://localhost:7110/api/v2
+@email = admin@exceptionless.test
+@password = tester
+
+### login to test account
+# @name login
+POST {{apiUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "{{email}}",
+    "password": "{{password}}"
+}
+
+###
+
+@token = {{login.response.body.$.token}}
+
+### Find open stacks
+# @name allStacks
+GET {{apiUrl}}/stacks?limit=10&filter=status:open
+Authorization: Bearer {{token}}
+
+###
+@stackId = {{allStacks.response.body.$[0].id}}
+
+### Get By Id
+GET {{apiUrl}}/stacks/{{stackId}}
+Authorization: Bearer {{token}}
+
+### Change Status (open, fixed, ignored, discarded)
+POST {{apiUrl}}/stacks/{{stackId}}/change-status?status=open
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+### Mark Snoozed
+POST {{apiUrl}}/stacks/{{stackId}}/mark-snoozed?snoozeUntilUtc=2030-12-31T00:00:00Z
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+### Attach an issue or documentation link
+POST {{apiUrl}}/stacks/{{stackId}}/add-link
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "value": "https://example.com/issues/123" }

@@ -1,0 +1,26 @@
+<script lang="ts">
+    import type { HTMLInputAttributes, HTMLInputTypeAttribute } from 'svelte/elements';
+
+    import Search from '@lucide/svelte/icons/search';
+
+    import * as InputGroup from '#comp/ui/input-group/index.ts';
+    import { type WithElementRef } from '#lib/utils.ts';
+
+    type BaseProps = WithElementRef<Omit<HTMLInputAttributes, 'type'> & ({ files?: FileList; type: 'file' } | { files?: undefined; type?: InputType })>;
+
+    type InputType = Exclude<HTMLInputTypeAttribute, 'file'>;
+
+    type Props = BaseProps & {
+        groupClass?: string;
+    };
+
+    let { class: className, groupClass = '', id = 'search', placeholder = 'Search...', value = $bindable(), ...props }: Props = $props();
+</script>
+
+<label class="sr-only" for={id}>Search</label>
+<InputGroup.Root class={groupClass}>
+    <InputGroup.Addon aria-hidden="true">
+        <Search class="size-5" />
+    </InputGroup.Addon>
+    <InputGroup.Input bind:value class={className} {id} name="search" {placeholder} type="text" {...props} />
+</InputGroup.Root>

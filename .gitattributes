@@ -1,7 +1,11 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+*.sh text eol=lf
+
+# Test baselines must use LF on disk so cross-platform string comparisons work
+tests/Exceptionless.Tests/Controllers/Data/openapi.json text eol=lf
 
 # Custom for Visual Studio
 *.cs     diff=csharp
-*.sln    merge=union
+*.slnx    merge=union
 *.csproj merge=union

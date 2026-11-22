@@ -1,0 +1,86 @@
+import type { ProblemDetails } from '@foundatiofx/fetchclient';
+import type { CreateQueryResult } from '@tanstack/svelte-query';
+
+import { type ColumnDef, renderComponent, type StockFeatures } from '@tanstack/svelte-table';
+
+import type { ClientConfiguration, ClientConfigurationSetting } from '#features/projects/models.ts';
+
+import ProjectConfigActionsCell from '#features/projects/components/table/project-config-actions-cell.svelte';
+import { getSharedTableOptions, type TableMemoryPagingParameters } from '#features/shared/table.svelte.ts';
+
+export type ConfigurationSettingsColumnParameters = {
+    projectId: string;
+};
+
+export function getColumns<TClientConfigurationSetting extends ClientConfigurationSetting>(
+    params: ConfigurationSettingsColumnParameters
+): ColumnDef<StockFeatures, TClientConfigurationSetting, unknown>[] {
+    const columns: ColumnDef<StockFeatures, TClientConfigurationSetting, unknown>[] = [
+        {
+            accessorKey: 'key',
+            cell: (info) => info.getValue(),
+            enableHiding: false,
+            header: 'Key',
+            meta: {
+                class: 'w-[200px]'
+            }
+        },
+        {
+            accessorKey: 'value',
+            cell: (info) => info.getValue(),
+            enableHiding: false,
+            header: 'Value',
+            meta: {
+                class: 'w-[200px]'
+            }
+        },
+        {
+            cell: (info) =>
+                renderComponent(ProjectConfigActionsCell, {
+                    projectId: params.projectId,
+                    setting: info.row.original
+                }),
+            enableHiding: false,
+            enableSorting: false,
+            header: '',
+            id: 'actions',
+            meta: {
+                class: 'w-12 min-w-12 max-w-12 text-right'
+            }
+        }
+    ];
+
+    return columns;
+}
+
+export function getTableOptions<TClientConfigurationSetting extends ClientConfigurationSetting>(
+    columnParameters: ConfigurationSettingsColumnParameters,
+    queryParameters: TableMemoryPagingParameters,
+    queryResponse: CreateQueryResult<ClientConfiguration, ProblemDetails>
+) {
+    const knownSettingsToHide = ['@@log:*', '@@DataExclusions', '@@IncludePrivateInformation', '@@UserAgentBotPatterns', 'UserNamespaces', 'CommonMethods'];
+    const queryData = $derived(
+        Object.entries(queryResponse.data?.settings ?? {})
+            .map(([key, value]) => {
+                return {
+                    key,
+                    value
+                } as TClientConfigurationSetting;
+            })
+            .filter((setting) => !knownSettingsToHide.includes(setting.key))
+    );
+
+    return getSharedTableOptions<TClientConfigurationSetting>({
+        columnPersistenceKey: 'projects-configuration-values-column-visibility',
+        get columns() {
+            return getColumns<TClientConfigurationSetting>(columnParameters);
+        },
+        paginationStrategy: 'memory',
+        get queryData() {
+            return queryData;
+        },
+        get queryParameters() {
+            return queryParameters;
+        }
+    });
+}

@@ -1,95 +1,97 @@
-﻿using System;
-using System.Linq;
+﻿using System.Diagnostics.CodeAnalysis;
 using Exceptionless.Core.Models;
-using Foundatio.Utility;
+using Exceptionless.DateTimeExtensions;
 
-namespace Exceptionless.Core.Extensions {
-    public static class UserExtensions {
-        public static bool IsCorrectPassword(this User user, string password) {
-            if (String.IsNullOrEmpty(user.Salt) || String.IsNullOrEmpty(user.Password))
-                return false;
+namespace Exceptionless.Core.Extensions;
 
-            string encodedPassword = password.ToSaltedHash(user.Salt);
-            return String.Equals(encodedPassword, user.Password);
-        }
+public static class UserExtensions
+{
+    /// <summary>
+    /// Checks whether an active user's session generation matches the presented credential.
+    /// A missing generation matches only another missing generation for legacy credentials.
+    /// This method does not load or refresh the user.
+    /// </summary>
+    public static bool HasValidAuthenticationVersion([NotNullWhen(true)] this User? user, string? authenticationVersion)
+    {
+        return user is { IsActive: true }
+            && String.Equals(user.AuthenticationVersion, authenticationVersion, StringComparison.Ordinal);
+    }
 
-        public static void ResetVerifyEmailAddressToken(this User user) {
-            if (user == null)
-                return;
+    public static bool IsCorrectPassword(this User user, string password)
+    {
+        if (String.IsNullOrEmpty(user.Salt) || String.IsNullOrEmpty(user.Password))
+            return false;
 
-            user.VerifyEmailAddressToken = null;
-            user.VerifyEmailAddressTokenExpiration = DateTime.MinValue;
-        }
+        string encodedPassword = password.ToSaltedHash(user.Salt);
+        return String.Equals(encodedPassword, user.Password);
+    }
 
-        public static void CreateVerifyEmailAddressToken(this User user) {
-            if (user == null)
-                return;
+    public static void ResetVerifyEmailAddressTokenAndExpiration(this User user, TimeProvider timeProvider)
+    {
+        user.IsEmailAddressVerified = false;
+        user.VerifyEmailAddressToken = StringExtensions.GetNewToken();
+        user.VerifyEmailAddressTokenExpiration = timeProvider.GetUtcNow().UtcDateTime.AddMinutes(1440);
+    }
 
-            user.VerifyEmailAddressToken = StringExtensions.GetNewToken();
-            user.VerifyEmailAddressTokenExpiration = SystemClock.UtcNow.AddMinutes(1440);
-        }
+    public static void MarkEmailAddressVerified(this User user)
+    {
+        user.IsEmailAddressVerified = true;
+        user.VerifyEmailAddressToken = null;
+        user.VerifyEmailAddressTokenExpiration = DateTime.MinValue;
+    }
 
-        public static bool HasValidVerifyEmailAddressTokenExpiration(this User user) {
-            if (user == null)
-                return false;
+    public static bool HasValidVerifyEmailAddressTokenExpiration(this User user, TimeProvider timeProvider)
+    {
+        return user.VerifyEmailAddressTokenExpiration.IsAfterOrEqual(timeProvider.GetUtcNow().UtcDateTime);
+    }
 
-            return user.VerifyEmailAddressTokenExpiration != DateTime.MinValue && user.VerifyEmailAddressTokenExpiration >= SystemClock.UtcNow;
-        }
+    public static void ResetPasswordResetToken(this User user)
+    {
+        user.PasswordResetToken = null;
+        user.PasswordResetTokenExpiration = DateTime.MinValue;
+    }
 
-        public static void MarkEmailAddressVerified(this User user) {
-            if (user == null)
-                return;
+    public static void CreatePasswordResetToken(this User user, TimeProvider timeProvider)
+    {
+        user.PasswordResetToken = StringExtensions.GetNewToken();
+        user.PasswordResetTokenExpiration = timeProvider.GetUtcNow().UtcDateTime.AddMinutes(1440);
+    }
 
-            user.IsEmailAddressVerified = true;
-            user.VerifyEmailAddressToken = null;
-            user.VerifyEmailAddressTokenExpiration = DateTime.MinValue;
-        }
+    public static bool HasValidPasswordResetTokenExpiration(this User user, TimeProvider timeProvider)
+    {
+        return user.PasswordResetTokenExpiration != DateTime.MinValue && user.PasswordResetTokenExpiration >= timeProvider.GetUtcNow().UtcDateTime;
+    }
 
-        public static void ResetPasswordResetToken(this User user) {
-            if (user == null)
-                return;
+    public static void AddOAuthAccount(this User user, string providerName, string providerUserId, string username, SettingsDictionary? data = null)
+    {
+        var account = new OAuthAccount
+        {
+            Provider = providerName.ToLowerInvariant(),
+            ProviderUserId = providerUserId,
+            Username = username
+        };
 
-            user.PasswordResetToken = null;
-            user.PasswordResetTokenExpiration = DateTime.MinValue;
-        }
+        if (data is not null)
+            account.ExtraData.Apply(data);
 
-        public static void CreatePasswordResetToken(this User user) {
-            if (user == null)
-                return;
+        user.OAuthAccounts.Add(account);
+    }
 
-            user.PasswordResetToken = StringExtensions.GetNewToken();
-            user.PasswordResetTokenExpiration = SystemClock.UtcNow.AddMinutes(1440);
-        }
+    public static bool RemoveOAuthAccount(this User user, string providerName, string providerUserId)
+    {
+        var account = user.OAuthAccounts.FirstOrDefault(o =>
+            String.Equals(o.Provider, providerName, StringComparison.OrdinalIgnoreCase)
+            && String.Equals(o.ProviderUserId, providerUserId, StringComparison.Ordinal));
+        if (account is null)
+            return true;
 
-        public static bool HasValidPasswordResetTokenExpiration(this User user) {
-            if (user == null)
-                return false;
+        var activeOAuthAccounts = user.OAuthAccounts
+            .Where(o => !String.Equals(o.Provider, "facebook", StringComparison.OrdinalIgnoreCase)
+                && !String.Equals(o.Provider, "windowslive", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (String.IsNullOrEmpty(user.Password) && activeOAuthAccounts.Length <= 1 && activeOAuthAccounts.Contains(account))
+            return false;
 
-            return user.PasswordResetTokenExpiration != DateTime.MinValue && user.PasswordResetTokenExpiration >= SystemClock.UtcNow;
-        }
-
-        public static void AddOAuthAccount(this User user, string providerName, string providerUserId, string username, SettingsDictionary data = null) {
-            var account = new OAuthAccount {
-                Provider = providerName.ToLowerInvariant(),
-                ProviderUserId = providerUserId,
-                Username = username
-            };
-
-            if (data != null)
-                account.ExtraData.Apply(data);
-
-            user.OAuthAccounts.Add(account);
-        }
-
-        public static bool RemoveOAuthAccount(this User user, string providerName, string providerUserId) {
-            if (user.OAuthAccounts.Count <= 1 && String.IsNullOrEmpty(user.Password))
-                return false;
-
-            var account = user.OAuthAccounts.FirstOrDefault(o => o.Provider == providerName.ToLowerInvariant() && o.ProviderUserId == providerUserId);
-            if (account == null)
-                return true;
-
-            return user.OAuthAccounts.Remove(account);
-        }
+        return user.OAuthAccounts.Remove(account);
     }
 }

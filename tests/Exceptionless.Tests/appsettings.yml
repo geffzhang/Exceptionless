@@ -1,29 +1,27 @@
-﻿---
+---
 ConnectionStrings:
-  Redis.off: localhost,abortConnect=false
-  Elasticsearch.off: http://localhost:9200/
+  #  Redis: localhost,abortConnect=false
+  #  Elasticsearch: server=https://elastic:elastic@localhost:9200
+  #  Cache: provider=redis;
+  #  MessageBus: provider=redis;
+  #  Queue: provider=redis;
+  Storage: provider=folder;path=..\..\..\..\..\src\Exceptionless.Web\storage
 
 # Base url for the ui used to build links in emails and other places.
-BaseURL: 'http://localhost:5000/'
+BaseURL: "http://localhost:7110"
 
+AppMode: Development
 AppScope: test
+EnableSampleData: false
+MaximumRetentionDays: 3650
 
 # Controls whether daily summary emails are sent
 EnableDailySummary: false
+ContactEmailAddress: "contact@exceptionless.test"
 
 # Runs the jobs in the current website process
 RunJobsInProcess: false
-EnableBootstrapStartupActions: false
 EnableWebSockets: false
 
-# Folder used to store event post data
-StorageFolder: ..\..\..\..\..\src\Exceptionless.Web\storage
-
-Logging:
-  IncludeScopes: false
-  Debug:
-    LogLevel:
-      Default: Warning
-  Console:
-    LogLevel:
-      Default: Warning
+Serilog:
+  MinimumLevel: Warning

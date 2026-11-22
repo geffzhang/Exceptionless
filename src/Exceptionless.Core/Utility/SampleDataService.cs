@@ -1,118 +1,303 @@
-﻿using System;
-using System.Threading.Tasks;
-using Exceptionless.Core.Authorization;
+﻿using Exceptionless.Core.Authorization;
 using Exceptionless.Core.Billing;
 using Exceptionless.Core.Extensions;
-using Exceptionless.Core.Repositories;
 using Exceptionless.Core.Models;
+using Exceptionless.Core.Models.WorkItems;
+using Exceptionless.Core.Repositories;
+using Foundatio.Jobs;
+using Foundatio.Queues;
 using Foundatio.Repositories;
-using Foundatio.Utility;
+using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Utility {
-    public class SampleDataService {
-        private readonly IOrganizationRepository _organizationRepository;
-        private readonly IProjectRepository _projectRepository;
-        private readonly ITokenRepository _tokenRepository;
-        private readonly IUserRepository _userRepository;
+namespace Exceptionless.Core.Utility;
 
-        public const string TEST_USER_EMAIL = "test@exceptionless.io";
-        public const string TEST_USER_PASSWORD = "tester";
-        public const string TEST_ORG_ID = "537650f3b77efe23a47914f3";
-        public const string TEST_PROJECT_ID = "537650f3b77efe23a47914f4";
-        public const string TEST_API_KEY = "LhhP1C9gijpSKCslHHCvwdSIz298twx271n1l6xw";
-        public const string TEST_USER_API_KEY = "5f8aT5j0M1SdWCMOiJKCrlDNHMI38LjCH4LTWqGp";
-        public const string INTERNAL_API_KEY = "Bx7JgglstPG544R34Tw9T7RlCed3OIwtYXVeyhT2";
-        public const string INTERNAL_PROJECT_ID = "54b56e480ef9605a88a13153";
+public class SampleDataService
+{
+    private readonly IOrganizationRepository _organizationRepository;
+    private readonly IProjectRepository _projectRepository;
+    private readonly ITokenRepository _tokenRepository;
+    private readonly IQueue<WorkItemData> _workItemQueue;
+    private readonly BillingManager _billingManager;
+    private readonly BillingPlans _billingPlans;
+    private readonly TimeProvider _timeProvider;
+    private readonly IUserRepository _userRepository;
+    private readonly ILogger<SampleDataService> _logger;
 
-        public SampleDataService(IOrganizationRepository organizationRepository, IProjectRepository projectRepository, IUserRepository userRepository, ITokenRepository tokenRepository) {
-            _organizationRepository = organizationRepository;
-            _projectRepository = projectRepository;
-            _userRepository = userRepository;
-            _tokenRepository = tokenRepository;
+    public const string TEST_USER_EMAIL = "admin@exceptionless.test";
+    public const string TEST_USER_PASSWORD = "tester";
+    public const string TEST_ORG_ID = "537650f3b77efe23a47914f3";
+    public const string TEST_PROJECT_ID = "537650f3b77efe23a47914f4";
+    public const string TEST_ROCKET_SHIP_PROJECT_ID = "537650f3b77efe23a47914f7";
+    public const string TEST_API_KEY = "LhhP1C9gijpSKCslHHCvwdSIz298twx271nTest";
+    public const string TEST_ROCKET_SHIP_API_KEY = "LhhP1C9gijpSKCslHHCvwdSIz298twx271oTest";
+    public const string TEST_USER_API_KEY = "5f8aT5j0M1SdWCMOiJKCrlDNHMI38LjCH4LTTest";
+    public const string TEST_ORG_USER_EMAIL = "org@localhost";
+    public const string TEST_ORG_USER_PASSWORD = "tester";
+    public const string FREE_USER_EMAIL = "free@localhost";
+    public const string FREE_USER_PASSWORD = "tester";
+    public const string FREE_ORG_ID = "537650f3b77efe23a47914f5";
+    public const string FREE_PROJECT_ID = "537650f3b77efe23a47914f6";
+    public const string FREE_API_KEY = "LhhP1C9gijpSKCslHHCvwdSIz298twx271n1Free";
+    public const string FREE_USER_API_KEY = "5f8aT5j0M1SdWCMOiJKCrlDNHMI37LjCH4LTFree";
+    public const string INTERNAL_API_KEY = "Bx7JgglstPG544R34Tw9T7RlCed3OIwtYXVeyhT2";
+    public const string INTERNAL_PROJECT_ID = "54b56e480ef9605a88a13153";
+
+    public SampleDataService(
+        IOrganizationRepository organizationRepository,
+        IProjectRepository projectRepository,
+        IUserRepository userRepository,
+        ITokenRepository tokenRepository,
+        IQueue<WorkItemData> workItemQueue,
+        BillingManager billingManager,
+        BillingPlans billingPlans,
+        TimeProvider timeProvider,
+        ILoggerFactory loggerFactory
+    )
+    {
+        _organizationRepository = organizationRepository;
+        _projectRepository = projectRepository;
+        _userRepository = userRepository;
+        _tokenRepository = tokenRepository;
+        _workItemQueue = workItemQueue;
+        _billingManager = billingManager;
+        _billingPlans = billingPlans;
+        _timeProvider = timeProvider;
+        _logger = loggerFactory.CreateLogger<SampleDataService>();
+    }
+
+    public async Task CreateDataAsync()
+    {
+        if (await _userRepository.GetByEmailAddressAsync(TEST_USER_EMAIL) is not null)
+            return;
+
+        var user = new User
+        {
+            FullName = "Test User",
+            EmailAddress = TEST_USER_EMAIL
+        };
+
+        user.ResetVerifyEmailAddressTokenAndExpiration(_timeProvider);
+        user.Roles.Add(AuthorizationRoles.Client);
+        user.Roles.Add(AuthorizationRoles.User);
+        user.Roles.Add(AuthorizationRoles.GlobalAdmin);
+
+        user.Salt = StringExtensions.GetRandomString(16);
+        user.Password = TEST_USER_PASSWORD.ToSaltedHash(user.Salt);
+
+        user = await _userRepository.AddAsync(user, o => o.Cache());
+        _logger.LogDebug("Created Global Admin {FullName} - {EmailAddress}", user.FullName, user.EmailAddress);
+        await CreateOrganizationAndProjectAsync(user);
+        await CreateInternalOrganizationAndProjectAsync(user.Id);
+        await CreateOrganizationAdminUserAsync();
+        await CreateFreeOrganizationAndProjectAsync();
+    }
+
+    public async Task CreateOrganizationAdminUserAsync()
+    {
+        if (await _userRepository.GetByEmailAddressAsync(TEST_ORG_USER_EMAIL) is not null)
+            return;
+
+        var user = new User
+        {
+            FullName = "Test Org User",
+            EmailAddress = TEST_ORG_USER_EMAIL
+        };
+
+        user.ResetVerifyEmailAddressTokenAndExpiration(_timeProvider);
+        user.Roles.Add(AuthorizationRoles.Client);
+        user.Roles.Add(AuthorizationRoles.User);
+
+        user.Salt = StringExtensions.GetRandomString(16);
+        user.Password = TEST_ORG_USER_PASSWORD.ToSaltedHash(user.Salt);
+
+        user.OrganizationIds.Add(TEST_ORG_ID);
+
+        user = await _userRepository.AddAsync(user, o => o.Cache());
+        _logger.LogDebug("Created Org Admin {FullName} - {EmailAddress}", user.FullName, user.EmailAddress);
+    }
+
+    public async Task CreateOrganizationAndProjectAsync(User user)
+    {
+        if (await _tokenRepository.ExistsAsync(TEST_API_KEY))
+            return;
+
+        var organization = new Organization { Id = TEST_ORG_ID, Name = "Acme", CreatedByUserId = user.Id };
+        _billingManager.ApplyBillingPlan(organization, _billingPlans.UnlimitedPlan, user);
+        organization = await _organizationRepository.AddAsync(organization, o => o.ImmediateConsistency().Cache());
+
+        var disintegratingPistolProject = new Project
+        {
+            Id = TEST_PROJECT_ID,
+            Name = "Disintegrating Pistol",
+            OrganizationId = organization.Id,
+            NextSummaryEndOfDayTicks = _timeProvider.GetUtcNow().UtcDateTime.Date.AddDays(1).AddHours(1).Ticks
+        };
+        disintegratingPistolProject.Configuration.Settings.Add("IncludeConditionalData", "true");
+        disintegratingPistolProject.AddDefaultNotificationSettings(user.Id);
+
+        var rocketShipProject = new Project
+        {
+            Id = TEST_ROCKET_SHIP_PROJECT_ID,
+            Name = "Rocket Ship",
+            OrganizationId = organization.Id,
+            NextSummaryEndOfDayTicks = _timeProvider.GetUtcNow().UtcDateTime.Date.AddDays(1).AddHours(1).Ticks
+        };
+
+        await _projectRepository.AddAsync(new List<Project> {
+            disintegratingPistolProject,
+            rocketShipProject
+        }, o => o.ImmediateConsistency().Cache());
+
+        await _tokenRepository.AddAsync(new List<Token>
+        {
+                new()
+                {
+                    Id = TEST_API_KEY,
+                    OrganizationId = organization.Id,
+                    ProjectId = disintegratingPistolProject.Id,
+                    Type = TokenType.Access
+                },
+                new()
+                {
+                    Id = TEST_ROCKET_SHIP_API_KEY,
+                    OrganizationId = organization.Id,
+                    ProjectId = rocketShipProject.Id,
+                    Type = TokenType.Access
+                },
+                new()
+                {
+                    Id = TEST_USER_API_KEY,
+                    UserId = user.Id,
+                    Type = TokenType.Access
+                }
+            }, o => o.ImmediateConsistency().Cache());
+
+        user.OrganizationIds.Add(organization.Id);
+        await _userRepository.SaveAsync(user, o => o.Cache());
+        _logger.LogDebug("Created Organization {OrganizationName} and Projects {DisintegratingPistolProjectName}, {RocketShipProjectName}", organization.Name, disintegratingPistolProject.Name, rocketShipProject.Name);
+    }
+
+    public async Task CreateFreeOrganizationAndProjectAsync()
+    {
+        if (await _userRepository.GetByEmailAddressAsync(FREE_USER_EMAIL) is not null)
+            return;
+
+        var user = new User
+        {
+            FullName = "Free User",
+            EmailAddress = FREE_USER_EMAIL
+        };
+
+        user.ResetVerifyEmailAddressTokenAndExpiration(_timeProvider);
+        user.Roles.Add(AuthorizationRoles.Client);
+        user.Roles.Add(AuthorizationRoles.User);
+
+        user.Salt = StringExtensions.GetRandomString(16);
+        user.Password = FREE_USER_PASSWORD.ToSaltedHash(user.Salt);
+
+        user = await _userRepository.AddAsync(user, o => o.Cache());
+
+        if (await _tokenRepository.ExistsAsync(FREE_API_KEY))
+            return;
+
+        var organization = new Organization { Id = FREE_ORG_ID, Name = "Free Plan Organization", CreatedByUserId = user.Id };
+        _billingManager.ApplyBillingPlan(organization, _billingPlans.FreePlan, user);
+        organization = await _organizationRepository.AddAsync(organization, o => o.ImmediateConsistency().Cache());
+
+        var project = new Project
+        {
+            Id = FREE_PROJECT_ID,
+            Name = "Free Plan Project",
+            OrganizationId = organization.Id,
+            NextSummaryEndOfDayTicks = _timeProvider.GetUtcNow().UtcDateTime.Date.AddDays(1).AddHours(1).Ticks
+        };
+        project.Configuration.Settings.Add("IncludeConditionalData", "true");
+        project.AddDefaultNotificationSettings(user.Id);
+        project = await _projectRepository.AddAsync(project, o => o.ImmediateConsistency().Cache());
+
+        await _tokenRepository.AddAsync(new List<Token>
+        {
+                new()
+                {
+                    Id = FREE_API_KEY,
+                    OrganizationId = organization.Id,
+                    ProjectId = project.Id,
+                    Type = TokenType.Access
+                },
+                    new()
+                    {
+                    Id = FREE_USER_API_KEY,
+                    UserId = user.Id,
+                    Type = TokenType.Access
+                }
+            }, o => o.ImmediateConsistency().Cache());
+
+        user.OrganizationIds.Add(organization.Id);
+        await _userRepository.SaveAsync(user, o => o.Cache());
+        _logger.LogDebug("Created Free Organization {OrganizationName} and Project {ProjectName}", organization.Name, project.Name);
+    }
+
+    public async Task CreateInternalOrganizationAndProjectAsync(string userId)
+    {
+        if (await _tokenRepository.GetByIdAsync(INTERNAL_API_KEY) is not null)
+            return;
+
+        var user = await _userRepository.GetByIdAsync(userId, o => o.Cache());
+        if (user is null)
+        {
+            _logger.LogDebug("User {UserId} not found when creating sample data", userId);
+            return;
         }
 
-        public async Task CreateDataAsync() {
-            if (await _userRepository.GetByEmailAddressAsync(TEST_USER_EMAIL).AnyContext() != null)
-                return;
+        var organization = new Organization { Name = "Exceptionless", CreatedByUserId = user.Id };
+        _billingManager.ApplyBillingPlan(organization, _billingPlans.UnlimitedPlan, user);
+        organization = await _organizationRepository.AddAsync(organization, o => o.ImmediateConsistency().Cache());
 
-            var user = new User {
-                FullName = "Test User",
-                EmailAddress = TEST_USER_EMAIL,
-                IsEmailAddressVerified = true
-            };
-            user.Roles.Add(AuthorizationRoles.Client);
-            user.Roles.Add(AuthorizationRoles.User);
-            user.Roles.Add(AuthorizationRoles.GlobalAdmin);
+        var project = new Project
+        {
+            Id = INTERNAL_PROJECT_ID,
+            Name = "Exceptionless",
+            OrganizationId = organization.Id,
+            NextSummaryEndOfDayTicks = _timeProvider.GetUtcNow().UtcDateTime.Date.AddDays(1).AddHours(1).Ticks
+        };
+        project.AddDefaultNotificationSettings(userId);
+        project = await _projectRepository.AddAsync(project, o => o.ImmediateConsistency().Cache());
 
-            user.Salt = StringExtensions.GetRandomString(16);
-            user.Password = TEST_USER_PASSWORD.ToSaltedHash(user.Salt);
+        await _tokenRepository.AddAsync(new Token
+        {
+            Id = INTERNAL_API_KEY,
+            OrganizationId = organization.Id,
+            ProjectId = project.Id,
+            CreatedBy = userId,
+            Type = TokenType.Access
+        }, o => o.ImmediateConsistency());
 
-            user = await _userRepository.AddAsync(user, o => o.Cache()).AnyContext();
-            await CreateOrganizationAndProjectAsync(user.Id).AnyContext();
-            await CreateInternalOrganizationAndProjectAsync(user.Id).AnyContext();
-        }
+        user.OrganizationIds.Add(organization.Id);
+        await _userRepository.SaveAsync(user, o => o.Cache());
+        _logger.LogDebug("Created Internal Organization {OrganizationName} and Project {ProjectName}", organization.Name, project.Name);
+    }
 
-        public async Task CreateOrganizationAndProjectAsync(string userId) {
-            if (await _tokenRepository.GetByIdAsync(TEST_API_KEY).AnyContext() != null)
-                return;
+    public async Task EnqueueSampleEventsAsync(int eventCount = 250, int daysBack = 7)
+    {
+        await _workItemQueue.EnqueueAsync(new GenerateSampleEventsWorkItem
+        {
+            EventCount = eventCount,
+            DaysBack = daysBack
+        });
+        _logger.LogInformation("Enqueued sample event generation: {EventCount} events over {DaysBack} days", eventCount, daysBack);
+    }
 
-            var user = await _userRepository.GetByIdAsync(userId, o => o.Cache()).AnyContext();
-            var organization = new Organization { Id = TEST_ORG_ID, Name = "Acme" };
-            BillingManager.ApplyBillingPlan(organization, BillingManager.UnlimitedPlan, user);
-            organization = await _organizationRepository.AddAsync(organization, o => o.Cache()).AnyContext();
+    public async Task<string> EnqueueSampleEventsAsync(string organizationId, string projectId, int eventCount = 250, int daysBack = 7)
+    {
+        string workItemId = await _workItemQueue.EnqueueAsync(new GenerateSampleEventsWorkItem
+        {
+            OrganizationId = organizationId,
+            ProjectId = projectId,
+            EventCount = eventCount,
+            DaysBack = daysBack
+        });
 
-            var project = new Project { Id = TEST_PROJECT_ID, Name = "Disintegrating Pistol", OrganizationId = organization.Id };
-            project.NextSummaryEndOfDayTicks = SystemClock.UtcNow.Date.AddDays(1).AddHours(1).Ticks;
-            project.Configuration.Settings.Add("IncludeConditionalData", "true");
-            project.AddDefaultNotificationSettings(userId);
-            project = await _projectRepository.AddAsync(project, o => o.Cache()).AnyContext();
-
-            await _tokenRepository.AddAsync(new Token {
-                Id = TEST_API_KEY,
-                OrganizationId = organization.Id,
-                ProjectId = project.Id,
-                CreatedUtc = SystemClock.UtcNow,
-                UpdatedUtc = SystemClock.UtcNow,
-                Type = TokenType.Access
-            }).AnyContext();
-
-            await _tokenRepository.AddAsync(new Token {
-                Id = TEST_USER_API_KEY,
-                UserId = user.Id,
-                CreatedUtc = SystemClock.UtcNow,
-                UpdatedUtc = SystemClock.UtcNow,
-                Type = TokenType.Access
-            }).AnyContext();
-
-            user.OrganizationIds.Add(organization.Id);
-            await _userRepository.SaveAsync(user, o => o.Cache()).AnyContext();
-        }
-
-        public async Task CreateInternalOrganizationAndProjectAsync(string userId) {
-            if (await _tokenRepository.GetByIdAsync(INTERNAL_API_KEY).AnyContext() != null)
-                return;
-
-            var user = await _userRepository.GetByIdAsync(userId, o => o.Cache()).AnyContext();
-            var organization = new Organization { Name = "Exceptionless" };
-            BillingManager.ApplyBillingPlan(organization, BillingManager.UnlimitedPlan, user);
-            organization = await _organizationRepository.AddAsync(organization, o => o.Cache()).AnyContext();
-
-            var project = new Project { Id = INTERNAL_PROJECT_ID, Name = "API", OrganizationId = organization.Id };
-            project.NextSummaryEndOfDayTicks = SystemClock.UtcNow.Date.AddDays(1).AddHours(1).Ticks;
-            project.AddDefaultNotificationSettings(userId);
-            project = await _projectRepository.AddAsync(project, o => o.Cache()).AnyContext();
-
-            await _tokenRepository.AddAsync(new Token {
-                Id = INTERNAL_API_KEY,
-                OrganizationId = organization.Id,
-                ProjectId = project.Id,
-                CreatedUtc = SystemClock.UtcNow,
-                UpdatedUtc = SystemClock.UtcNow,
-                Type = TokenType.Access
-            }).AnyContext();
-
-            user.OrganizationIds.Add(organization.Id);
-            await _userRepository.SaveAsync(user, o => o.Cache()).AnyContext();
-        }
+        _logger.LogInformation("Enqueued sample event generation for project {ProjectId}: {EventCount} events over {DaysBack} days", projectId, eventCount, daysBack);
+        return workItemId;
     }
 }

@@ -1,33 +1,68 @@
-# Exceptionless
-[![Build status](https://ci.appveyor.com/api/projects/status/4ept2hsism8bygls/branch/master?svg=true)](https://ci.appveyor.com/project/Exceptionless/exceptionless) [![Slack Status](https://slack.exceptionless.com/badge.svg)](https://slack.exceptionless.com) [![Donate](https://img.shields.io/badge/donorbox-donate-blue.svg)](https://donorbox.org/exceptionless?recurring=true) 
+[![Exceptionless](https://raw.githubusercontent.com/exceptionless/MediaKit/main/exceptionless-dark-bg.svg#gh-dark-mode-only "Exceptionless")](https://exceptionless.com#gh-dark-mode-only)
+[![Exceptionless](https://raw.githubusercontent.com/exceptionless/MediaKit/main/exceptionless.svg#gh-light-mode-only "Exceptionless")](https://exceptionless.com#gh-light-mode-only)
 
-The definition of the word exceptionless is: to be without exception. [Exceptionless](http://exceptionless.com) provides real-time error reporting for your JavaScript, Node, .NET Core, ASP.NET, Web API, WebForms, WPF, Console, and MVC apps. It organizes the gathered information into simple actionable data that will help your app become exceptionless!
+[![Build](https://github.com/exceptionless/Exceptionless/workflows/Build/badge.svg?branch=main)](https://github.com/exceptionless/Exceptionless/actions?query=branch%3Amain)
+[![Discord](https://img.shields.io/discord/715744504891703319)](https://discord.gg/6HxgFCx)
+
+The definition of the word exceptionless is: to be without exception. [Exceptionless](https://exceptionless.com) provides real-time error reporting for your JavaScript, Node, .NET Core, ASP.NET, Web API, WebForms, WPF, Console, and MVC apps. It organizes the gathered information into simple actionable data that will help your app become exceptionless!
+
+⭐️ We appreciate your star, it helps!
 
 ## Using Exceptionless
-Refer to the [Exceptionless documentation wiki](https://github.com/exceptionless/Exceptionless/wiki/Getting-Started).
- 
-## Hosting Options
-We provide very reasonably priced hosting at [Exceptionless](http://exceptionless.com). By using our hosted service, you are supporting the project and helping it get better! We also provide set up and support services.
 
-If you would rather host Exceptionless yourself, you will need to follow the [self hosting documentation](https://github.com/exceptionless/Exceptionless/wiki/Self-Hosting). Also, if you want to support the project while self hosting you can send us a pull request or [donation](https://donorbox.org/exceptionless?recurring=true).
+Refer to the [Exceptionless documentation](https://exceptionless.com/docs/).
+
+## Hosting Options
+
+We provide very reasonably priced hosting at [Exceptionless](https://exceptionless.com). By using our hosted service, you are supporting the project and helping it get better! We also provide set up and support services.
+
+Exceptionless can easily be run locally using Docker:
+
+- `docker run --rm -it -p 7110:8080 exceptionless/exceptionless:latest`
+- Open `http://localhost:7110`
+- Create an account. The first account in the system will automatically be an admin.
+
+This will run a completely self-contained simple instance of Exceptionless. It is only suitable for testing purposes since it will not persist data. For more complete setups, check out the [self hosting documentation](https://exceptionless.com/docs/self-hosting/). Also, if you want to support the project while self hosting you can send us a pull request or [donation](https://github.com/sponsors/exceptionless).
 
 ## Contributing
-_In appreciation for anyone who submits a non-trivial pull request, we will give you a free [Exceptionless](http://exceptionless.com) paid plan for a year. After your pull request is accepted, simply send an email to team@exceptionless.io with the name of your organization and we will upgrade you to a paid plan._
 
-1. Please read the [contributing document](https://github.com/exceptionless/Exceptionless/blob/master/CONTRIBUTING.md).
-2. Please follow the steps below to start configuring your Exceptionless development environment.
-  1. Make sure you have [Visual Studio Code](https://code.visualstudio.com) installed. You can also use Visual Studio or JetBrains Rider, but these steps assume you are using Visual Studio Code.
-  2. Make sure you have [Docker](https://www.docker.com/get-docker) installed.
-  3. Open Visual Studio Code and then open the Exceptionless root folder.
-  4. Go to the `Tasks` menu and select `Run Task...` and then select `Start Elasticsearch`.
-  5. Go to the `Debug` menu and select `Start Debugging`.
-  6. Open the `exceptionless.http` file in the Exceptionless root folder and begin making API requests.
-  7. If you want to use the Exceptionless UI then Go to the `Tasks` menu and select `Run Task...` and then select `Start Exceptionless UI` and then open a browser to `http://ex-ui.localtest.me:5100`.
-  8. When running locally in `Development` mode, a global administrator user `test@exceptionless.io` is automatically created with password `tester`.
+_In appreciation for anyone who submits a non-trivial pull request, we will give you a free [Exceptionless](https://exceptionless.com) paid plan for a year. After your pull request is accepted, simply send an email to <team@exceptionless.io> with the name of your organization and we will upgrade you to a paid plan._
+
+Start here:
+
+1. Read the [contributing document](https://github.com/exceptionless/Exceptionless/blob/main/CONTRIBUTING.md).
+2. Install [Docker](https://www.docker.com/get-docker), [.NET 11.0](https://dotnet.microsoft.com/), and [Node 26+](https://nodejs.org/).
+3. Run the app with one of these entry points:
+    - Visual Studio Code: open the repo root and start the `Aspire` launch configuration.
+    - Visual Studio: open `Exceptionless.slnx`, set `Exceptionless.AppHost` as the startup project, and run it.
+    - CLI or Dev Container: run `aspire run` from the repo root.
+
+After startup:
+
+1. Open `https://web-ex.dev.localhost:7131/` if a browser does not open automatically. If Aspire assigns a dynamic port, use the App endpoint shown in its dashboard.
+2. In `Development` mode, a global administrator user `admin@exceptionless.test` with password `tester` is created automatically.
+
+Notes:
+
+1. Running `Exceptionless.AppHost` starts the app and required infrastructure together.
+2. Backend tests bootstrap required infrastructure automatically.
+3. Use Aspire CLI 13.6.5 or newer (`aspire update --self` to update). The AppHost uses the CLI bundle for the dashboard and resource orchestrator; when no CLI is installed, the SDK downloads the matching version through DNX.
+4. Try `dotnet build -mt` for multithreaded builds. Performance depends on the workload and machine.
+
+## UI Development
+
+The Svelte 5 UI in `src/Exceptionless.Web/ClientApp` is the only application frontend and serves at `/`. Aspire starts Svelte together with the API. Primary hash-route bookmarks resolve to the current pages, and existing signed-in sessions are retained.
+
+See the [frontend README](src/Exceptionless.Web/ClientApp/README.md) for development, build, and test commands. Published app images contain the Svelte build at the web root; API-only images retain their API landing page.
+
+For a quick API walkthrough, start with [exceptionless.http](exceptionless.http). The [tests/http](tests/http) folder contains additional examples for manual use, such as querying events, uploading source maps, and obtaining OAuth tokens. These are curated examples, not an automated test suite or an exhaustive endpoint catalog. Set the local API URL and sample variables, then run the requests you need. In Visual Studio Code, use the [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension.
 
 ## Thanks
-Thanks to the community for your support!
 
-Thanks to [JetBrains](http://jetbrains.com) for a community [WebStorm](https://www.jetbrains.com/webstorm/) and [ReSharper](https://www.jetbrains.com/resharper/) license to use on this project. It's the best JavaScript IDE/Visual Studio productivity enhancement hands down.
+Thanks to all the people who have contributed!
 
-Thanks to [Red Gate](http://www.red-gate.com) for providing an open source license for a [.NET Developer Bundle](http://www.red-gate.com/products/dotnet-development/). It's an indepensible tool when you need to track down a performance/memory issue.
+[![contributors](https://contributors-img.web.app/image?repo=exceptionless/exceptionless)](https://github.com/exceptionless/exceptionless/graphs/contributors)
+
+Thanks to [JetBrains](https://jetbrains.com) for a community [WebStorm](https://www.jetbrains.com/webstorm/) and [ReSharper](https://www.jetbrains.com/resharper/) license to use on this project. It's the best JavaScript IDE/Visual Studio productivity enhancement hands down.
+
+Thanks to [Red Gate](https://www.red-gate.com) for providing an open source license for a [.NET Developer Bundle](https://www.red-gate.com/products/dotnet-development/). It's an indispensable tool when you need to track down a performance/memory issue.

@@ -1,47 +1,57 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
-using Exceptionless.Core;
+using System.Text.Json;
+using Exceptionless.Core.Configuration;
 using Exceptionless.Core.Models;
 
-namespace Exceptionless.Web.Models {
-    public class ViewCurrentUser : ViewUser {
-        public ViewCurrentUser(User user) {
-            Id = user.Id;
-            OrganizationIds = user.OrganizationIds;
-            FullName = user.FullName;
-            EmailAddress = user.EmailAddress;
-            EmailNotificationsEnabled = user.EmailNotificationsEnabled;
-            IsEmailAddressVerified = user.IsEmailAddressVerified;
-            IsActive = user.IsActive;
-            Roles = user.Roles;
+namespace Exceptionless.Web.Models;
 
-            Hash = HMACSHA256HashString(user.Id);
-            HasLocalAccount = !String.IsNullOrWhiteSpace(user.Password);
-            OAuthAccounts = user.OAuthAccounts;
-        }
+public record ViewCurrentUser : ViewUser
+{
+    public ViewCurrentUser(User user, IntercomOptions options)
+    {
+        Id = user.Id;
+        OrganizationIds = user.OrganizationIds;
+        FullName = user.FullName;
+        EmailAddress = user.EmailAddress;
+        AvatarUrl = user.AvatarFileName;
+        EmailNotificationsEnabled = user.EmailNotificationsEnabled;
+        IsEmailAddressVerified = user.IsEmailAddressVerified;
+        IsActive = user.IsActive;
+        Roles = user.Roles;
+        OrganizationPreferences = user.OrganizationPreferences;
+        SavedViewOrders = user.SavedViewOrders;
 
-        public string Hash { get; set; }
-        public bool HasLocalAccount { get; set; }
-        public ICollection<OAuthAccount> OAuthAccounts { get; set; }
+        Hash = HMACSHA256HashString(user.Id, options);
+        HasLocalAccount = !String.IsNullOrWhiteSpace(user.Password);
+        OAuthAccounts = user.OAuthAccounts;
+        ProductTours = user.ProductTours;
+    }
 
-        private string HMACSHA256HashString(string value) {
-            if (!Settings.Current.EnableIntercom)
-                return null;
+    public string? Hash { get; set; }
+    public bool HasLocalAccount { get; set; }
+    public ICollection<OAuthAccount> OAuthAccounts { get; set; }
+    public ICollection<UserOrganizationPreference> OrganizationPreferences { get; set; }
+    public ICollection<UserSavedViewOrderPreference> SavedViewOrders { get; set; }
+    public IDictionary<string, JsonElement> ProductTours { get; set; } = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
 
-            byte[] secretKey = Encoding.UTF8.GetBytes(Settings.Current.IntercomAppSecret);
-            byte[] bytes = Encoding.UTF8.GetBytes(value);
-            using (var hmac = new HMACSHA256(secretKey)) {
-                hmac.ComputeHash(bytes);
-                byte[] data = hmac.Hash;
+    private static string? HMACSHA256HashString(string value, IntercomOptions options)
+    {
+        if (!options.EnableIntercom)
+            return null;
 
-                var builder = new StringBuilder();
-                for (int i = 0; i < data.Length; i++)
-                    builder.Append(data[i].ToString("x2"));
+        byte[] secretKey = Encoding.UTF8.GetBytes(options.IntercomSecret!);
+        byte[] bytes = Encoding.UTF8.GetBytes(value);
+        using (var hmac = new HMACSHA256(secretKey))
+        {
+            hmac.ComputeHash(bytes);
+            byte[] data = hmac.Hash ?? throw new InvalidOperationException();
 
-                return builder.ToString();
-            }
+            var builder = new StringBuilder();
+            for (int i = 0; i < data.Length; i++)
+                builder.Append(data[i].ToString("x2"));
+
+            return builder.ToString();
         }
     }
 }

@@ -1,0 +1,82 @@
+@apiUrl = http://localhost:7110/api/v2
+@email = admin@exceptionless.test
+@password = tester
+@organizationId = 537650f3b77efe23a47914f3
+
+### login to test account
+# @name login
+POST {{apiUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "{{email}}",
+    "password": "{{password}}"
+}
+
+###
+
+@token = {{login.response.body.$.token}}
+
+### Get saved views by view
+GET {{apiUrl}}/organizations/{{organizationId}}/saved-views/events
+Authorization: Bearer {{token}}
+
+### Create an organization-wide view with custom columns
+# Set is_private to true for a personal view.
+# @name newSavedView
+POST {{apiUrl}}/organizations/{{organizationId}}/saved-views
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "organization_id": "{{organizationId}}",
+    "name": "Open Events",
+    "filter": "status:open",
+    "time": "[now-7d TO now]",
+    "sort": "-date",
+    "view_type": "events",
+    "is_private": false,
+    "columns": {
+        "summary": {
+            "auto_fill": true,
+            "visible": true,
+            "position": 0
+        },
+        "user": {
+            "visible": true,
+            "position": 1
+        },
+        "date": {
+            "visible": true,
+            "position": 2,
+            "width": 180
+        }
+    }
+}
+
+###
+
+@savedViewId = {{newSavedView.response.body.$.id}}
+
+### Set your default view (use saved_view_id: null to clear it)
+PUT {{apiUrl}}/organizations/{{organizationId}}/saved-view-defaults/user
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "saved_view_id": "{{savedViewId}}"
+}
+
+### Update saved view
+PATCH {{apiUrl}}/saved-views/{{savedViewId}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "name": "Open Events (Last 30d)",
+    "time": "[now-30d TO now]"
+}
+
+### Delete saved view
+DELETE {{apiUrl}}/saved-views/{{savedViewId}}
+Authorization: Bearer {{token}}

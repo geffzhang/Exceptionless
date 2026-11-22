@@ -1,13 +1,14 @@
-﻿using System;
+﻿namespace Exceptionless.Core.Utility;
 
-namespace Exceptionless.Core.Utility {
-    public class NullCoreLastReferenceIdManager : ICoreLastReferenceIdManager {
-        public string GetLastReferenceId() {
-            return null;
-        }
+public class NullCoreLastReferenceIdManager : ICoreLastReferenceIdManager
+{
+    public string? GetLastReferenceId()
+    {
+        return null;
     }
+}
 
-    public interface ICoreLastReferenceIdManager {
-        string GetLastReferenceId();
-    }
+public interface ICoreLastReferenceIdManager
+{
+    string? GetLastReferenceId();
 }

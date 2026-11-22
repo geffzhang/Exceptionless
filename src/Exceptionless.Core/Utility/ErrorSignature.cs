@@ -1,176 +1,215 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Models;
 using Exceptionless.Core.Models.Data;
+using Foundatio.Serializer;
 
-namespace Exceptionless.Core.Utility {
-    public class ErrorSignature {
-        private readonly HashSet<string> _userNamespaces;
-        private readonly HashSet<string> _userCommonMethods;
-        private static readonly string[] _defaultNonUserNamespaces = { "System", "Microsoft" };
-        // TODO: Add support for user public key token on signed assemblies
+namespace Exceptionless.Core.Utility;
 
-        public ErrorSignature(Error error, IEnumerable<string> userNamespaces = null, IEnumerable<string> userCommonMethods = null, bool emptyNamespaceIsUserMethod = true, bool shouldFlagSignatureTarget = true) {
-            Error = error ?? throw new ArgumentNullException(nameof(error));
+public class ErrorSignature
+{
+    private readonly HashSet<string> _userNamespaces;
+    private readonly HashSet<string> _userCommonMethods;
+    private readonly ITextSerializer _serializer;
+    private static readonly string[] _defaultNonUserNamespaces = ["System", "Microsoft"];
+    // TODO: Add support for user public key token on signed assemblies
 
-            _userNamespaces = userNamespaces == null
-                ? new HashSet<string>()
-                : new HashSet<string>(userNamespaces);
+    public ErrorSignature(Error error, ITextSerializer serializer, IEnumerable<string>? userNamespaces = null, IEnumerable<string>? userCommonMethods = null, bool emptyNamespaceIsUserMethod = true, bool shouldFlagSignatureTarget = true)
+    {
+        Error = error ?? throw new ArgumentNullException(nameof(error));
+        _serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
 
-            _userCommonMethods = userCommonMethods == null
-                ? new HashSet<string>()
-                : new HashSet<string>(userCommonMethods);
+        _userNamespaces = userNamespaces is null
+            ? []
+            : [.. userNamespaces];
 
-            EmptyNamespaceIsUserMethod = emptyNamespaceIsUserMethod;
+        _userCommonMethods = userCommonMethods is null
+            ? []
+            : [.. userCommonMethods];
 
-            SignatureInfo = new SettingsDictionary();
-            ShouldFlagSignatureTarget = shouldFlagSignatureTarget;
+        EmptyNamespaceIsUserMethod = emptyNamespaceIsUserMethod;
 
-            Parse();
+        SignatureInfo = new SettingsDictionary();
+        ShouldFlagSignatureTarget = shouldFlagSignatureTarget;
+
+        Parse();
+    }
+
+    public string[] UserNamespaces => _userNamespaces.ToArray();
+
+    public string[] UserCommonMethods => _userCommonMethods.ToArray();
+
+    public Error Error { get; private set; }
+
+    public bool EmptyNamespaceIsUserMethod { get; private set; }
+
+    public SettingsDictionary SignatureInfo { get; private set; }
+
+    public string? SignatureHash { get; private set; }
+
+    public bool IsUser { get; private set; }
+    public bool ShouldFlagSignatureTarget { get; private set; }
+
+    private void Parse()
+    {
+        SignatureInfo.Clear();
+
+        // start at the inner most exception and work our way out until we find a user method
+        InnerError current = Error;
+        var errorStack = new List<InnerError> { current };
+        while (current.Inner is not null)
+        {
+            current = current.Inner;
+            errorStack.Add(current);
         }
 
-        public string[] UserNamespaces => _userNamespaces.ToArray();
+        errorStack.Reverse();
 
-        public string[] UserCommonMethods => _userCommonMethods.ToArray();
+        // reset all flags before we figure out which method to tag as the new target.
+        if (ShouldFlagSignatureTarget)
+            errorStack.ForEach(es => es.StackTrace?.ForEach(st => st.IsSignatureTarget = false));
 
-        public Error Error { get; private set; }
+        foreach (var e in errorStack)
+        {
+            var stackTrace = e.StackTrace;
+            if (stackTrace is null)
+                continue;
 
-        public bool EmptyNamespaceIsUserMethod { get; private set; }
-
-        public SettingsDictionary SignatureInfo { get; private set; }
-
-        public string SignatureHash { get; private set; }
-
-        public bool IsUser { get; private set; }
-        public bool ShouldFlagSignatureTarget { get; private set; }
-
-        private void Parse() {
-            SignatureInfo.Clear();
-
-            // start at the inner most exception and work our way out until we find a user method
-            InnerError current = Error;
-            var errorStack = new List<InnerError> { current };
-            while (current.Inner != null) {
-                current = current.Inner;
-                errorStack.Add(current);
+            foreach (var stackFrame in stackTrace.Where(IsUserFrame))
+            {
+                SignatureInfo.AddItemIfNotEmpty("ExceptionType", e.Type);
+                SignatureInfo.AddItemIfNotEmpty("Method", GetStackFrameSignature(stackFrame));
+                if (ShouldFlagSignatureTarget)
+                    stackFrame.IsSignatureTarget = true;
+                AddSpecialCaseDetails(e);
+                UpdateInfo(true);
+                return;
             }
+        }
 
-            errorStack.Reverse();
+        // We haven't found a user method yet, try some alternatives with the inner most error.
+        var innerMostError = errorStack[0];
 
-            // reset all flags before we figure out which method to tag as the new target.
+        if (innerMostError.TargetMethod is not null)
+        {
+            // Use the target method if it exists.
+            SignatureInfo.AddItemIfNotEmpty("ExceptionType", innerMostError.Type);
+            SignatureInfo.AddItemIfNotEmpty("Method", GetStackFrameSignature(innerMostError.TargetMethod));
             if (ShouldFlagSignatureTarget)
-                errorStack.ForEach(es => es.StackTrace.ForEach(st => st.IsSignatureTarget = false));
-
-            foreach (var e in errorStack) {
-                var stackTrace = e.StackTrace;
-                if (stackTrace == null)
-                    continue;
-
-                foreach (var stackFrame in stackTrace.Where(IsUserFrame)) {
-                    SignatureInfo.AddItemIfNotEmpty("ExceptionType", e.Type);
-                    SignatureInfo.AddItemIfNotEmpty("Method", GetStackFrameSignature(stackFrame));
-                    if (ShouldFlagSignatureTarget)
-                        stackFrame.IsSignatureTarget = true;
-                    AddSpecialCaseDetails(e);
-                    UpdateInfo(true);
-                    return;
-                }
-            }
-
-            // We haven't found a user method yet, try some alternatives with the inner most error.
-            var innerMostError = errorStack[0];
-
-            if (innerMostError.TargetMethod != null) {
-                // Use the target method if it exists.
-                SignatureInfo.AddItemIfNotEmpty("ExceptionType", innerMostError.Type);
-                SignatureInfo.AddItemIfNotEmpty("Method", GetStackFrameSignature(innerMostError.TargetMethod));
-                if (ShouldFlagSignatureTarget)
-                    innerMostError.TargetMethod.IsSignatureTarget = true;
-            } else if (innerMostError.StackTrace != null && innerMostError.StackTrace.Count > 0) {
-                // Use the topmost stack frame.
-                SignatureInfo.AddItemIfNotEmpty("ExceptionType", innerMostError.Type);
-                SignatureInfo.AddItemIfNotEmpty("Method", GetStackFrameSignature(innerMostError.StackTrace[0]));
-                if (ShouldFlagSignatureTarget)
-                    innerMostError.StackTrace[0].IsSignatureTarget = true;
-            } else {
-                // All else failed, use the type.
-                SignatureInfo.AddItemIfNotEmpty("ExceptionType", innerMostError.Type);
-            }
-
-            AddSpecialCaseDetails(innerMostError);
-            if (SignatureInfo.Count == 0)
-                SignatureInfo.Add("NoStackingInformation", Guid.NewGuid().ToString());
-
-            UpdateInfo(false);
+                innerMostError.TargetMethod.IsSignatureTarget = true;
+        }
+        else if (innerMostError.StackTrace is not null && innerMostError.StackTrace.Count > 0)
+        {
+            // Use the topmost stack frame.
+            SignatureInfo.AddItemIfNotEmpty("ExceptionType", innerMostError.Type);
+            SignatureInfo.AddItemIfNotEmpty("Method", GetStackFrameSignature(innerMostError.StackTrace[0]));
+            if (ShouldFlagSignatureTarget)
+                innerMostError.StackTrace[0].IsSignatureTarget = true;
+        }
+        else
+        {
+            // All else failed, use the type.
+            SignatureInfo.AddItemIfNotEmpty("ExceptionType", innerMostError.Type);
         }
 
-        private void UpdateInfo(bool isUser) {
-            IsUser = isUser;
-            RecalculateHash();
+        AddSpecialCaseDetails(innerMostError);
+        if (SignatureInfo.Count == 0)
+            SignatureInfo.Add("NoStackingInformation", Guid.NewGuid().ToString());
+
+        UpdateInfo(false);
+    }
+
+    private void UpdateInfo(bool isUser)
+    {
+        IsUser = isUser;
+        RecalculateHash();
+    }
+
+    public void RecalculateHash()
+    {
+        SignatureHash = SignatureInfo.Values.Any(v => v is not null) ? SignatureInfo.Values.ToSHA1() : null;
+    }
+
+    private static string GetStackFrameSignature(Method method)
+    {
+        if (method is StackFrame frame && TryGetSourceMappedLocationSignature(frame, out string signature))
+        {
+            return signature;
         }
 
-        public void RecalculateHash() {
-            SignatureHash = SignatureInfo.Values.Any(v => v != null) ? SignatureInfo.Values.ToSHA1() : null;
+        return method.GetSignature();
+    }
+
+    private bool IsUserFrame(StackFrame frame)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+
+        bool hasSourceMappedLocation = TryGetSourceMappedLocationSignature(frame, out string sourceMappedLocationSignature);
+        if (frame.Name is null && !hasSourceMappedLocation)
+        {
+            return false;
         }
 
-        private string GetStackFrameSignature(Method method) {
-            var builder = new StringBuilder(255);
-
-            if (method == null)
-                return builder.ToString();
-
-            builder.Append(method.GetSignature());
-
-            return builder.ToString();
-        }
-
-        private bool IsUserFrame(StackFrame frame) {
-            if (frame == null)
-                throw new ArgumentNullException(nameof(frame));
-
-            if (frame.Name == null)
+        // Assume user method if no namespace
+        bool isEmptyNamespaceMethod = EmptyNamespaceIsUserMethod && frame.DeclaringNamespace.IsNullOrEmpty();
+        if (!isEmptyNamespaceMethod)
+        {
+            bool isUserNamespace = IsUserNamespace(frame.DeclaringNamespace);
+            if (!isUserNamespace)
                 return false;
-
-            // Assume user method if no namespace
-            bool isEmptyNamespaceMethod = EmptyNamespaceIsUserMethod && frame.DeclaringNamespace.IsNullOrEmpty();
-            if (!isEmptyNamespaceMethod) {
-                bool isUserNamespace = IsUserNamespace(frame.DeclaringNamespace);
-                if (!isUserNamespace)
-                    return false;
-            }
-
-            return !UserCommonMethods.Any(frame.GetSignature().Contains);
         }
 
-        private bool IsUserNamespace(string ns) {
-            if (String.IsNullOrEmpty(ns))
-                return false;
+        string frameSignature = hasSourceMappedLocation ? sourceMappedLocationSignature : frame.GetSignature();
+        return !UserCommonMethods.Any(frameSignature.Contains);
+    }
 
-            // if no user namespaces were set, return any non-system namespace as true
-            if (UserNamespaces == null || _userNamespaces.Count == 0)
-                return !_defaultNonUserNamespaces.Any(ns.StartsWith);
-
-            return UserNamespaces.Any(ns.StartsWith);
+    private static bool TryGetSourceMappedLocationSignature(StackFrame frame, out string signature)
+    {
+        signature = String.Empty;
+        if (frame.Name is not null
+            || String.IsNullOrWhiteSpace(frame.FileName)
+            || frame.LineNumber is null
+            || frame.Data?.ContainsKey(StackFrame.KnownDataKeys.SourceMap) != true)
+        {
+            return false;
         }
 
-        private void AddSpecialCaseDetails(InnerError error) {
-            if (!error.Data.ContainsKey(Error.KnownDataKeys.ExtraProperties))
-                return;
+        signature = frame.Column is null
+            ? $"{frame.FileName}:{frame.LineNumber}"
+            : $"{frame.FileName}:{frame.LineNumber}:{frame.Column}";
+        return true;
+    }
 
-            var extraProperties = error.Data.GetValue<Dictionary<string, object>>(Error.KnownDataKeys.ExtraProperties);
-            if (extraProperties == null) {
-                error.Data.Remove(Error.KnownDataKeys.ExtraProperties);
-                return;
-            }
+    private bool IsUserNamespace(string? ns)
+    {
+        if (String.IsNullOrEmpty(ns))
+            return false;
 
-            if (extraProperties.TryGetValue("Number", out object value))
-                SignatureInfo.Add("Number", value.ToString());
+        // if no user namespaces were set, return any non-system namespace as true
+        if (_userNamespaces.Count == 0)
+            return !_defaultNonUserNamespaces.Any(ns.StartsWith);
 
-            if (extraProperties.TryGetValue("ErrorCode", out value))
-                SignatureInfo.Add("ErrorCode", value.ToString());
+        return UserNamespaces.Any(ns.StartsWith);
+    }
+
+    private void AddSpecialCaseDetails(InnerError error)
+    {
+        if (error.Data is null)
+            return;
+
+        if (!error.Data.ContainsKey(Error.KnownDataKeys.ExtraProperties))
+            return;
+
+        var extraProperties = error.Data.GetValue<Dictionary<string, object>>(Error.KnownDataKeys.ExtraProperties, _serializer);
+        if (extraProperties is null)
+        {
+            error.Data.Remove(Error.KnownDataKeys.ExtraProperties);
+            return;
         }
+
+        if (extraProperties.TryGetValue("Number", out object? value) && value is not null)
+            SignatureInfo.Add("Number", value.ToString()!);
+
+        if (extraProperties.TryGetValue("ErrorCode", out value) && value is not null)
+            SignatureInfo.Add("ErrorCode", value.ToString()!);
     }
 }

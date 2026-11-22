@@ -1,9 +1,12 @@
-﻿using System;
+﻿using System.ComponentModel.DataAnnotations;
 
-namespace Exceptionless.Core.Models {
-    public class Invite {
-        public string Token { get; set; }
-        public string EmailAddress { get; set; }
-        public DateTime DateAdded { get; set; }
-    }
+namespace Exceptionless.Core.Models;
+
+public record Invite
+{
+    public required string Token { get; init; }
+
+    [EmailAddress]
+    public required string EmailAddress { get; init; }
+    public required DateTime DateAdded { get; init; }
 }

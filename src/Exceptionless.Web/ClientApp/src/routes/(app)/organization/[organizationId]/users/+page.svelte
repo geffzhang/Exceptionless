@@ -1,0 +1,110 @@
+<script lang="ts">
+    import { page } from '$app/state';
+    import { ProblemDetails } from '@foundatiofx/fetchclient';
+    import Plus from '@lucide/svelte/icons/plus';
+    import { createTable } from '@tanstack/svelte-table';
+    import { toast } from 'svelte-sonner';
+
+    import type { ViewUser } from '#features/users/models.ts';
+
+    import DataTableViewOptions from '#comp/data-table/data-table-view-options.svelte';
+    import { Muted } from '#comp/typography/index.ts';
+    import { Button } from '#comp/ui/button/index.ts';
+    import { showBillingDialogOnUpgradeProblem } from '#features/billing/index.ts';
+    import { addOrganizationUser } from '#features/organizations/api.svelte.ts';
+    import { DEFAULT_LIMIT } from '#features/shared/api/api.svelte.ts';
+    import { type GetOrganizationUsersParams, getOrganizationUsersQuery } from '#features/users/api.svelte.ts';
+    import InviteUserDialog from '#features/users/components/invite-user-dialog.svelte';
+    import { getTableOptions } from '#features/users/components/table/options.svelte.ts';
+    import UsersDataTable from '#features/users/components/table/users-data-table.svelte';
+    import { createQueryParameters } from '#shared/query-params/index.ts';
+
+    const organizationId = $derived(page.params.organizationId || '');
+
+    const DEFAULT_PARAMS = {
+        limit: DEFAULT_LIMIT
+    };
+
+    const queryParams = createQueryParameters({
+        defaults: DEFAULT_PARAMS,
+        history: 'push',
+        schema: {
+            limit: 'number'
+        }
+    });
+
+    const usersQueryParameters: GetOrganizationUsersParams = $state({
+        get limit() {
+            return queryParams.limit!;
+        },
+        set limit(value) {
+            queryParams.limit = value;
+        }
+    });
+
+    const usersQuery = getOrganizationUsersQuery({
+        get params() {
+            return usersQueryParameters;
+        },
+        route: {
+            get organizationId() {
+                return organizationId;
+            }
+        }
+    });
+
+    const table = createTable(getTableOptions<ViewUser>(usersQueryParameters, usersQuery, () => organizationId));
+
+    const addUserMutation = addOrganizationUser({
+        route: {
+            get organizationId() {
+                return organizationId;
+            }
+        }
+    });
+
+    $effect(() => {
+        queryParams.limit ??= DEFAULT_LIMIT;
+    });
+
+    let showInviteDialog = $state(false);
+    let toastId = $state<number | string>();
+
+    function handleInviteUser() {
+        showInviteDialog = true;
+    }
+
+    async function inviteUser(email: string): Promise<void> {
+        toast.dismiss(toastId);
+
+        try {
+            await addUserMutation.mutateAsync(email);
+            toastId = toast.success('User invited successfully');
+        } catch (error: unknown) {
+            if (showBillingDialogOnUpgradeProblem(error, organizationId, () => inviteUser(email))) {
+                return;
+            }
+
+            const message = error instanceof ProblemDetails ? error.title : 'Please try again.';
+            toastId = toast.error(`An error occurred while trying to invite the user: ${message}`);
+            throw error;
+        }
+    }
+</script>
+
+<div class="space-y-6">
+    <Muted>Manage users for this organization</Muted>
+
+    <UsersDataTable bind:limit={usersQueryParameters.limit!} isLoading={usersQuery.isLoading} {table}>
+        {#snippet toolbarChildren()}
+            <div class="flex-1"></div>
+            <DataTableViewOptions size="icon-lg" {table} />
+            <Button size="icon-lg" onclick={handleInviteUser} title="Invite User">
+                <Plus class="size-4" aria-hidden="true" />
+                <span class="sr-only">Invite User</span>
+            </Button>
+        {/snippet}
+    </UsersDataTable>
+</div>
+
+<InviteUserDialog bind:open={showInviteDialog} {inviteUser} />

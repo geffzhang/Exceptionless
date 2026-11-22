@@ -1,0 +1,110 @@
+global:
+  cloud: aks
+  clusterName: ex-k8s-v6
+  deploymentEnvironment: prod
+otelCollectorEndpoint: https://ingest.us.signoz.cloud:443
+otelInsecure: false
+presets:
+  otlpExporter:
+    enabled: false
+  otlphttpExporter:
+    enabled: true
+  loggingExporter:
+    enabled: false
+  logsCollection:
+    enabled: false
+  resourceDetection:
+    detectors:
+      - azure
+      - system
+  hostMetrics:
+    enabled: true
+    collectionInterval: 60s
+  kubeletMetrics:
+    enabled: true
+    collectionInterval: 60s
+  clusterMetrics:
+    enabled: true
+    collectionInterval: 60s
+  prometheus:
+    enabled: true
+    scrapeInterval: 30s
+    namespaceScoped: false
+    namespaces:
+      - ex-prod
+    scrapeConfigs:
+      - job_name: elasticsearch
+        static_configs:
+          - targets:
+              - es-exporter-prometheus-elasticsearch-exporter.ex-prod:9108
+otelDeployment:
+  config:
+    processors:
+      filter/drop_es_per_index:
+        error_mode: ignore
+        metrics:
+          datapoint:
+            - 'IsMatch(metric.name, "^elasticsearch_") and attributes["index"] != nil'
+      filter/drop_redis_latency:
+        error_mode: ignore
+        metrics:
+          metric:
+            - 'IsMatch(name, "^redis_commands_latencies_usec")'
+            - 'IsMatch(name, "^redis_latency_percentiles_usec")'
+    service:
+      pipelines:
+        metrics/scraper:
+          processors: [resource/deployenv, resourcedetection, filter/drop_es_per_index, filter/drop_redis_latency, batch]
+otelAgent:
+  config:
+    exporters:
+      otlp/elastic:
+        endpoint: http://apm.elastic-system.svc:8200
+        tls:
+          insecure: true
+    processors:
+      filter/drop_unused_metrics:
+        error_mode: ignore
+        metrics:
+          exclude:
+            match_type: strict
+            metric_names:
+              - http.client.request.duration
+              - http.client.request.time_in_queue
+              - http.client.connection.duration
+              - http.client.open_connections
+              - http.client.active_requests
+              - dns.lookup.duration
+              - kestrel.connection.duration
+              - aspnetcore.authentication.authenticate.duration
+              - aspnetcore.routing.match_attempts
+              - dotnet.exceptions
+              - dotnet.gc.collections
+              - dotnet.gc.last_collection.heap.size
+              - dotnet.gc.last_collection.heap.fragmentation.size
+              - dotnet.process.cpu.time
+              - foundatio.lock.wait.time
+              - ex.posts.size
+              - ex.events.parse.jsoneventparserplugin
+              - ex.events.field.count
+              - ex.eventpipeline.markascriticalaction
+      filter/volumes_pvc_only:
+        error_mode: ignore
+        metrics:
+          datapoint:
+            - 'IsMatch(metric.name, "^k8s\\.volume\\.") and attributes["k8s.volume.type"] != "persistentVolumeClaim"'
+      filter/drop_cache_spans:
+        error_mode: ignore
+        traces:
+          span:
+            - 'attributes["db.system"] == "redis" and status.code != STATUS_CODE_ERROR'
+            - 'attributes["db.system.name"] == "redis" and status.code != STATUS_CODE_ERROR'
+            - 'name == "Message: EntityChanged"'
+    service:
+      pipelines:
+        traces:
+          processors: [filter/drop_cache_spans, batch]
+          exporters: [otlphttp, otlp/elastic]
+        metrics:
+          processors: [filter/drop_unused_metrics, filter/volumes_pvc_only, batch]
+          exporters: [otlphttp, otlp/elastic]

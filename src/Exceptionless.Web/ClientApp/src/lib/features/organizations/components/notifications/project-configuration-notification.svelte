@@ -1,0 +1,34 @@
+<script lang="ts">
+    import { resolve } from '$app/paths';
+
+    import type { NotificationProps } from '#comp/notification/index.ts';
+    import type { ViewProject } from '#features/projects/models.ts';
+
+    import { Notification, NotificationDescription, NotificationTitle } from '#comp/notification/index.ts';
+    import { A } from '#comp/typography/index.ts';
+
+    interface Props extends NotificationProps {
+        projects: ViewProject[];
+    }
+
+    let { projects, ...restProps }: Props = $props();
+
+    const configureHref = $derived.by(() => {
+        const project = projects[0];
+
+        if (projects.length === 1 && project) {
+            return resolve('/(app)/project/[projectId]/configure', {
+                projectId: project.id
+            });
+        }
+
+        return resolve('/(app)/project/list');
+    });
+</script>
+
+<Notification variant="information" {...restProps}>
+    <NotificationTitle>We haven't received any events yet!</NotificationTitle>
+    <NotificationDescription>
+        Open <A href={configureHref}>Client setup</A> to connect your app and send your first event.
+    </NotificationDescription>
+</Notification>

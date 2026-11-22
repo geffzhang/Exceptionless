@@ -1,39 +1,48 @@
-﻿using System;
-using System.Threading.Tasks;
-using Exceptionless.Core.Extensions;
+﻿using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Models;
 using Exceptionless.Core.Pipeline;
-using Exceptionless.Core.Models.Data;
+using Foundatio.Serializer;
 using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Plugins.EventProcessor {
-    [Priority(30)]
-    public sealed class SimpleErrorPlugin : EventProcessorPluginBase {
-        public SimpleErrorPlugin(ILoggerFactory loggerFactory = null) : base(loggerFactory) {}
+namespace Exceptionless.Core.Plugins.EventProcessor;
 
-        public override Task EventProcessingAsync(EventContext context) {
-            if (!context.Event.IsError())
-                return Task.CompletedTask;
+[Priority(30)]
+public sealed class SimpleErrorPlugin : EventProcessorPluginBase
+{
+    private readonly ITextSerializer _serializer;
 
-            var error = context.Event.GetSimpleError();
-            if (error == null)
-                return Task.CompletedTask;
-            
-            if (String.IsNullOrWhiteSpace(context.Event.Message))
-                context.Event.Message = error.Message;
-            
-            if (context.StackSignatureData.Count > 0)
-                return Task.CompletedTask;
+    public SimpleErrorPlugin(ITextSerializer serializer, AppOptions options, ILoggerFactory loggerFactory) : base(options, loggerFactory)
+    {
+        _serializer = serializer;
+    }
 
-            // TODO: Parse the stack trace and upgrade this to a full error.
-            if (!String.IsNullOrEmpty(error.Type))
-                context.StackSignatureData.Add("ExceptionType", error.Type);
-
-            if (!String.IsNullOrEmpty(error.StackTrace))
-                context.StackSignatureData.Add("StackTrace", error.StackTrace.ToSHA1());
-
-            error.Data[Error.KnownDataKeys.TargetInfo] = new SettingsDictionary(context.StackSignatureData);
+    public override Task EventProcessingAsync(EventContext context)
+    {
+        if (!context.Event.IsError())
             return Task.CompletedTask;
-        }
+
+        var error = context.Event.GetSimpleError(_serializer, _logger);
+        if (error is null)
+            return Task.CompletedTask;
+
+        if (String.IsNullOrWhiteSpace(context.Event.Message))
+            context.Event.Message = error.Message;
+
+        if (context.StackSignatureData.Count > 0)
+            return Task.CompletedTask;
+
+        // TODO: Parse the stack trace and upgrade this to a full error.
+        if (!String.IsNullOrEmpty(error.Type))
+            context.StackSignatureData.Add("ExceptionType", error.Type);
+
+        if (!String.IsNullOrEmpty(error.StackTrace))
+            context.StackSignatureData.Add("StackTrace", error.StackTrace.ToSHA1());
+
+        error.SetTargetInfo(new SettingsDictionary(context.StackSignatureData));
+
+        // Write the mutated error back so @target persists (see ErrorPlugin for rationale).
+        context.Event.SetSimpleError(error);
+
+        return Task.CompletedTask;
     }
 }

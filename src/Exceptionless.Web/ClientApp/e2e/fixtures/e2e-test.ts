@@ -1,0 +1,330 @@
+import { test as base, expect, type TestInfo } from '@playwright/test';
+
+import { runCleanupStep, throwIfCleanupFailed } from '../support/cleanup';
+import { E2EApiClient } from './api-client';
+import { getE2EEnvironment } from './environment';
+
+export const E2E_TEST_PASSWORD = 'tester';
+
+export const E2E_ORGANIZATION_NAME_PREFIX = 'E2E Playwright Org';
+export const E2E_REFERENCE_ID_MAX_LENGTH = 100;
+
+const E2E_REFERENCE_ID_PREFIX = 'pw-e2e-';
+const SECONDARY_ORGANIZATION_REFERENCE_SUFFIX = '-organization';
+const SECONDARY_PROJECT_REFERENCE_SUFFIX = '-secondary';
+
+export interface E2EScenario {
+    email: string;
+    message: string;
+    organizationId: string;
+    organizationName: string;
+    projectId: string;
+    projectName: string;
+    projectToken: string;
+    referenceId: string;
+    run: string;
+    userName: string;
+    userToken: string;
+}
+
+export interface E2ESecondaryOrganization extends E2ESecondaryProject {
+    organizationId: string;
+    organizationName: string;
+}
+
+export interface E2ESecondaryProject {
+    message: string;
+    projectId: string;
+    projectName: string;
+    projectToken: string;
+    referenceId: string;
+}
+
+interface E2EFixtures {
+    e2eApi: E2EApiClient;
+    e2eCleanupPassword: string;
+    e2eDismissProductTourWelcome: boolean;
+    e2eInjectBrowserToken: boolean;
+    e2eScenario: E2EScenario;
+    e2eSecondaryOrganization: E2ESecondaryOrganization;
+    e2eSecondaryProject: E2ESecondaryProject;
+    e2eUseGeneratedUser: boolean;
+    e2eUseInvitedUser: boolean;
+    e2eUserInvitation: undefined | { organizationId: string; token: string };
+    effectDepthGuard: void;
+}
+
+export const test = base.extend<E2EFixtures>({
+    e2eApi: async ({ request }, use) => {
+        await use(new E2EApiClient(request, getE2EEnvironment()));
+    },
+
+    e2eCleanupPassword: [E2E_TEST_PASSWORD, { option: true }],
+
+    e2eDismissProductTourWelcome: [true, { option: true }],
+
+    e2eInjectBrowserToken: [true, { option: true }],
+
+    e2eScenario: async (
+        { e2eApi, e2eCleanupPassword, e2eDismissProductTourWelcome, e2eInjectBrowserToken, e2eUseGeneratedUser, e2eUserInvitation, page },
+        use,
+        testInfo
+    ) => {
+        const run = createRunName(e2eApi.environment.runId, testInfo);
+        const userName = `Playwright User ${run}`;
+        const email = `playwright-${run}@exceptionless.test`.toLowerCase();
+        const organizationName = `${E2E_ORGANIZATION_NAME_PREFIX} ${run}`;
+        const projectName = `Playwright Project ${run}`;
+        const referenceId = createReferenceId(run);
+        const message = `Playwright onboarding event ${run}`;
+        let organizationId: string | undefined;
+        let projectId: string | undefined;
+        let userToken: string | undefined;
+        let createdUser = false;
+        let generatedUserSignupAttempted = false;
+
+        try {
+            if (!e2eUseGeneratedUser && !e2eUserInvitation && !e2eApi.environment.isProduction && e2eApi.environment.email && e2eApi.environment.password) {
+                userToken = await e2eApi.login();
+            } else {
+                generatedUserSignupAttempted = true;
+                userToken = await e2eApi.signup(userName, email, E2E_TEST_PASSWORD, e2eUserInvitation?.token);
+                createdUser = true;
+            }
+
+            const organization = await e2eApi.createOrganization(userToken, organizationName);
+            organizationId = organization.id;
+            if (e2eUserInvitation) {
+                await e2eApi.deleteOrganizationUser(userToken, e2eUserInvitation.organizationId, email);
+                await e2eApi.waitForOrganizationNotListed(userToken, e2eUserInvitation.organizationId);
+            }
+            const project = await e2eApi.createProject(userToken, organization.id, projectName);
+            projectId = project.id;
+            const projectToken = await e2eApi.getProjectDefaultToken(userToken, project.id);
+            if (e2eDismissProductTourWelcome) {
+                await e2eApi.recordProductTour(userToken, 'app-welcome');
+            }
+
+            if (e2eInjectBrowserToken) {
+                await page.addInitScript(
+                    ({ organizationId, token }) => {
+                        window.localStorage.setItem('satellizer_token', token);
+                        if (!window.localStorage.getItem('organization')) {
+                            window.localStorage.setItem('organization', JSON.stringify(organizationId));
+                        }
+                    },
+                    { organizationId: organization.id, token: userToken }
+                );
+            }
+
+            await use({
+                email,
+                message,
+                organizationId: organization.id,
+                organizationName,
+                projectId: project.id,
+                projectName,
+                projectToken: projectToken.id,
+                referenceId,
+                run,
+                userName,
+                userToken
+            });
+        } finally {
+            const cleanupErrors: Error[] = [];
+
+            if (generatedUserSignupAttempted && !userToken) {
+                await runCleanupStep(cleanupErrors, 'recover generated user session for cleanup', async () => {
+                    userToken = await e2eApi.loginIfExists(email, E2E_TEST_PASSWORD);
+                    createdUser = Boolean(userToken);
+                });
+            }
+
+            if (createdUser && userToken) {
+                await runCleanupStep(cleanupErrors, 'restore generated user session for cleanup', async () => {
+                    if (!(await e2eApi.getCurrentUser(userToken!))) {
+                        userToken = await e2eApi.login(email, e2eCleanupPassword);
+                    }
+                });
+            }
+
+            if (userToken && projectId) {
+                await runCleanupStep(cleanupErrors, `delete project ${projectId}`, async () => {
+                    await e2eApi.deleteProject(userToken!, projectId!);
+                    await e2eApi.waitForProjectDeleted(userToken!, projectId!);
+                });
+            }
+
+            if (userToken && organizationId) {
+                await runCleanupStep(cleanupErrors, `delete organization ${organizationId}`, async () => {
+                    await e2eApi.deleteOrganization(userToken!, organizationId!);
+                    await e2eApi.waitForOrganizationDeleted(userToken!, organizationId!);
+                });
+            }
+
+            if (userToken && createdUser) {
+                await runCleanupStep(cleanupErrors, 'delete generated user', async () => {
+                    await e2eApi.deleteCurrentUser(userToken!);
+                    await e2eApi.waitForCurrentUserDeleted(userToken!);
+                });
+            }
+
+            throwIfCleanupFailed(cleanupErrors);
+        }
+    },
+
+    e2eSecondaryOrganization: async ({ e2eApi, e2eScenario }, use) => {
+        const organizationName = `${E2E_ORGANIZATION_NAME_PREFIX} Secondary ${e2eScenario.run}`;
+        const projectName = `Playwright Secondary Organization Project ${e2eScenario.run}`;
+        const referenceId = createReferenceId(e2eScenario.run, SECONDARY_ORGANIZATION_REFERENCE_SUFFIX);
+        const message = `Playwright secondary organization event ${e2eScenario.run}`;
+        let organizationId: string | undefined;
+        let projectId: string | undefined;
+
+        try {
+            const organization = await e2eApi.createOrganization(e2eScenario.userToken, organizationName);
+            organizationId = organization.id;
+            await e2eApi.waitForOrganizationListed(e2eScenario.userToken, organization.id);
+            const project = await e2eApi.createProject(e2eScenario.userToken, organization.id, projectName);
+            projectId = project.id;
+            const projectToken = await e2eApi.getProjectDefaultToken(e2eScenario.userToken, project.id);
+
+            await use({
+                message,
+                organizationId: organization.id,
+                organizationName,
+                projectId: project.id,
+                projectName,
+                projectToken: projectToken.id,
+                referenceId
+            });
+        } finally {
+            const cleanupErrors: Error[] = [];
+
+            if (projectId) {
+                await runCleanupStep(cleanupErrors, `delete secondary organization project ${projectId}`, async () => {
+                    await e2eApi.deleteProject(e2eScenario.userToken, projectId!);
+                    await e2eApi.waitForProjectDeleted(e2eScenario.userToken, projectId!);
+                });
+            }
+
+            if (organizationId) {
+                await runCleanupStep(cleanupErrors, `delete secondary organization ${organizationId}`, async () => {
+                    await e2eApi.deleteOrganization(e2eScenario.userToken, organizationId!);
+                    await e2eApi.waitForOrganizationDeleted(e2eScenario.userToken, organizationId!);
+                });
+            }
+
+            throwIfCleanupFailed(cleanupErrors);
+        }
+    },
+
+    e2eSecondaryProject: async ({ e2eApi, e2eScenario }, use) => {
+        const projectName = `Playwright Secondary Project ${e2eScenario.run}`;
+        const referenceId = createReferenceId(e2eScenario.run, SECONDARY_PROJECT_REFERENCE_SUFFIX);
+        const message = `Playwright secondary project event ${e2eScenario.run}`;
+        let projectId: string | undefined;
+
+        try {
+            const project = await e2eApi.createProject(e2eScenario.userToken, e2eScenario.organizationId, projectName);
+            projectId = project.id;
+            const projectToken = await e2eApi.getProjectDefaultToken(e2eScenario.userToken, project.id);
+
+            await use({
+                message,
+                projectId: project.id,
+                projectName,
+                projectToken: projectToken.id,
+                referenceId
+            });
+        } finally {
+            const cleanupErrors: Error[] = [];
+
+            if (projectId) {
+                await runCleanupStep(cleanupErrors, `delete secondary project ${projectId}`, async () => {
+                    await e2eApi.deleteProject(e2eScenario.userToken, projectId!);
+                    await e2eApi.waitForProjectDeleted(e2eScenario.userToken, projectId!);
+                });
+            }
+
+            throwIfCleanupFailed(cleanupErrors);
+        }
+    },
+
+    e2eUseGeneratedUser: [false, { option: true }],
+
+    e2eUseInvitedUser: [false, { option: true }],
+
+    e2eUserInvitation: async ({ e2eApi, e2eUseInvitedUser }, use, testInfo) => {
+        if (!e2eUseInvitedUser) {
+            await use(undefined);
+            return;
+        }
+
+        if (e2eApi.environment.isProduction) {
+            throw new Error('Invited test users require local Mailpit.');
+        }
+
+        const run = createRunName(e2eApi.environment.runId, testInfo);
+        const email = `playwright-${run}@exceptionless.test`.toLowerCase();
+        const ownerToken = await e2eApi.login();
+        const organization = await e2eApi.createOrganization(ownerToken, `${E2E_ORGANIZATION_NAME_PREFIX} Invitations ${run}`);
+        try {
+            await e2eApi.inviteOrganizationUser(ownerToken, organization.id, email);
+            const inviteToken = await e2eApi.pollForMailToken(email, 'signup');
+            await e2eApi.waitForInvitationListed(ownerToken, organization.id, inviteToken);
+            await use({ organizationId: organization.id, token: inviteToken });
+        } finally {
+            await e2eApi.deleteOrganization(ownerToken, organization.id);
+            await e2eApi.waitForOrganizationDeleted(ownerToken, organization.id);
+        }
+    },
+
+    effectDepthGuard: [
+        async ({ page }, use) => {
+            const errors = new Set<string>();
+            const recordConsoleError = (message: { text: () => string; type: () => string }) => {
+                if (message.type() === 'error' && isEffectDepthError(message.text())) {
+                    errors.add(message.text());
+                }
+            };
+
+            const recordPageError = (error: Error) => {
+                const message = error.stack ?? error.message;
+                if (isEffectDepthError(message)) {
+                    errors.add(message);
+                }
+            };
+
+            page.on('console', recordConsoleError);
+            page.on('pageerror', recordPageError);
+            try {
+                await use();
+            } finally {
+                page.off('console', recordConsoleError);
+                page.off('pageerror', recordPageError);
+                expect([...errors]).toEqual([]);
+            }
+        },
+        { auto: true }
+    ]
+});
+
+export { expect };
+
+export function createReferenceId(run: string, suffix = ''): string {
+    const runLength = E2E_REFERENCE_ID_MAX_LENGTH - E2E_REFERENCE_ID_PREFIX.length - suffix.length;
+    return `${E2E_REFERENCE_ID_PREFIX}${run.slice(0, runLength)}${suffix}`;
+}
+
+export function createRunName(runId: string, testInfo: TestInfo): string {
+    const rawName = [runId, `w${testInfo.workerIndex}`, `r${testInfo.retry}`, Date.now().toString(36)].join('-');
+    return rawName
+        .replace(/[^a-zA-Z0-9_-]/g, '-')
+        .replace(/-+/g, '-')
+        .slice(0, 96);
+}
+
+function isEffectDepthError(message: string): boolean {
+    return /effect_update_depth_exceeded|maximum update depth|svelte\.dev\/e\/effect/i.test(message);
+}

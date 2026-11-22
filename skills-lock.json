@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "skills": {
+    "dogfood": {
+      "source": "vercel-labs/agent-browser",
+      "sourceType": "github",
+      "computedHash": "17a3fc2c1a49df9debce572c7b47521caa96f793597d944c4e648b3aa90738cf"
+    },
+    "releasenotes": {
+      "source": "OpenHands/skills",
+      "sourceType": "github",
+      "computedHash": "1b12297eacd1cd24b9f1eda16dada205b96d9c75fd3bf07474a54775559fff09"
+    },
+    "shadcn-svelte": {
+      "source": "huntabyte/shadcn-svelte",
+      "sourceType": "github",
+      "skillPath": "skills/shadcn-svelte/SKILL.md",
+      "computedHash": "d4f3f983a71466a86649985a8a7fbce47da29f44de3a9d02540bbcf3167134e0"
+    }
+  }
+}

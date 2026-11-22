@@ -1,0 +1,32 @@
+{
+	"servers": {
+        "aspire": {
+            "type": "stdio",
+            "command": "aspire",
+            "args": [
+                "mcp",
+                "start"
+            ]
+        },
+        "chrome-devtools": {
+            "command": "npx",
+            "args": [
+                "chrome-devtools-mcp@latest"
+            ]
+        },
+        "context7": {
+            "url": "https://mcp.context7.com/mcp",
+        },
+		"ESLint": {
+			"type": "stdio",
+			"command": "npx",
+			"args": ["eslint", "--mcp"]
+		},
+        "microsoft-docs": {
+            "url": "https://learn.microsoft.com/api/mcp"
+        },
+        "svelte": {
+            "url": "https://mcp.svelte.dev/mcp"
+        },
+	}
+}

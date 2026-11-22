@@ -1,36 +1,46 @@
-﻿using System;
 using Exceptionless.Web.Utility;
+using Foundatio.Xunit;
 using Xunit;
 
-namespace Exceptionless.Tests.Miscellaneous {
-    public class DeltaTests {
-        [Fact]
-        public void CanSetUnknownProperties() {
-            dynamic delta = new Delta<SimpleMessageA>();
-            delta.Data = "Blah";
-            delta.SomeUnknown = "yes";
-            Assert.Equal(1, delta.UnknownProperties.Count);
-        }
+namespace Exceptionless.Tests.Miscellaneous;
 
-        [Fact]
-        public void CanPatchUnrelatedTypes() {
-            dynamic delta = new Delta<SimpleMessageA>();
-            delta.Data = "Blah";
+public class DeltaTests : TestWithLoggingBase
+{
+    public DeltaTests(ITestOutputHelper output) : base(output)
+    {
+    }
 
-            var msg = new SimpleMessageB {
-                Data = "Blah2"
-            };
-            delta.Patch(msg);
+    [Fact]
+    public void TrySetPropertyValue_UnknownProperty_AddsToUnknownProperties()
+    {
+        dynamic delta = new Delta<SimpleMessageA>();
+        delta.Data = "Blah";
+        delta.SomeUnknown = "yes";
+        Assert.Equal(1, delta.UnknownProperties.Count);
+    }
 
-            Assert.Equal(delta.Data, msg.Data);
-        }
+    [Fact]
+    public void Patch_UnrelatedTypes_CopiesMatchingProperties()
+    {
+        dynamic delta = new Delta<SimpleMessageA>();
+        delta.Data = "Blah";
 
-        public class SimpleMessageA {
-            public string Data { get; set; }
-        }
+        var msg = new SimpleMessageB
+        {
+            Data = "Blah2"
+        };
+        delta.Patch(msg);
 
-        public class SimpleMessageB {
-            public string Data { get; set; }
-        }
+        Assert.Equal(delta.Data, msg.Data);
+    }
+
+    public record SimpleMessageA
+    {
+        public required string Data { get; set; }
+    }
+
+    public record SimpleMessageB
+    {
+        public required string Data { get; set; }
     }
 }

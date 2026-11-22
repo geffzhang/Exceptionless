@@ -1,0 +1,195 @@
+<script lang="ts">
+    import { goto } from '$app/navigation';
+    import { resolve } from '$app/paths';
+    import { ProblemDetails } from '@foundatiofx/fetchclient';
+    import { createForm } from '@tanstack/svelte-form';
+    import { toast } from 'svelte-sonner';
+    import { type infer as Infer, object, string } from 'zod';
+
+    import type { NewProject } from '#features/projects/models.ts';
+
+    import ErrorMessage from '#comp/error-message.svelte';
+    import Logo from '#comp/logo.svelte';
+    import { Muted } from '#comp/typography/index.ts';
+    import { Button } from '#comp/ui/button/index.ts';
+    import * as Card from '#comp/ui/card/index.ts';
+    import * as Field from '#comp/ui/field/index.ts';
+    import { Input } from '#comp/ui/input/index.ts';
+    import { Spinner } from '#comp/ui/spinner/index.ts';
+    import { showBillingDialogOnUpgradeProblem } from '#features/billing/index.ts';
+    import { postOrganization } from '#features/organizations/api.svelte.ts';
+    import { organization } from '#features/organizations/context.svelte.ts';
+    import { useHideOrganizationNotifications } from '#features/organizations/hooks/use-hide-organization-notifications.svelte.ts';
+    import { createProductTourActions } from '#features/product-tours/actions.svelte.ts';
+    import ProductTourSpotlight from '#features/product-tours/components/product-tour-spotlight.svelte';
+    import { productTourCheckpoint } from '#features/product-tours/state.svelte.ts';
+    import { postProject } from '#features/projects/api.svelte.ts';
+    import { ariaInvalid, getFormErrorMessages, mapFieldErrors, problemDetailsToFormErrors } from '#features/shared/validation.ts';
+
+    const SetupSchema = object({
+        organization_name: string().min(1, 'Organization name is required'),
+        project_name: string().min(1, 'Project name is required')
+    });
+
+    type SetupFormData = Infer<typeof SetupSchema>;
+
+    let toastId = $state<number | string>();
+    const createOrganization = postOrganization();
+    const createProject = postProject();
+    const tourActions = createProductTourActions();
+    const projectConfigureCheckpoint = $derived(productTourCheckpoint.current?.tourName === 'project-configure' ? productTourCheckpoint.current : undefined);
+    const CREATE_ERROR_MESSAGE = 'Error creating setup. Please try again.';
+
+    useHideOrganizationNotifications();
+
+    const form = createForm(() => ({
+        defaultValues: {
+            organization_name: '',
+            project_name: ''
+        } as SetupFormData,
+        validators: {
+            onSubmit: SetupSchema,
+            onSubmitAsync: async ({ value }) => {
+                toast.dismiss(toastId);
+                try {
+                    const createdOrganization = await createOrganization.mutateAsync({
+                        name: value.organization_name
+                    });
+                    organization.current = createdOrganization.id;
+
+                    const createdProject = await createProject.mutateAsync({
+                        delete_bot_data_enabled: true,
+                        name: value.project_name,
+                        organization_id: createdOrganization.id
+                    } as NewProject);
+
+                    const checkpoint = projectConfigureCheckpoint;
+                    if (checkpoint) {
+                        productTourCheckpoint.advance(checkpoint, 'choose-platform', createdOrganization.id);
+                    }
+
+                    toastId = toast.success('Project added successfully');
+                    await goto(
+                        resolve('/(app)/project/[projectId]/configure', {
+                            projectId: createdProject.id
+                        }) + '?redirect=true'
+                    );
+                    return null;
+                } catch (error: unknown) {
+                    if (showBillingDialogOnUpgradeProblem(error, organization.current, () => form.handleSubmit())) {
+                        return null;
+                    }
+
+                    if (error instanceof ProblemDetails) {
+                        toastId = toast.error(error.title || CREATE_ERROR_MESSAGE);
+                        return problemDetailsToFormErrors(error);
+                    }
+
+                    toastId = toast.error(CREATE_ERROR_MESSAGE);
+                    return {
+                        form: 'An unexpected error occurred, please try again.'
+                    };
+                }
+            }
+        }
+    }));
+</script>
+
+<Card.Root class="mx-auto w-[calc(100vw-2rem)] max-w-lg">
+    <Card.Header>
+        <Logo />
+        <Card.Title class="text-center text-2xl">Set Up Exceptionless</Card.Title>
+        <Muted class="text-center">Create an organization and project. Next, we'll connect your app.</Muted>
+    </Card.Header>
+    <Card.Content>
+        <form
+            data-tour="project-setup-form"
+            onsubmit={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                form.handleSubmit();
+            }}
+        >
+            <form.Subscribe selector={(state) => state.errors}>
+                {#snippet children(errors)}
+                    <ErrorMessage message={getFormErrorMessages(errors)}></ErrorMessage>
+                {/snippet}
+            </form.Subscribe>
+            <form.Field name="organization_name">
+                {#snippet children(field)}
+                    <Field.Field data-invalid={ariaInvalid(field)}>
+                        <Field.Label for={field.name}>Organization Name</Field.Label>
+                        <Input
+                            data-tour="setup-organization-name"
+                            id={field.name}
+                            name={field.name}
+                            placeholder="Enter organization name"
+                            value={field.state.value}
+                            onblur={field.handleBlur}
+                            oninput={(e) => field.handleChange(e.currentTarget.value)}
+                            aria-invalid={ariaInvalid(field)}
+                        />
+                        <Field.Error errors={mapFieldErrors(field.state.meta.errors)} />
+                    </Field.Field>
+                {/snippet}
+            </form.Field>
+            <form.Field name="project_name">
+                {#snippet children(field)}
+                    <Field.Field data-invalid={ariaInvalid(field)}>
+                        <Field.Label for={field.name}>Project Name</Field.Label>
+                        <Input
+                            data-tour="project-name"
+                            id={field.name}
+                            name={field.name}
+                            placeholder="Enter project name"
+                            value={field.state.value}
+                            onblur={field.handleBlur}
+                            oninput={(e) => field.handleChange(e.currentTarget.value)}
+                            aria-invalid={ariaInvalid(field)}
+                        />
+                        <Field.Error errors={mapFieldErrors(field.state.meta.errors)} />
+                    </Field.Field>
+                {/snippet}
+            </form.Field>
+            <form.Subscribe selector={(state) => state.isSubmitting}>
+                {#snippet children(isSubmitting)}
+                    <Button type="submit" class="mt-4 w-full" disabled={isSubmitting}>
+                        {#if isSubmitting}
+                            <Spinner /> Creating Setup...
+                        {:else}
+                            Continue
+                        {/if}
+                    </Button>
+                {/snippet}
+            </form.Subscribe>
+        </form>
+    </Card.Content>
+</Card.Root>
+
+{#if projectConfigureCheckpoint}
+    {#key projectConfigureCheckpoint.checkpointName}
+        <ProductTourSpotlight
+            checkpoint={projectConfigureCheckpoint}
+            showProgress={false}
+            description={projectConfigureCheckpoint.checkpointName === 'organization-name'
+                ? 'Choose a name for your team’s workspace.'
+                : 'Give your app a name, then continue to connect it.'}
+            onDismiss={tourActions.dismiss}
+            onPrevious={projectConfigureCheckpoint.checkpointName === 'project-name'
+                ? (checkpoint) => {
+                      productTourCheckpoint.advance(checkpoint, 'organization-name');
+                  }
+                : undefined}
+            onNext={projectConfigureCheckpoint.checkpointName === 'organization-name'
+                ? (checkpoint) => {
+                      productTourCheckpoint.advance(checkpoint, 'project-name');
+                  }
+                : undefined}
+            side="top"
+            target={projectConfigureCheckpoint.checkpointName === 'organization-name'
+                ? "[data-tour='setup-organization-name']"
+                : "[data-tour='project-setup-form']"}
+            title={projectConfigureCheckpoint.checkpointName === 'organization-name' ? 'Name your organization' : 'Name your first project'}
+        />
+    {/key}
+{/if}

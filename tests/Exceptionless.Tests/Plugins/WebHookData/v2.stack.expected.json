@@ -1,0 +1,17 @@
+{
+  "id": "1ecd0826e447a44e78877ab1",
+  "url": "http://localhost:7110/stack/1ecd0826e447a44e78877ab1",
+  "title": "A potentially dangerous Request.Path value was detected from the client (&).",
+  "tags": [
+    "Test"
+  ],
+  "project_id": "537650f3b77efe23a47914f4",
+  "project_name": "Disintegrating Pistol",
+  "organization_id": "537650f3b77efe23a47914f3",
+  "organization_name": "Acme",
+  "total_occurrences": 0,
+  "first_occurrence": "2014-01-17T20:37:02.739Z",
+  "last_occurrence": "2014-01-17T20:37:02.739Z",
+  "is_regression": false,
+  "is_critical": false
+}

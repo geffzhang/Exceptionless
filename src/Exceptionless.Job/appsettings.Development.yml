@@ -1,19 +1,22 @@
 ---
 ConnectionStrings:
-  Redis.off: localhost,abortConnect=false
-  Elasticsearch.off: http://localhost:9200/
+#  Redis: localhost,abortConnect=false
+#  Elasticsearch: server=https://elastic:elastic@localhost:9200
+#  Cache: provider=redis;
+#  MessageBus: provider=redis;
+#  Queue: provider=redis;
+#  Storage: provider=folder;path=..\Exceptionless.Web\storage
+  Email: smtp://localhost:1025
 
 # Base url for the ui used to build links in emails and other places.
-BaseURL: 'http://localhost:9001/#!'
-
-# Folder used to store event post data
-StorageFolder: ..\..\..\..\Exceptionless.Web\storage
+BaseURL: https://web-ex.dev.localhost:7131
 
 Serilog:
   MinimumLevel:
-    Default: Debug
-    Override:
-      Microsoft: Warning
-      System: Warning
-      Foundatio.Utility.ScheduledTimer: Warning
-      Foundatio.Metrics: Warning
+    Default: Information
+
+Apm:
+  EnableLogs: false
+  FullDetails: true
+  Debug: false
+  Console: false

@@ -1,99 +1,334 @@
 {
-  "version": "2.0.0",
-  "options": {
-    "env": {
-      "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "true"
-    }
-  },
-  "tasks": [
-    {
-      "label": "Build",
-      "command": "dotnet",
-      "args": [
-        "build",
-        "${workspaceFolder}/Exceptionless.sln",
-        "/p:GenerateFullPaths=true"
-      ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "presentation": {
-        "panel": "dedicated"
-      },
-      "problemMatcher": "$msCompile"
-    },
-    {
-      "label": "Run Tests",
-      "command": "dotnet",
-      "group": {
-        "kind": "test",
-        "isDefault": true
-      },
-      "args": [
-        "test",
-        "${workspaceFolder}/tests/Exceptionless.Tests/Exceptionless.Tests.csproj",
-        "/p:GenerateFullPaths=true"
-      ],
-      "problemMatcher": "$msCompile"
-    },
-    {
-      "label": "Start Elasticsearch",
-      "command": "docker-compose",
-      "args": [
-        "up",
-        "elasticsearch"
-      ],
-      "isBackground": true,
-      "problemMatcher": []
-    },
-    {
-      "label": "Start Exceptionless UI",
-      "command": "docker-compose",
-      "args": [
-        "up",
-        "ui"
-      ],
-      "isBackground": true,
-      "problemMatcher": []
-    },
-    {
-      "label": "Build API Docker Image",
-      "command": "docker",
-      "args": [
-        "build",
-        "--target",
-        "api",
-        "-t",
-        "exceptionless/api-ci",
-        "."
-      ],
-      "problemMatcher": []
-    },
-    {
-      "label": "Build Job Docker Image",
-      "command": "docker",
-      "args": [
-        "build",
-        "--target",
-        "job",
-        "-t",
-        "exceptionless/job-ci",
-        "."
-      ],
-      "problemMatcher": []
-    },
-    {
-      "label": "Run in Docker",
-      "command": "docker-compose",
-      "args": [
-        "up"
-      ],
-      "problemMatcher": [],
-      "dependsOn": [
-        "Build API Docker Image",
-        "Build Job Docker Image"
-      ]
-    }
-  ]
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build (active file context)",
+            "type": "process",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile",
+                "-Command",
+                "$ext='${fileExtname}'; if ($ext -in @('.svelte', '.ts', '.js', '.tsx', '.jsx', '.css', '.html')) { Write-Host \"Frontend file detected ($ext). Running npm run build...\"; Set-Location 'src/Exceptionless.Web/ClientApp'; npm run build } elseif ($ext -in @('.cs', '.csproj', '.sln', '.slnx')) { Write-Host \"Backend file detected ($ext). Running dotnet build...\"; dotnet build /property:GenerateFullPaths=true /consoleloggerparameters:NoSummary } else { Write-Host \"Unknown or no active file extension ($ext). Defaulting to dotnet build...\"; dotnet build /property:GenerateFullPaths=true /consoleloggerparameters:NoSummary }"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "dotnet build",
+            "command": "dotnet",
+            "type": "shell",
+            "args": [
+                "build",
+                "/property:GenerateFullPaths=true",
+                "/consoleloggerparameters:NoSummary"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "presentation": {
+                "reveal": "silent"
+            },
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "Run Tests",
+            "command": "dotnet",
+            "type": "shell",
+            "args": [
+                "test",
+                "/property:GenerateFullPaths=true",
+                "/consoleloggerparameters:NoSummary"
+            ],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "build",
+            "command": "dotnet",
+            "type": "process",
+            "args": [
+                "build",
+                "${workspaceFolder}/src/Exceptionless.Web/Exceptionless.Web.csproj",
+                "/property:GenerateFullPaths=true",
+                "/consoleloggerparameters:NoSummary"
+            ],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "publish",
+            "command": "dotnet",
+            "type": "process",
+            "args": [
+                "publish",
+                "${workspaceFolder}/src/Exceptionless.Web/Exceptionless.Web.csproj",
+                "/property:GenerateFullPaths=true",
+                "/consoleloggerparameters:NoSummary"
+            ],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "watch",
+            "command": "dotnet",
+            "type": "process",
+            "args": [
+                "watch",
+                "run",
+                "--project",
+                "${workspaceFolder}/src/Exceptionless.Web/Exceptionless.Web.csproj"
+            ],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "dotnet outdated",
+            "command": "dotnet",
+            "type": "process",
+            "args": [
+                "outdated",
+                "-u:prompt"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "label": "npm run build",
+            "script": "build",
+            "problemMatcher": [
+                {
+                    "owner": "vite-plugin-svelte",
+                    "fileLocation": "absolute",
+                    "pattern": {
+                        "regexp": "^.*\\[vite-plugin-svelte\\] (.*):(\\d+):(\\d+) (.*)$",
+                        "file": 1,
+                        "line": 2,
+                        "column": 3,
+                        "message": 4
+                    },
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": ".",
+                        "endsPattern": "done$"
+                    }
+                }
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "label": "npm run check",
+            "script": "check",
+            "problemMatcher": [
+                {
+                    "owner": "svelte-check",
+                    "fileLocation": "absolute",
+                    "pattern": [
+                        {
+                            "regexp": "^(.*):(\\d+):(\\d+)",
+                            "file": 1,
+                            "line": 2,
+                            "column": 3
+                        },
+                        {
+                            "regexp": "^(Error|Warn): (.*)$",
+                            "severity": 1,
+                            "message": 2
+                        }
+                    ],
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": ".",
+                        "endsPattern": "files$"
+                    }
+                }
+            ],
+            "group": {
+                "kind": "none",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "label": "npm run lint",
+            "script": "lint",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "label": "npm run dev",
+            "script": "dev",
+            "isBackground": true,
+            "problemMatcher": [
+                {
+                    "owner": "vite-plugin-svelte",
+                    "fileLocation": "absolute",
+                    "pattern": {
+                        "regexp": "^.*\\[vite-plugin-svelte\\] (.*):(\\d+):(\\d+) (.*)$",
+                        "file": 1,
+                        "line": 2,
+                        "column": 3,
+                        "message": 4
+                    },
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": ".",
+                        "endsPattern": "ready in"
+                    }
+                }
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "presentation": {
+                "reveal": "never"
+            }
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "label": "npm run dev:api",
+            "script": "dev:api",
+            "isBackground": true,
+            "problemMatcher": [
+                {
+                    "owner": "vite-plugin-svelte",
+                    "fileLocation": "absolute",
+                    "pattern": {
+                        "regexp": "^.*\\[vite-plugin-svelte\\] (.*):(\\d+):(\\d+) (.*)$",
+                        "file": 1,
+                        "line": 2,
+                        "column": 3,
+                        "message": 4
+                    },
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": ".",
+                        "endsPattern": "ready in"
+                    }
+                }
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "presentation": {
+                "reveal": "never"
+            }
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "label": "npm install",
+            "script": "install",
+            "problemMatcher": []
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "script": "format",
+            "problemMatcher": [
+                {
+                    "owner": "eslint-stylish",
+                    "pattern": [
+                        {
+                            // Matches the 1st line in the output
+                            "regexp": "^([^\\s].*)$",
+                            "file": 1
+                        },
+                        {
+                            // Matches the 2nd and 3rd line in the output
+                            "regexp": "^\\s+(\\d+):(\\d+)\\s+(error|warning|info)\\s+(.*)\\s\\s+(.*)$",
+                            "line": 1,
+                            "column": 2,
+                            "severity": 3,
+                            "message": 4,
+                            "code": 5,
+                            "loop": true
+                        }
+                    ]
+                }
+            ],
+            "label": "npm run format"
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "script": "test:unit",
+            "problemMatcher": [],
+            "label": "npm run test:unit"
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "script": "test:e2e",
+            "problemMatcher": [],
+            "label": "npm run test:e2e"
+        },
+        {
+            "type": "npm",
+            "path": "src/Exceptionless.Web/ClientApp",
+            "script": "storybook",
+            "problemMatcher": [],
+            "label": "npm run storybook"
+        },
+        {
+            "type": "shell",
+            "label": "ncu -i",
+            "command": "ncu -i",
+            "options": {
+                "cwd": "${workspaceFolder}/src/Exceptionless.Web/ClientApp"
+            },
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": []
+        },
+        {
+            "type": "shell",
+            "label": "Update shadcn-svelte",
+            "command": "npx",
+            "args": [
+                "shadcn-svelte@latest",
+                "update"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/src/Exceptionless.Web/ClientApp"
+            },
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": []
+        }
+    ]
 }

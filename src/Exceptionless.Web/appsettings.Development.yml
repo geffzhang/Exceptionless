@@ -1,24 +1,33 @@
-﻿---
+---
 ConnectionStrings:
-  Redis.off: localhost,abortConnect=false
-  Elasticsearch.off: http://localhost:9200/
-  Ldap.off: ''
+#  Redis: localhost,abortConnect=false
+#  Elasticsearch: server=https://elastic:elastic@localhost:9200
+#  Cache: provider=redis;
+#  MessageBus: provider=redis;
+#  Queue: provider=redis;
+#  Storage: provider=folder;path=.\storage
+#  LDAP: ''
+#  Email: smtp://localhost:1025
 
 # Base url for the ui used to build links in emails and other places.
-BaseURL: 'http://localhost:9001/#!'
+BaseURL: https://web-ex.dev.localhost:7131
 
-# Wether or not to run the jobs in process. Requires Redis to be configured when running jobs out of process.
+Assistant:
+  Enabled: true
+
+# Whether to run the jobs in process. Requires Redis to be configured when running jobs out of process.
 RunJobsInProcess: true
-
-# Folder used to store event post data
-StorageFolder: .\storage
+#AppScope: dev
+#EnableAccountCreation: false
+#DisableIndexConfiguration: false
+#AllowedOutboundAddresses: "exceptionless"
 
 Serilog:
   MinimumLevel:
-    Default: Debug
-    Override:
-      Microsoft: Warning
-      System: Warning
-      Exceptionless.Web.Security.ApiKeyAuthenticationHandler: Warning
-      Foundatio.Utility.ScheduledTimer: Warning
-      Foundatio.Metrics: Warning
+    Default: Information
+
+Apm:
+  EnableLogs: true
+  FullDetails: true
+  Debug: true
+  Console: false

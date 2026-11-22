@@ -1,101 +1,142 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Threading.Tasks;
+﻿using System.Collections.Concurrent;
 
-namespace Exceptionless.Core.Utility {
-    public interface IConnectionMapping {
-        Task AddAsync(string key, string connectionId);
-        Task<ICollection<string>> GetConnectionsAsync(string key);
-        Task<int> GetConnectionCountAsync(string key);
-        Task RemoveAsync(string key, string connectionId);
+namespace Exceptionless.Core.Utility;
+
+public interface IConnectionMapping
+{
+    Task AddAsync(string key, string connectionId);
+    Task<ICollection<string>> GetConnectionsAsync(string key);
+    Task<int> GetConnectionCountAsync(string key);
+    Task RemoveAsync(string key, string connectionId);
+}
+
+public class ConnectionMapping : IConnectionMapping
+{
+    private readonly ConcurrentDictionary<string, ConnectionSet> _connections = new();
+
+    internal int TrackedKeyCount => _connections.Count;
+
+    public Task AddAsync(string key, string connectionId)
+    {
+        if (key is null)
+            return Task.CompletedTask;
+
+        while (true)
+        {
+            var connections = _connections.GetOrAdd(key, _ => new ConnectionSet());
+
+            lock (connections.SyncRoot)
+            {
+                if (connections.IsDetachedFromMap)
+                    continue;
+
+                connections.ConnectionIds.Add(connectionId);
+                return Task.CompletedTask;
+            }
+        }
     }
 
-    public class ConnectionMapping : IConnectionMapping {
-        private readonly ConcurrentDictionary<string, HashSet<string>> _connections = new ConcurrentDictionary<string, HashSet<string>>();
+    public Task<ICollection<string>> GetConnectionsAsync(string key)
+    {
+        if (key is null)
+            return Task.FromResult<ICollection<string>>([]);
 
-        public Task AddAsync(string key, string connectionId) {
-            if (key == null)
-                return Task.CompletedTask;
+        if (!_connections.TryGetValue(key, out var connections))
+            return Task.FromResult<ICollection<string>>([]);
 
-            _connections.AddOrUpdate(key, new HashSet<string>(new[] { connectionId }), (_, hs) => {
-                hs.Add(connectionId);
-                return hs;
-            });
+        lock (connections.SyncRoot)
+        {
+            if (connections.IsDetachedFromMap)
+                return Task.FromResult<ICollection<string>>([]);
 
-            return Task.CompletedTask;
+            return Task.FromResult<ICollection<string>>([.. connections.ConnectionIds]);
         }
+    }
 
-        public Task<ICollection<string>> GetConnectionsAsync(string key) {
-            if (key == null)
-                return Task.FromResult<ICollection<string>>(new List<string>());
-
-            return Task.FromResult<ICollection<string>>(_connections.GetOrAdd(key, new HashSet<string>()));
-        }
-
-        public Task<int> GetConnectionCountAsync(string key) {
-            if (key == null)
-                return Task.FromResult(0);
-
-            if (_connections.TryGetValue(key, out var connections))
-                return Task.FromResult(connections.Count);
-
+    public Task<int> GetConnectionCountAsync(string key)
+    {
+        if (key is null)
             return Task.FromResult(0);
+
+        if (!_connections.TryGetValue(key, out var connections))
+            return Task.FromResult(0);
+
+        lock (connections.SyncRoot)
+        {
+            return Task.FromResult(connections.IsDetachedFromMap ? 0 : connections.ConnectionIds.Count);
         }
+    }
 
-        public Task RemoveAsync(string key, string connectionId) {
-            if (key == null)
+    public Task RemoveAsync(string key, string connectionId)
+    {
+        if (key is null)
+            return Task.CompletedTask;
+
+        if (!_connections.TryGetValue(key, out var connections))
+            return Task.CompletedTask;
+
+        lock (connections.SyncRoot)
+        {
+            if (connections.IsDetachedFromMap)
                 return Task.CompletedTask;
 
-            bool shouldRemove = false;
-            _connections.AddOrUpdate(key, new HashSet<string>(), (_, hs) => {
-                hs.Remove(connectionId);
-                if (hs.Count == 0)
-                    shouldRemove = true;
-
-                return hs;
-            });
-
-            if (!shouldRemove)
+            if (!connections.ConnectionIds.Remove(connectionId))
                 return Task.CompletedTask;
 
-            if (_connections.TryRemove(key, out var connections) && connections.Count > 0)
-                _connections.TryAdd(key, connections);
+            if (connections.ConnectionIds.Count is not 0)
+                return Task.CompletedTask;
 
+            connections.IsDetachedFromMap = true;
+            _connections.TryRemove(key, out _);
             return Task.CompletedTask;
         }
     }
 
-    public static class ConnectionMappingExtensions {
-        public const string UserIdPrefix = "u-";
-        public const string GroupPrefix = "g-";
+    private sealed class ConnectionSet
+    {
+        public object SyncRoot { get; } = new();
+        public HashSet<string> ConnectionIds { get; } = [];
+        public bool IsDetachedFromMap { get; set; }
+    }
+}
 
-        public static Task GroupAddAsync(this IConnectionMapping map, string group, string connectionId) {
-            return map.AddAsync(GroupPrefix + group, connectionId);
-        }
+public static class ConnectionMappingExtensions
+{
+    public const string UserIdPrefix = "u-";
+    public const string GroupPrefix = "g-";
 
-        public static Task GroupRemoveAsync(this IConnectionMapping map, string group, string connectionId) {
-            return map.RemoveAsync(GroupPrefix + group, connectionId);
-        }
+    public static Task GroupAddAsync(this IConnectionMapping map, string group, string connectionId)
+    {
+        return map.AddAsync(GroupPrefix + group, connectionId);
+    }
 
-        public static Task<ICollection<string>> GetGroupConnectionsAsync(this IConnectionMapping map, string group) {
-            return map.GetConnectionsAsync(GroupPrefix + group);
-        }
-        
-        public static Task<int> GetGroupConnectionCountAsync(this IConnectionMapping map, string group) {
-            return map.GetConnectionCountAsync(GroupPrefix + group);
-        }
+    public static Task GroupRemoveAsync(this IConnectionMapping map, string group, string connectionId)
+    {
+        return map.RemoveAsync(GroupPrefix + group, connectionId);
+    }
 
-        public static Task UserIdAddAsync(this IConnectionMapping map, string userId, string connectionId) {
-            return map.AddAsync(UserIdPrefix + userId, connectionId);
-        }
+    public static Task<ICollection<string>> GetGroupConnectionsAsync(this IConnectionMapping map, string group)
+    {
+        return map.GetConnectionsAsync(GroupPrefix + group);
+    }
 
-        public static Task UserIdRemoveAsync(this IConnectionMapping map, string userId, string connectionId) {
-            return map.RemoveAsync(UserIdPrefix + userId, connectionId);
-        }
+    public static Task<int> GetGroupConnectionCountAsync(this IConnectionMapping map, string group)
+    {
+        return map.GetConnectionCountAsync(GroupPrefix + group);
+    }
 
-        public static Task<ICollection<string>> GetUserIdConnectionsAsync(this IConnectionMapping map, string userId) {
-            return map.GetConnectionsAsync(UserIdPrefix + userId);
-        }
+    public static Task UserIdAddAsync(this IConnectionMapping map, string userId, string connectionId)
+    {
+        return map.AddAsync(UserIdPrefix + userId, connectionId);
+    }
+
+    public static Task UserIdRemoveAsync(this IConnectionMapping map, string userId, string connectionId)
+    {
+        return map.RemoveAsync(UserIdPrefix + userId, connectionId);
+    }
+
+    public static Task<ICollection<string>> GetUserIdConnectionsAsync(this IConnectionMapping map, string userId)
+    {
+        return map.GetConnectionsAsync(UserIdPrefix + userId);
     }
 }

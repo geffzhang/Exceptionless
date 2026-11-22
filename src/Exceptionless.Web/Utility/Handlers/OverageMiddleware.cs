@@ -1,110 +1,110 @@
-﻿using System;
-using System.Threading.Tasks;
-using Exceptionless.Web.Extensions;
-using Exceptionless.Core;
-using Exceptionless.Core.AppStats;
+﻿using Exceptionless.Core;
 using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Repositories;
 using Exceptionless.Core.Services;
-using Foundatio.Metrics;
+using Exceptionless.Web.Extensions;
 using Foundatio.Repositories;
-using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Web.Utility {
-    public sealed class OverageMiddleware {
-        private readonly IOrganizationRepository _organizationRepository;
-        private readonly IProjectRepository _projectRepository;
-        private readonly UsageService _usageService;
-        private readonly IMetricsClient _metricsClient;
-        private readonly ILogger _logger;
-        private readonly RequestDelegate _next;
+namespace Exceptionless.Web.Utility;
 
-        public OverageMiddleware(RequestDelegate next, IOrganizationRepository organizationRepository, IProjectRepository projectRepository, UsageService usageService, IMetricsClient metricsClient, ILogger<OverageMiddleware> logger) {
-            _next = next;
-            _organizationRepository = organizationRepository;
-            _projectRepository = projectRepository;
-            _usageService = usageService;
-            _metricsClient = metricsClient;
-            _logger = logger;
+public sealed class OverageMiddleware
+{
+    private readonly UsageService _usageService;
+    private readonly IOrganizationRepository _organizationRepository;
+    private readonly AppOptions _appOptions;
+    private readonly SystemSettingsService _systemSettingsService;
+    private readonly ILogger _logger;
+    private readonly RequestDelegate _next;
+
+    public OverageMiddleware(RequestDelegate next, UsageService usageService, IOrganizationRepository organizationRepository, AppOptions appOptions, SystemSettingsService systemSettingsService, ILogger<OverageMiddleware> logger)
+    {
+        _next = next;
+        _usageService = usageService;
+        _organizationRepository = organizationRepository;
+        _appOptions = appOptions;
+        _systemSettingsService = systemSettingsService;
+        _logger = logger;
+    }
+
+    public async Task Invoke(HttpContext context)
+    {
+        if (!context.Request.IsEventPost())
+        {
+            await _next(context);
+            return;
         }
 
-        private bool IsEventPost(HttpContext context) {
-            string method = context.Request.Method;
-            if (String.Equals(method, "GET", StringComparison.OrdinalIgnoreCase))
-                return context.Request.Path.Value.Contains("/events/submit");
-
-            if (!String.Equals(method, "POST", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            string absolutePath = context.Request.Path.Value;
-            if (absolutePath.EndsWith("/"))
-                absolutePath = absolutePath.Substring(0, absolutePath.Length - 1);
-
-            return absolutePath.EndsWith("/events", StringComparison.OrdinalIgnoreCase)
-                || String.Equals(absolutePath, "/api/v1/error", StringComparison.OrdinalIgnoreCase);
+        string? organizationId = context.Request.GetDefaultOrganizationId();
+        if (String.IsNullOrEmpty(organizationId))
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return;
         }
 
-        public async Task Invoke(HttpContext context) {
-            if (!IsEventPost(context)) {
-                await _next(context);
+        if (!await _systemSettingsService.IsEventSubmissionEnabledAsync())
+        {
+            context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return;
+        }
+
+        bool tooBig = false;
+        if (String.Equals(context.Request.Method, "POST", StringComparison.OrdinalIgnoreCase) && context.Request.Headers is not null)
+        {
+            long? contentLength = context.Request.Headers.ContentLength;
+            if (contentLength is <= 0)
+            {
+                AppDiagnostics.PostsBlocked.Add(1);
+                context.Response.StatusCode = StatusCodes.Status411LengthRequired;
                 return;
             }
 
-            if (Settings.Current.EventSubmissionDisabled) {
-                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-                return;
-            }
+            long size = contentLength.GetValueOrDefault();
+            if (size > 0)
+                AppDiagnostics.PostsSize.Record(size);
 
-            string organizationId = context.Request.GetDefaultOrganizationId();
-            var organizationTask = _organizationRepository.GetByIdAsync(organizationId, o => o.Cache());
-
-            string projectId = context.Request.GetDefaultProjectId();
-            var projectTask = _projectRepository.GetByIdAsync(projectId, o => o.Cache());
-
-            bool tooBig = false;
-            if (String.Equals(context.Request.Method, "POST", StringComparison.OrdinalIgnoreCase) && context.Request.Headers != null) {
-                if (context.Request.Headers.ContentLength.HasValue && context.Request.Headers.ContentLength.Value <= 0) {
-                    //_metricsClient.Counter(MetricNames.PostsBlocked);
-                    context.Response.StatusCode = StatusCodes.Status411LengthRequired;
-                    await Task.WhenAll(organizationTask, projectTask);
-                    return;
+            if (size > _appOptions.MaximumEventPostSize)
+            {
+                if (_logger.IsEnabled(LogLevel.Warning))
+                {
+                    using (_logger.BeginScope(new ExceptionlessState().Value(size).Tag(context.Request.Headers.TryGetAndReturn(Headers.ContentEncoding))))
+                        _logger.SubmissionTooLarge(size);
                 }
 
-                long size = context.Request.Headers.ContentLength.GetValueOrDefault();
-                if (size > 0)
-                    _metricsClient.Gauge(MetricNames.PostsSize, size);
-
-                if (size > Settings.Current.MaximumEventPostSize) {
-                    if (_logger.IsEnabled(LogLevel.Warning)) {
-                        using (_logger.BeginScope(new ExceptionlessState().Value(size).Tag(context.Request.Headers.TryGetAndReturn(Headers.ContentEncoding))))
-                            _logger.LogWarning("Event submission discarded for being too large: {@value} bytes.", size);
-                    }
-
-                    _metricsClient.Counter(MetricNames.PostsDiscarded);
-                    tooBig = true;
-                }
+                tooBig = true;
             }
+        }
 
-            var organization = await organizationTask;
-            var project = await projectTask;
-            bool overLimit = await _usageService.IncrementUsageAsync(organization, project, tooBig);
+        // block large submissions, client should break them up or remove some of the data.
+        if (tooBig)
+        {
+            string? projectId = context.Request.GetDefaultProjectId();
+            await _usageService.IncrementTooBigAsync(organizationId, projectId);
+            context.Response.StatusCode = StatusCodes.Status413RequestEntityTooLarge;
+            return;
+        }
 
-            // block large submissions, client should break them up or remove some of the data.
-            if (tooBig) {
-                context.Response.StatusCode = StatusCodes.Status413RequestEntityTooLarge;
-                return;
-            }
+        int eventsLeft = await _usageService.GetEventsLeftAsync(organizationId);
+        if (eventsLeft <= 0)
+        {
+            string? projectId = context.Request.GetDefaultProjectId();
+            await _usageService.IncrementBlockedAsync(organizationId, projectId);
+            context.Response.StatusCode = StatusCodes.Status402PaymentRequired;
+            return;
+        }
 
-            if (overLimit) {
-                _metricsClient.Counter(MetricNames.PostsBlocked);
+        // if user auth, check to see if the organization is suspended
+        // api tokens are marked as suspended immediately
+        if (context.Request.GetAuthType() is AuthType.User)
+        {
+            AppDiagnostics.PostsBlocked.Add(1);
+            var organization = await _organizationRepository.GetByIdAsync(organizationId, o => o.Cache());
+            if (organization is { IsSuspended: true })
+            {
                 context.Response.StatusCode = StatusCodes.Status402PaymentRequired;
                 return;
             }
-
-            context.Request.SetOrganization(organization);
-            context.Request.SetProject(project);
-            await _next(context);
         }
+
+        await _next(context);
     }
 }

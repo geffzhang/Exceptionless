@@ -1,0 +1,148 @@
+<script lang="ts">
+    import Check from '@lucide/svelte/icons/check';
+
+    import * as FacetedFilter from '#comp/faceted-filter/index.ts';
+    import { Button } from '#comp/ui/button/index.ts';
+    import * as Command from '#comp/ui/command/index.ts';
+    import * as Popover from '#comp/ui/popover/index.ts';
+    import Separator from '#comp/ui/separator/separator.svelte';
+    import { Spinner } from '#comp/ui/spinner/index.ts';
+    import { cn } from '#lib/utils.ts';
+
+    type Option = {
+        label: string;
+        value: string;
+    };
+
+    interface Props {
+        changed: (value?: string) => void;
+        hidden?: boolean;
+        loading?: boolean;
+        noOptionsText?: string;
+        open: boolean;
+        options: Option[];
+        remove: () => void;
+        title: string;
+        toggleHidden?: () => void;
+        value?: string;
+    }
+
+    let {
+        changed,
+        hidden = false,
+        loading = false,
+        noOptionsText = 'No results found.',
+        open = $bindable(),
+        options,
+        remove,
+        title,
+        toggleHidden,
+        value
+    }: Props = $props();
+
+    // eslint-disable-next-line svelte/prefer-writable-derived
+    let updatedValue = $state<string | undefined>();
+
+    $effect.pre(() => {
+        updatedValue = value;
+    });
+
+    export function onClearFilter() {
+        updatedValue = undefined;
+        changed(updatedValue);
+    }
+
+    export function onValueSelected(currentValue: string) {
+        if (updatedValue === currentValue) {
+            updatedValue = undefined;
+        } else {
+            updatedValue = currentValue;
+        }
+
+        changed(updatedValue);
+    }
+
+    function cancelAndClose() {
+        updatedValue = value;
+        changed(updatedValue);
+        open = false;
+    }
+
+    function displayValue(value: string | undefined) {
+        return options.find((option) => option.value === value)?.label ?? value;
+    }
+
+    function filter(value: string, search: string) {
+        if (value.includes(search)) {
+            return 1;
+        }
+
+        const option = options.find((option) => option.value === value);
+        if (option?.label.toLowerCase().includes(search)) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    function onEscapeKeydown(e: KeyboardEvent) {
+        e.preventDefault();
+        cancelAndClose();
+    }
+
+    function onOpenChange(isOpen: boolean) {
+        if (!isOpen) {
+            open = false;
+        }
+    }
+</script>
+
+<Popover.Root bind:open {onOpenChange}>
+    <Popover.Trigger>
+        {#snippet child({ props })}
+            <Button {...props} class="gap-x-1 px-3" size="lg" variant="outline" aria-describedby={`${title}-help`}>
+                {title}
+                <Separator class="mx-2" orientation="vertical" />
+                {#if loading}
+                    <FacetedFilter.BadgeLoading />
+                {:else if value !== undefined}
+                    <FacetedFilter.BadgeValue>{displayValue(value)}</FacetedFilter.BadgeValue>
+                {:else}
+                    <FacetedFilter.BadgeValue>No Value</FacetedFilter.BadgeValue>
+                {/if}
+            </Button>
+        {/snippet}
+    </Popover.Trigger>
+    <Popover.Content align="start" class="p-0" side="bottom" trapFocus={false} {onEscapeKeydown} onFocusOutside={(e) => e.preventDefault()}>
+        <Command.Root {filter}>
+            <Command.Input placeholder={title} autofocus={open} aria-describedby={`${title}-help`} />
+            <Command.List>
+                <Command.Empty>{noOptionsText}</Command.Empty>
+                {#if loading}
+                    <Command.Loading><div class="flex p-2"><Spinner /> Loading...</div></Command.Loading>
+                {/if}
+                {#if options.length > 0}
+                    <Command.Group>
+                        {#each options as option (option.value)}
+                            <Command.Item id={option.value} onSelect={() => onValueSelected(option.value)} value={option.value}>
+                                <div
+                                    class={cn(
+                                        'border-primary mr-2 flex size-4 items-center justify-center rounded-sm border',
+                                        updatedValue === option.value ? 'bg-primary text-primary-foreground' : 'opacity-50 [&_svg]:invisible'
+                                    )}
+                                >
+                                    <Check className={cn('size-4')} />
+                                </div>
+                                <span>
+                                    {option.label}
+                                </span>
+                            </Command.Item>
+                        {/each}
+                    </Command.Group>
+                {/if}
+            </Command.List>
+        </Command.Root>
+        <div id={`${title}-help`} class="sr-only">Arrow keys navigate. Space or Enter toggles selection. Escape cancels without saving.</div>
+        <FacetedFilter.Actions clear={onClearFilter} {hidden} {remove} showClear={!!updatedValue?.trim()} {toggleHidden} />
+    </Popover.Content>
+</Popover.Root>

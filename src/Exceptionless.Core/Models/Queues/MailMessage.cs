@@ -1,10 +1,10 @@
-﻿using System;
+﻿namespace Exceptionless.Core.Queues.Models;
 
-namespace Exceptionless.Core.Queues.Models {
-    public class MailMessage {
-        public string To { get; set; }
-        public string From { get; set; }
-        public string Subject { get; set; }
-        public string Body { get; set; }
-    }
+public record MailMessage
+{
+    public required string To { get; set; }
+    public string? From { get; set; }
+    public string? ReplyTo { get; set; }
+    public required string Subject { get; set; }
+    public required string Body { get; set; }
 }

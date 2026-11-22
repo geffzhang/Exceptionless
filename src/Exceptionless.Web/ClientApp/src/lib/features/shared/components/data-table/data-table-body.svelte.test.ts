@@ -1,0 +1,248 @@
+import { fireEvent, render, screen } from '@testing-library/svelte';
+import { tick } from 'svelte';
+import { describe, expect, it, vi } from 'vitest';
+
+import DataTableBodyTestHarness from './data-table-body.test-harness.svelte';
+
+describe('DataTableBody', () => {
+    it('keeps the row selection column at a fixed width', () => {
+        render(DataTableBodyTestHarness, { kind: 'event', onRowClick: vi.fn() });
+
+        const table = screen.getByRole('table');
+        const selectHeader = screen.getByRole('columnheader', { name: 'Select' });
+        const selectCell = screen.getByText('Select row').closest('td');
+
+        expect(table.classList.contains('table-fixed')).toBe(true);
+        expect(selectHeader.style.cssText).toBe('width: 32px; min-width: 32px; max-width: 32px;');
+        expect(selectCell?.style.cssText).toBe('width: 32px; min-width: 32px; max-width: 32px;');
+    });
+
+    it('preserves every explicitly sized data column', () => {
+        render(DataTableBodyTestHarness, { allColumnsSized: true, kind: 'event', onRowClick: vi.fn() });
+
+        const table = screen.getByRole('table');
+        const summaryHeader = screen.getByRole('columnheader', { name: 'Summary' });
+        const dateHeader = screen.getByRole('columnheader', { name: 'Date' });
+
+        expect(table.style.cssText).toBe('width: 100%; min-width: 302px;');
+        expect(summaryHeader.style.cssText).toBe('width: 140px; min-width: 140px; max-width: 140px;');
+        expect(dateHeader.style.cssText).toBe('width: 130px; min-width: 130px; max-width: 130px;');
+        expect(table.querySelector('thead tr')?.lastElementChild?.getAttribute('aria-hidden')).toBe('true');
+        expect(table.querySelector('tbody tr')?.lastElementChild?.getAttribute('aria-hidden')).toBe('true');
+    });
+
+    it('spans empty state rows across the fixed-width filler column', () => {
+        render(DataTableBodyTestHarness, { allColumnsSized: true, empty: true, kind: 'event', onRowClick: vi.fn() });
+
+        const emptyCell = screen.getByText('No data was found with the current filter.').closest('td');
+
+        expect(emptyCell?.colSpan).toBe(4);
+    });
+
+    it('does not add a filler column to flexible empty state rows', () => {
+        render(DataTableBodyTestHarness, { empty: true, fullWidthSummary: true, kind: 'event', onRowClick: vi.fn() });
+
+        const emptyCell = screen.getByText('No data was found with the current filter.').closest('td');
+
+        expect(emptyCell?.colSpan).toBe(3);
+    });
+
+    it('uses the full-width data column as the flexible column', () => {
+        render(DataTableBodyTestHarness, { fullWidthSummary: true, kind: 'event', onRowClick: vi.fn() });
+
+        const summaryHeader = screen.getByRole('columnheader', { name: 'Summary' });
+        const dateHeader = screen.getByRole('columnheader', { name: 'Date' });
+
+        expect(summaryHeader.style.cssText).toBe('width: 100%;');
+        expect(dateHeader.style.cssText).toBe('width: 150px; min-width: 150px; max-width: 150px;');
+    });
+
+    it('uses the saved view auto-fill column instead of the column-definition default', () => {
+        render(DataTableBodyTestHarness, { autoFillColumnId: 'date', fullWidthSummary: true, kind: 'event', onRowClick: vi.fn() });
+
+        const summaryHeader = screen.getByRole('columnheader', { name: 'Summary' });
+        const dateHeader = screen.getByRole('columnheader', { name: 'Date' });
+
+        expect(summaryHeader.style.cssText).toBe('width: 160px; min-width: 160px; max-width: 160px;');
+        expect(dateHeader.style.cssText).toBe('width: 100%;');
+    });
+
+    it('does not transfer flexibility after the full-width column is sized', () => {
+        render(DataTableBodyTestHarness, { fullWidthSummary: true, kind: 'event', onRowClick: vi.fn(), sizedFullWidthSummary: true });
+
+        const table = screen.getByRole('table');
+        const summaryHeader = screen.getByRole('columnheader', { name: 'Summary' });
+        const dateHeader = screen.getByRole('columnheader', { name: 'Date' });
+
+        expect(table.style.cssText).toBe('width: 100%; min-width: 362px;');
+        expect(summaryHeader.style.cssText).toBe('width: 180px; min-width: 180px; max-width: 180px;');
+        expect(dateHeader.style.cssText).toBe('width: 150px; min-width: 150px; max-width: 150px;');
+    });
+
+    it('keeps every data column fixed when auto-fill is explicitly disabled', () => {
+        render(DataTableBodyTestHarness, { autoFillColumnId: null, fullWidthSummary: true, kind: 'event', onRowClick: vi.fn() });
+
+        const table = screen.getByRole('table');
+        const summaryHeader = screen.getByRole('columnheader', { name: 'Summary' });
+        const dateHeader = screen.getByRole('columnheader', { name: 'Date' });
+
+        expect(table.style.cssText).toBe('width: 100%; min-width: 342px;');
+        expect(summaryHeader.style.cssText).toBe('width: 160px; min-width: 160px; max-width: 160px;');
+        expect(dateHeader.style.cssText).toBe('width: 150px; min-width: 150px; max-width: 150px;');
+    });
+
+    it('wraps only columns that opt in', () => {
+        render(DataTableBodyTestHarness, { kind: 'event', onRowClick: vi.fn(), wrappedColumnIds: ['summary', 'date'] });
+
+        const summaryCell = screen.getByText('Unexpected end of Stream, the content may have already been read by another component.').closest('td');
+        const dateCell = screen.getByText('event-id').closest('td');
+
+        expect(summaryCell?.getAttribute('data-wrap')).toBe('true');
+        expect(summaryCell?.classList.contains('whitespace-normal')).toBe(true);
+        expect(summaryCell?.classList.contains('break-words')).toBe(true);
+        expect(summaryCell?.classList.contains('truncate')).toBe(false);
+        expect(summaryCell?.className).toContain('[&_.line-clamp-2]:line-clamp-none');
+        expect(dateCell?.hasAttribute('data-wrap')).toBe(false);
+        expect(dateCell?.classList.contains('truncate')).toBe(true);
+    });
+
+    it('reports when the selected auto-fill column is resized', async () => {
+        const onAutoFillColumnResized = vi.fn();
+        render(DataTableBodyTestHarness, {
+            autoFillColumnId: 'date',
+            fullWidthSummary: true,
+            kind: 'event',
+            onAutoFillColumnResized,
+            onRowClick: vi.fn()
+        });
+
+        await fireEvent.keyDown(screen.getByRole('button', { name: 'Resize date column' }), { key: 'ArrowRight' });
+
+        expect(onAutoFillColumnResized).toHaveBeenCalledOnce();
+        expect(onAutoFillColumnResized).toHaveBeenCalledWith('date');
+    });
+
+    it('resizes a flexible column from its rendered width', async () => {
+        render(DataTableBodyTestHarness, { fullWidthSummary: true, kind: 'event', onRowClick: vi.fn() });
+
+        const summaryHeader = screen.getByRole('columnheader', { name: 'Summary' });
+        vi.spyOn(summaryHeader, 'getBoundingClientRect').mockReturnValue({ width: 300 } as DOMRect);
+
+        await fireEvent.keyDown(screen.getByRole('button', { name: 'Resize summary column' }), { key: 'ArrowRight' });
+
+        expect(summaryHeader.style.cssText).toBe('width: 316px; min-width: 316px; max-width: 316px;');
+    });
+
+    it('keeps a flexible column flexible when its resize handle is clicked without dragging', async () => {
+        render(DataTableBodyTestHarness, { fullWidthSummary: true, kind: 'event', onRowClick: vi.fn() });
+
+        const summaryHeader = screen.getByRole('columnheader', { name: 'Summary' });
+        vi.spyOn(summaryHeader, 'getBoundingClientRect').mockReturnValue({ width: 300 } as DOMRect);
+        const resizeHandle = screen.getByRole('button', { name: 'Resize summary column' });
+
+        await fireEvent.mouseDown(resizeHandle, { clientX: 100 });
+        await fireEvent.mouseUp(document, { clientX: 100 });
+
+        expect(summaryHeader.style.cssText).toBe('width: 100%;');
+    });
+
+    it('starts dragging a flexible column from its rendered width', async () => {
+        render(DataTableBodyTestHarness, { fullWidthSummary: true, kind: 'event', onRowClick: vi.fn() });
+
+        const summaryHeader = screen.getByRole('columnheader', { name: 'Summary' });
+        vi.spyOn(summaryHeader, 'getBoundingClientRect').mockReturnValue({ width: 300 } as DOMRect);
+        const resizeHandle = screen.getByRole('button', { name: 'Resize summary column' });
+
+        await fireEvent.mouseDown(resizeHandle, { clientX: 100 });
+        await fireEvent.mouseMove(document, { clientX: 116 });
+
+        expect(summaryHeader.style.cssText).toBe('width: 316px; min-width: 316px; max-width: 316px;');
+
+        await fireEvent.mouseUp(document, { clientX: 116 });
+    });
+
+    it('keeps horizontal scrolling available while the table is in view', async () => {
+        const { container } = render(DataTableBodyTestHarness, { allColumnsSized: true, kind: 'event', onRowClick: vi.fn() });
+        const tableScrollContainer = container.querySelector<HTMLDivElement>('[data-slot="table-container"]');
+        expect(tableScrollContainer).not.toBeNull();
+
+        Object.defineProperties(tableScrollContainer, {
+            clientWidth: { configurable: true, value: 300 },
+            scrollLeft: { configurable: true, value: 0, writable: true },
+            scrollWidth: { configurable: true, value: 600 }
+        });
+        await fireEvent(window, new Event('resize'));
+        await tick();
+
+        const floatingScrollbar = screen.getByRole('scrollbar', { name: 'Horizontal table scroll' });
+        expect(floatingScrollbar.classList).not.toContain('hidden');
+        expect(floatingScrollbar.firstElementChild?.getAttribute('style')).toBe('width: 600px;');
+
+        floatingScrollbar.scrollLeft = 120;
+        await fireEvent.scroll(floatingScrollbar);
+        expect(tableScrollContainer?.scrollLeft).toBe(120);
+
+        if (tableScrollContainer) {
+            tableScrollContainer.scrollLeft = 48;
+            await fireEvent.scroll(tableScrollContainer);
+        }
+        expect(floatingScrollbar.scrollLeft).toBe(48);
+
+        await fireEvent.keyDown(floatingScrollbar, { key: 'End' });
+        expect(tableScrollContainer?.scrollLeft).toBe(300);
+        expect(floatingScrollbar.getAttribute('aria-valuenow')).toBe('300');
+    });
+
+    it('lets a resized header shrink below its metadata width', () => {
+        render(DataTableBodyTestHarness, { kind: 'event', onRowClick: vi.fn() });
+
+        const header = screen.getByRole('columnheader', { name: 'Summary' });
+        const headerContent = screen.getByText('Summary');
+
+        expect(header.style.cssText).toContain('width: 160px');
+        expect(header.style.cssText).toContain('min-width: 160px');
+        expect(header.style.cssText).toContain('max-width: 160px');
+        expect([...header.classList]).toEqual(expect.arrayContaining(['w-60', 'min-w-60', 'max-w-60']));
+        expect(headerContent.classList.contains('w-60')).toBe(false);
+        expect(headerContent.classList.contains('min-w-60')).toBe(false);
+        expect(headerContent.classList.contains('max-w-60')).toBe(false);
+    });
+
+    it('opens event details for normal clicks anywhere in an event summary', async () => {
+        const onRowClick = vi.fn();
+        render(DataTableBodyTestHarness, { kind: 'event', onRowClick });
+
+        await fireEvent.click(screen.getByText('IOException'));
+        await fireEvent.click(screen.getByText('Unexpected end of Stream, the content may have already been read by another component.'));
+
+        expect(onRowClick).toHaveBeenCalledTimes(2);
+        expect(onRowClick).toHaveBeenLastCalledWith(expect.objectContaining({ id: 'event-id' }), expect.any(MouseEvent));
+    });
+
+    it('uses that event details URL for middle and modified clicks', () => {
+        render(DataTableBodyTestHarness, { kind: 'event', onRowClick: vi.fn() });
+
+        const messageLink = screen.getByText('Unexpected end of Stream, the content may have already been read by another component.').closest('a');
+
+        expect(messageLink?.getAttribute('href')).toBe('/event/event-id');
+    });
+
+    it('opens stack details for normal clicks anywhere in a stack summary', async () => {
+        const onRowClick = vi.fn();
+        render(DataTableBodyTestHarness, { kind: 'stack', onRowClick });
+
+        await fireEvent.click(screen.getByText('IOException'));
+        await fireEvent.click(screen.getByText('Unexpected end of Stream, the content may have already been read by another component.'));
+
+        expect(onRowClick).toHaveBeenCalledTimes(2);
+        expect(onRowClick).toHaveBeenLastCalledWith(expect.objectContaining({ id: 'stack-id' }), expect.any(MouseEvent));
+    });
+
+    it('uses the stack details URL for middle and modified clicks', () => {
+        render(DataTableBodyTestHarness, { kind: 'stack', onRowClick: vi.fn() });
+
+        const messageLink = screen.getByText('Unexpected end of Stream, the content may have already been read by another component.').closest('a');
+
+        expect(messageLink?.getAttribute('href')).toBe('/stack/stack-id');
+    });
+});

@@ -1,0 +1,60 @@
+---
+name: backend-testing
+description: Write Exceptionless C# tests using local fixtures, HTTP helpers, and controlled time.
+---
+
+# Backend Testing
+
+## Unit test structure
+
+Follow [Microsoft's .NET unit testing best practices](https://learn.microsoft.com/en-us/dotnet/core/testing/unit-testing-best-practices).
+
+Organize tests as **Arrange–Act–Assert**:
+
+- **Arrange:** create the subject, minimal input, and required dependencies.
+- **Act:** perform the behavior under test, awaiting asynchronous work.
+- **Assert:** check the observable result and relevant side effects. Keep assertions separate from the action.
+
+Keep unit tests fast, isolated, repeatable, and self-checking. Use clear names and minimal setup; test behavior rather than implementation details. Avoid branching or recreating production logic to calculate expected results. Before adding a test, identify the distinct regression it catches and inspect existing coverage. Extend an existing scenario or parameterize equivalent cases instead of duplicating setup. Combine assertions for the same behavior when they share expensive setup, while keeping independent behaviors separately diagnosable. Do not add trivial accessor, framework, or implementation-mirroring tests. Infrastructure-dependent checks belong in integration tests, using the fixtures below. Coverage percentages and test counts alone do not establish test quality.
+
+Use the smallest fixture that proves the behavior. For batching/pagination, cross the real boundary rather than generating arbitrary thousands of records. Keep benchmarks out of the correctness suite. Inspect CI timing reports for expensive tests and preserve automatic shard discovery when restructuring test classes.
+
+## Fixtures and locations
+
+Under `tests/Exceptionless.Tests/`:
+
+- `IntegrationTestsBase.cs` and `AppWebHostFactory.cs`: HTTP/service integration fixtures.
+- `TestWithServices.cs`: tests needing dependency injection.
+- `Api/Endpoints/`, `Api/Filters/`, `Api/Handlers/`, and `Api/Results/`: API tests by boundary.
+- `Utility/AppSendBuilder.cs`: fluent HTTP requests and assertions.
+- `Utility/DataBuilder.cs`: synthetic records.
+- `Utility/ProxyTimeProvider.cs`: controlled time.
+
+Resolve services reused across tests or repeatedly within a test into descriptive readonly private fields in the test constructor. Keep one-off services in named locals. Never call a method or access a property directly on `GetService<T>()`, or pass the lookup inline as an argument.
+
+```csharp
+// Avoid
+await GetService<IOrganizationRepository>().AddAsync(organization);
+
+// Use
+var organizations = GetService<IOrganizationRepository>();
+await organizations.AddAsync(organization);
+```
+
+Use Foundatio in-memory implementations for cache, storage, queues, messaging, and locks instead of mocking those abstractions. Never mock cache clients or serialization; use the configured serializer. Test provider-specific behavior or failures against the real provider.
+
+Name tests `MethodUnderTest_Scenario_ExpectedBehavior`.
+
+## HTTP and state
+
+Use `SendRequestAsync` with `AppSendBuilder` and its authorization helpers: `AsGlobalAdminUser`, `AsTestOrganizationUser`, `AsFreeOrganizationUser`, and `AsTestOrganizationClientUser`. Match an existing endpoint test for the expected response and fixture setup.
+
+Use `CreateDataAsync` for synthetic data and `RefreshDataAsync` after database writes when reads require index refresh. `ResetDataAsync` clears the integration fixture's data; never point these fixtures at production.
+
+Tests use the production serializer. For JSON compatibility, inspect `Serializer/` and the relevant API snapshots.
+
+## Time
+
+Use the fixture's `TimeProvider`: `Advance`, `SetUtcNow`, and `Restore`. Do not create a separate clock when the fixture provides one. For isolated tests without that fixture, use a `FakeTimeProvider` and its default fixed time unless a particular date matters. Prefer controlled time to real waits.
+
+Follow root guidance for focused commands, conditional Aspire startup, and API contract verification.

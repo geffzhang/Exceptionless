@@ -1,0 +1,112 @@
+<script lang="ts">
+    import { ProblemDetails } from '@foundatiofx/fetchclient';
+    import { createForm } from '@tanstack/svelte-form';
+
+    import ErrorMessage from '#comp/error-message.svelte';
+    import { A, P } from '#comp/typography/index.ts';
+    import * as AlertDialog from '#comp/ui/alert-dialog/index.ts';
+    import * as Field from '#comp/ui/field/index.ts';
+    import { Input } from '#comp/ui/input/index.ts';
+    import { ClientConfigurationSettingSchema } from '#features/projects/schemas.ts';
+    import { ariaInvalid, getFormErrorMessages, mapFieldErrors, problemDetailsToFormErrors } from '#shared/validation.ts';
+
+    import type { ClientConfigurationSetting } from '../../models';
+
+    interface Props {
+        open: boolean;
+        save: (value: string) => Promise<void>;
+        setting: ClientConfigurationSetting;
+    }
+    let { open = $bindable(), save, setting }: Props = $props();
+
+    const form = createForm(() => ({
+        defaultValues: {
+            key: setting.key,
+            value: setting.value
+        },
+        validators: {
+            onSubmit: ClientConfigurationSettingSchema,
+            onSubmitAsync: async ({ value }) => {
+                try {
+                    await save(value.value.trim());
+                    open = false;
+                    return null;
+                } catch (error: unknown) {
+                    if (error instanceof ProblemDetails) {
+                        return problemDetailsToFormErrors(error);
+                    }
+
+                    return {
+                        form: 'An unexpected error occurred'
+                    };
+                }
+            }
+        }
+    }));
+
+    $effect(() => {
+        if (open) {
+            form.reset();
+            form.setFieldValue('key', setting.key);
+            form.setFieldValue('value', setting.value);
+        }
+    });
+</script>
+
+<AlertDialog.Root bind:open>
+    <AlertDialog.Content class="sm:max-w-[425px]">
+        <form
+            onsubmit={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                form.handleSubmit();
+            }}
+        >
+            <AlertDialog.Header>
+                <AlertDialog.Title>Update {setting.key} Configuration Value</AlertDialog.Title>
+                <AlertDialog.Description
+                    >The <A href="https://exceptionless.com/docs/project-settings/#client-configuration" target="_blank">configuration value</A> will be sent to the
+                    Exceptionless clients in real time.</AlertDialog.Description
+                >
+            </AlertDialog.Header>
+
+            <form.Subscribe selector={(state) => state.errors}>
+                {#snippet children(errors)}
+                    <ErrorMessage message={getFormErrorMessages(errors)}></ErrorMessage>
+                {/snippet}
+            </form.Subscribe>
+
+            <P class="pb-4">
+                <form.Field name="value">
+                    {#snippet children(field)}
+                        <Field.Field data-invalid={ariaInvalid(field)}>
+                            <Field.Label for={field.name}>Value</Field.Label>
+                            <Input
+                                id={field.name}
+                                name={field.name}
+                                type="text"
+                                placeholder="Please enter a valid value"
+                                required
+                                autocomplete="off"
+                                value={field.state.value}
+                                onblur={field.handleBlur}
+                                oninput={(e) => field.handleChange(e.currentTarget.value.trim())}
+                                aria-invalid={ariaInvalid(field)}
+                            />
+                            <Field.Error errors={mapFieldErrors(field.state.meta.errors)} />
+                        </Field.Field>
+                    {/snippet}
+                </form.Field>
+            </P>
+
+            <AlertDialog.Footer>
+                <AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
+                <form.Subscribe selector={(state) => state.isSubmitting}>
+                    {#snippet children(isSubmitting)}
+                        <AlertDialog.Action type="submit" disabled={isSubmitting}>Save Configuration Value</AlertDialog.Action>
+                    {/snippet}
+                </form.Subscribe>
+            </AlertDialog.Footer>
+        </form>
+    </AlertDialog.Content>
+</AlertDialog.Root>

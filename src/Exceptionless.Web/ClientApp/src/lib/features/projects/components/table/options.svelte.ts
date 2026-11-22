@@ -1,0 +1,114 @@
+import type { FetchClientResponse, ProblemDetails } from '@foundatiofx/fetchclient';
+import type { CreateQueryResult } from '@tanstack/svelte-query';
+
+import { type ColumnDef, renderComponent, type StockFeatures } from '@tanstack/svelte-table';
+
+import type { ViewProject } from '#features/projects/models.ts';
+
+import NumberFormatter from '#comp/formatters/number.svelte';
+import ProjectActionsCell from '#features/projects/components/table/project-actions-cell.svelte';
+import { getSharedTableOptions } from '#features/shared/table.svelte.ts';
+
+import type { GetOrganizationProjectsParams, GetProjectsMode } from '../../api.svelte';
+
+interface ProjectTableOptions {
+    includeOrganizationColumn?: boolean;
+}
+
+export function getColumns<TProject extends ViewProject>(
+    mode: GetProjectsMode = 'stats',
+    options: ProjectTableOptions = {}
+): ColumnDef<StockFeatures, TProject, unknown>[] {
+    const columns: ColumnDef<StockFeatures, TProject, unknown>[] = [
+        {
+            accessorKey: 'name',
+            cell: (info) => info.getValue(),
+            enableHiding: false,
+            header: 'Name',
+            meta: {
+                class: 'w-50'
+            }
+        }
+    ];
+
+    if (options.includeOrganizationColumn) {
+        columns.push({
+            accessorKey: 'organization_name',
+            cell: (info) => info.getValue(),
+            enableSorting: false,
+            header: 'Organization',
+            meta: {
+                class: 'w-50'
+            }
+        });
+    }
+
+    const isStatsMode = mode === 'stats';
+    if (isStatsMode) {
+        columns.push(
+            {
+                accessorKey: 'stack_count',
+                cell: (info) =>
+                    renderComponent(NumberFormatter, {
+                        value: info.getValue<number>()
+                    }),
+                enableSorting: false,
+                header: 'Stacks',
+                meta: {
+                    class: 'w-24'
+                }
+            },
+            {
+                accessorKey: 'event_count',
+                cell: (info) =>
+                    renderComponent(NumberFormatter, {
+                        value: info.getValue<number>()
+                    }),
+                enableSorting: false,
+                header: 'Events',
+                meta: {
+                    class: 'w-24'
+                }
+            }
+        );
+    }
+
+    columns.push({
+        cell: (info) =>
+            renderComponent(ProjectActionsCell, {
+                project: info.row.original
+            }),
+        enableHiding: false,
+        enableSorting: false,
+        header: '',
+        id: 'actions',
+        meta: {
+            class: 'w-12 min-w-12 max-w-12 text-right'
+        }
+    });
+
+    return columns;
+}
+
+export function getTableOptions<TProject extends ViewProject>(
+    queryParameters: GetOrganizationProjectsParams,
+    queryResponse: CreateQueryResult<FetchClientResponse<TProject[]>, ProblemDetails>,
+    options: ProjectTableOptions = {}
+) {
+    return getSharedTableOptions<TProject>({
+        columnPersistenceKey: 'projects-column-visibility',
+        get columns() {
+            return getColumns<TProject>(queryParameters.mode, options);
+        },
+        paginationStrategy: 'offset',
+        get queryData() {
+            return queryResponse.data?.data ?? [];
+        },
+        get queryMeta() {
+            return queryResponse.data?.meta;
+        },
+        get queryParameters() {
+            return queryParameters;
+        }
+    });
+}

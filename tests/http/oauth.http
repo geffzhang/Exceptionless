@@ -1,0 +1,93 @@
+# The GET authorize bridge redirects to /oauth/authorize on the configured application BaseURL with the original query string.
+# With separate hosts, configure EX_ApiUrl on both UI and API deployments and use that public API origin as rootUrl below.
+# Discovery, issuer, resources, and challenges use ApiUrl (or BaseURL when unset); only the browser redirect uses the UI BaseURL.
+# Local authorization-code walkthrough. Run registration, login, authorization, then token exchange.
+# Copy code from the authorization response's redirect_uri into authorizationCode. Each code can be exchanged once.
+@rootUrl = http://localhost:7110
+@apiUrl = {{rootUrl}}/api/v2
+@email = admin@exceptionless.test
+@password = tester
+@organizationId = 537650f3b77efe23a47914f3
+@redirectUri = http://127.0.0.1:49152/callback
+@resource = {{apiUrl}}
+@scope = projects:read events:read offline_access
+# Example S256 PKCE pair; real clients generate a new pair for each authorization.
+@codeVerifier = dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+@codeChallenge = E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+@authorizationCode = replace-with-code-from-redirect-uri
+
+### Discover authorization endpoints
+GET {{rootUrl}}/.well-known/oauth-authorization-server
+
+### Register a local client
+# @name registerOAuthClient
+POST {{apiUrl}}/oauth/register
+Content-Type: application/json
+
+{
+    "client_name": "Local API example",
+    "redirect_uris": ["{{redirectUri}}"],
+    "grant_types": ["authorization_code", "refresh_token"],
+    "response_types": ["code"],
+    "scope": "{{scope}}",
+    "token_endpoint_auth_method": "none"
+}
+
+###
+@clientId = {{registerOAuthClient.response.body.$.client_id}}
+
+### Login to a test account
+# @name login
+POST {{apiUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "{{email}}",
+    "password": "{{password}}"
+}
+
+### Authorize access to the selected organization
+POST {{apiUrl}}/oauth/authorize
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+    "client_id": "{{clientId}}",
+    "response_type": "code",
+    "redirect_uri": "{{redirectUri}}",
+    "scope": "{{scope}}",
+    "state": "local-example",
+    "code_challenge": "{{codeChallenge}}",
+    "code_challenge_method": "S256",
+    "resource": "{{resource}}",
+    "organization_ids": ["{{organizationId}}"]
+}
+
+### Exchange the authorization code for tokens
+# @name tokenExchange
+POST {{apiUrl}}/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code&client_id={{clientId}}&code={{authorizationCode}}&redirect_uri={{redirectUri}}&code_verifier={{codeVerifier}}&resource={{resource}}
+
+###
+@accessToken = {{tokenExchange.response.body.$.access_token}}
+@refreshToken = {{tokenExchange.response.body.$.refresh_token}}
+
+### Call the REST API with the access token
+# For MCP instead, use resource http://localhost:7110/mcp and scope
+# mcp:read projects:read stacks:read events:read offline_access from the start, then see mcp.http.
+GET {{apiUrl}}/projects
+Authorization: Bearer {{accessToken}}
+
+### Refresh the access token
+POST {{apiUrl}}/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=refresh_token&client_id={{clientId}}&refresh_token={{refreshToken}}
+
+### Revoke the access token
+POST {{apiUrl}}/oauth/revoke
+Content-Type: application/x-www-form-urlencoded
+
+client_id={{clientId}}&token={{accessToken}}

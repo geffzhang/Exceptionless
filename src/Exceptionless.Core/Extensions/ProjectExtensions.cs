@@ -1,98 +1,140 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+﻿using System.Text;
+using System.Text.Json;
 using Exceptionless.Core.Models;
 using Exceptionless.DateTimeExtensions;
-using Foundatio.Utility;
+using Foundatio.Serializer;
+using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Extensions {
-    public static class ProjectExtensions {
-        /// <summary>
-        /// These are the default settings for the integration or user who created the project.
-        /// </summary>
-        public static void AddDefaultNotificationSettings(this Project project, string userIdOrIntegration, NotificationSettings settings = null) {
-            if (project.NotificationSettings.ContainsKey(userIdOrIntegration))
-                return;
+namespace Exceptionless.Core.Extensions;
 
-            project.NotificationSettings.Add(userIdOrIntegration, settings ?? new NotificationSettings {
-                SendDailySummary = true,
-                ReportNewErrors = true,
-                ReportCriticalErrors = true,
-                ReportEventRegressions = true
-            });
+public static class ProjectExtensions
+{
+    /// <summary>
+    /// These are the default settings for the integration or user who created the project.
+    /// </summary>
+    public static void AddDefaultNotificationSettings(this Project project, string userIdOrIntegration, NotificationSettings? settings = null)
+    {
+        if (project.NotificationSettings.ContainsKey(userIdOrIntegration))
+            return;
+
+        project.NotificationSettings.Add(userIdOrIntegration, settings ?? new NotificationSettings
+        {
+            SendDailySummary = true,
+            ReportNewErrors = true,
+            ReportCriticalErrors = true,
+            ReportEventRegressions = true
+        });
+    }
+
+    public static void SetDefaultUserAgentBotPatterns(this Project project)
+    {
+        if (project.Configuration.Settings.ContainsKey(SettingsDictionary.KnownKeys.UserAgentBotPatterns))
+            return;
+
+        project.Configuration.Settings[SettingsDictionary.KnownKeys.UserAgentBotPatterns] = "*bot*,*crawler*,*spider*,*aolbuild*,*teoma*,*yahoo*";
+    }
+
+    public static string BuildFilter(this IList<Project> projects)
+    {
+        var builder = new StringBuilder();
+        for (int index = 0; index < projects.Count; index++)
+        {
+            if (index > 0)
+                builder.Append(" OR ");
+
+            builder.AppendFormat("project:{0}", projects[index].Id);
         }
 
-        public static void SetDefaultUserAgentBotPatterns(this Project project) {
-            if (project.Configuration.Settings.ContainsKey(SettingsDictionary.KnownKeys.UserAgentBotPatterns))
-                return;
+        return builder.ToString();
+    }
 
-            project.Configuration.Settings[SettingsDictionary.KnownKeys.UserAgentBotPatterns] = "*bot*,*crawler*,*spider*,*aolbuild*,*teoma*,*yahoo*";
+    /// <summary>
+    /// Gets the slack token from extended data.
+    /// </summary>
+    public static SlackToken? GetSlackToken(this Project project)
+    {
+        return project.Data is not null && project.Data.TryGetValue(Project.KnownDataKeys.SlackToken, out object? value) ? value as SlackToken : null;
+    }
+
+    /// <summary>
+    /// Gets the slack token from extended data using serializer-aware conversion.
+    /// </summary>
+    public static SlackToken? GetSlackToken(this Project project, ITextSerializer serializer, ILogger? logger = null)
+    {
+        if (project.Data is null || !project.Data.TryGetValue(Project.KnownDataKeys.SlackToken, out _))
+            return null;
+
+        try
+        {
+            return project.Data.GetValue<SlackToken>(Project.KnownDataKeys.SlackToken, serializer);
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
+        {
+            logger?.LogWarning(ex, "Failed to deserialize SlackToken for project {ProjectId}", project.Id);
         }
 
-        public static string BuildFilter(this IList<Project> projects) {
-            var builder = new StringBuilder();
-            for (int index = 0; index < projects.Count; index++) {
-                if (index > 0)
-                    builder.Append(" OR ");
+        return null;
+    }
 
-                builder.AppendFormat("project:{0}", projects[index].Id);
-            }
+    public static bool HasHourlyUsage(this Project project, DateTime date)
+    {
+        return project.UsageHours.Any(o => o.Date == date.ToUniversalTime().StartOfHour());
+    }
 
-            return builder.ToString();
-        }
+    public static UsageHourInfo GetHourlyUsage(this Project project, DateTime date)
+    {
+        var usage = project.UsageHours.FirstOrDefault(o => o.Date == date.ToUniversalTime().StartOfHour());
+        if (usage is not null)
+            return usage;
 
-        /// <summary>
-        /// Gets the slack token from extended data.
-        /// </summary>
-        public static SlackToken GetSlackToken(this Project project) {
-            return project.Data.TryGetValue(Project.KnownDataKeys.SlackToken, out object value) ? value as SlackToken : null;
-        }
+        usage = new UsageHourInfo
+        {
+            Date = date.ToUniversalTime().StartOfHour()
+        };
+        project.UsageHours.Add(usage);
 
-        public static int GetCurrentHourlyTotal(this Project project) {
-            var date = SystemClock.UtcNow.Floor(TimeSpan.FromHours(1));
-            var usageInfo = project.OverageHours.FirstOrDefault(o => o.Date == date);
-            return usageInfo?.Total ?? 0;
-        }
+        return usage;
+    }
 
-        public static int GetCurrentHourlyBlocked(this Project project) {
-            var date = SystemClock.UtcNow.Floor(TimeSpan.FromHours(1));
-            var usageInfo = project.OverageHours.FirstOrDefault(o => o.Date == date);
-            return usageInfo?.Blocked ?? 0;
-        }
+    public static UsageHourInfo GetCurrentHourlyUsage(this Project project, TimeProvider timeProvider)
+    {
+        return project.GetHourlyUsage(timeProvider.GetUtcNow().UtcDateTime);
+    }
 
-        public static int GetCurrentHourlyTooBig(this Project project) {
-            var date = SystemClock.UtcNow.Floor(TimeSpan.FromHours(1));
-            var usageInfo = project.OverageHours.FirstOrDefault(o => o.Date == date);
-            return usageInfo?.TooBig ?? 0;
-        }
+    public static void TrimUsage(this Project project, TimeProvider timeProvider)
+    {
+        var utcNow = timeProvider.GetUtcNow().UtcDateTime;
 
-        public static int GetCurrentMonthlyTotal(this Project project) {
-            var date = new DateTime(SystemClock.UtcNow.Year, SystemClock.UtcNow.Month, 1, 0, 0, 0, DateTimeKind.Utc);
-            var usageInfo = project.Usage.FirstOrDefault(o => o.Date == date);
-            return usageInfo?.Total ?? 0;
-        }
+        // keep 1 year of usage
+        project.Usage = project.Usage.Except(project.Usage
+            .Where(u => utcNow.Subtract(u.Date) > TimeSpan.FromDays(366)))
+            .OrderBy(u => u.Date)
+            .ToList();
 
-        public static int GetCurrentMonthlyBlocked(this Project project) {
-            var date = new DateTime(SystemClock.UtcNow.Year, SystemClock.UtcNow.Month, 1, 0, 0, 0, DateTimeKind.Utc);
-            var usageInfo = project.Usage.FirstOrDefault(o => o.Date == date);
-            return usageInfo?.Blocked ?? 0;
-        }
+        // keep 30 days of hourly usage that have blocked events, otherwise keep it for 7 days
+        project.UsageHours = project.UsageHours.Except(project.UsageHours
+            .Where(u => utcNow.Subtract(u.Date) > TimeSpan.FromDays(u.Blocked > 0 ? 30 : 7)))
+            .OrderBy(u => u.Date)
+            .ToList();
+    }
 
-        public static int GetCurrentMonthlyTooBig(this Project project) {
-            var date = new DateTime(SystemClock.UtcNow.Year, SystemClock.UtcNow.Month, 1, 0, 0, 0, DateTimeKind.Utc);
-            var usageInfo = project.Usage.FirstOrDefault(o => o.Date == date);
-            return usageInfo?.TooBig ?? 0;
-        }
+    public static UsageInfo GetCurrentUsage(this Project project, TimeProvider timeProvider)
+    {
+        return project.GetUsage(timeProvider.GetUtcNow().UtcDateTime);
+    }
 
-        public static void SetHourlyOverage(this Project project, double total, double blocked, double tooBig, int hourlyLimit) {
-            var date = SystemClock.UtcNow.Floor(TimeSpan.FromHours(1));
-            project.OverageHours.SetUsage(date, (int)total, (int)blocked, (int)tooBig, hourlyLimit, TimeSpan.FromDays(3));
-        }
+    public static UsageInfo GetUsage(this Project project, DateTime date)
+    {
+        var usage = project.Usage.FirstOrDefault(o => o.Date == date.ToUniversalTime().StartOfMonth());
+        if (usage is not null)
+            return usage;
 
-        public static void SetMonthlyUsage(this Project project, double total, double blocked, double tooBig, int monthlyLimit) {
-            var date = new DateTime(SystemClock.UtcNow.Year, SystemClock.UtcNow.Month, 1, 0, 0, 0, DateTimeKind.Utc);
-            project.Usage.SetUsage(date, (int)total, (int)blocked, (int)tooBig, monthlyLimit, TimeSpan.FromDays(366));
-        }
+        usage = new UsageInfo
+        {
+            Date = date.ToUniversalTime().StartOfMonth(),
+        };
+        project.Usage.Add(usage);
+
+        return usage;
     }
 }

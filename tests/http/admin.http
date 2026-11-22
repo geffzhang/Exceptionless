@@ -1,0 +1,89 @@
+@url = http://localhost:7110
+@apiUrl = {{url}}/api/v2
+@email = admin@exceptionless.test
+@password = tester
+
+### login to test account
+# @name login
+POST {{apiUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "{{email}}",
+    "password": "{{password}}"
+}
+
+###
+
+@token = {{login.response.body.$.token}}
+
+### Organizations By Criteria
+GET {{apiUrl}}/admin/organizations?criteria=acme
+Authorization: Bearer {{token}}
+
+### Admin Stats
+GET {{apiUrl}}/admin/stats
+Authorization: Bearer {{token}}
+
+### Get Exie Settings
+GET {{apiUrl}}/admin/assistant-settings
+Authorization: Bearer {{token}}
+
+### Set the Exie model (use model: null to restore the configured default)
+PUT {{apiUrl}}/admin/assistant-settings
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "model": "replace-with-model-id"
+}
+
+### Get Event Submission Settings
+GET {{apiUrl}}/admin/event-submission-settings
+Authorization: Bearer {{token}}
+
+### Pause event submission (use enabled: null to restore the configured default)
+PUT {{apiUrl}}/admin/event-submission-settings
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "enabled": false
+}
+
+### Requeue
+GET {{apiUrl}}/admin/requeue?archive=true
+Authorization: Bearer {{token}}
+
+### Recalculate stack statistics
+# Optional query parameters: utcStart and utcEnd (UTC timestamps).
+GET {{apiUrl}}/admin/maintenance/fix-stack-stats
+Authorization: Bearer {{token}}
+
+### Migrations
+GET {{apiUrl}}/admin/migrations
+Authorization: Bearer {{token}}
+
+### Rerun a migration
+# Set the version from the migrations list before running this request.
+@migrationVersion = replace-with-migration-version
+# @name rerunMigration
+POST {{apiUrl}}/admin/migrations/{{migrationVersion}}/rerun
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "confirmation": "RERUN {{migrationVersion}}"
+}
+
+### Get Migration Rerun Status
+GET {{apiUrl}}/admin/migrations/reruns/{{rerunMigration.response.body.$.workers[0]}}
+Authorization: Bearer {{token}}
+
+### Elasticsearch Cluster Info
+GET {{apiUrl}}/admin/elasticsearch
+Authorization: Bearer {{token}}
+
+### Elasticsearch Snapshots
+GET {{apiUrl}}/admin/elasticsearch/snapshots
+Authorization: Bearer {{token}}

@@ -1,56 +1,77 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
+﻿using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Models;
 using Exceptionless.Core.Repositories.Configuration;
-using FluentValidation;
+using Exceptionless.Core.Validation;
 using Foundatio.Repositories;
 using Foundatio.Repositories.Models;
-using Nest;
+using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Repositories {
-    public sealed class WebHookRepository : RepositoryOwnedByOrganizationAndProject<WebHook>, IWebHookRepository {
-        public WebHookRepository(ExceptionlessElasticConfiguration configuration, IValidator<WebHook> validator)
-            : base(configuration.Organizations.WebHook, validator) {}
+namespace Exceptionless.Core.Repositories;
 
-        public Task<FindResults<WebHook>> GetByUrlAsync(string targetUrl) {
-            return FindAsync(q => q.FieldEquals(w => w.Url, targetUrl));
-        }
-
-        public Task<FindResults<WebHook>> GetByOrganizationIdOrProjectIdAsync(string organizationId, string projectId) {
-            var filter = (Query<WebHook>.Term(e => e.OrganizationId, organizationId) && !Query<WebHook>.Exists(e => e.Field(f => f.ProjectId))) || Query<WebHook>.Term(e => e.ProjectId, projectId);
-
-            // TODO: This cache key may not always be cleared out if the web hook doesn't have both a org and project id.
-            return FindAsync(q => q.ElasticFilter(filter), o => o.CacheKey(String.Concat("paged:Organization:", organizationId, ":Project:", projectId)));
-        }
-
-        public static class EventTypes {
-            // TODO: Add support for these new web hook types.
-            public const string NewError = "NewError";
-            public const string CriticalError = "CriticalError";
-            public const string NewEvent = "NewEvent";
-            public const string CriticalEvent = "CriticalEvent";
-            public const string StackRegression = "StackRegression";
-            public const string StackPromoted = "StackPromoted";
-        }
-
-        protected override Task InvalidateCacheAsync(IReadOnlyCollection<ModifiedDocument<WebHook>> documents, ICommandOptions options = null) {
-            if (!IsCacheEnabled)
-                return Task.CompletedTask;
-
-            var keys = documents.Select(d => d.Value).Union(documents.Select(d => d.Original).Where(d => d != null)).Select(h => String.Concat("Organization:", h.OrganizationId, ":Project:", h.ProjectId)).Distinct();
-            return Task.WhenAll(Cache.RemoveAllAsync(keys), base.InvalidateCacheAsync(documents, options));
-        }
-
-        protected override Task InvalidateCachedQueriesAsync(IReadOnlyCollection<WebHook> documents, ICommandOptions options = null) {
-            var keysToRemove = documents.Select(d => $"paged:Organization:{d.OrganizationId}:Project:{d.ProjectId}").Distinct();
-            var tasks = new List<Task>();
-            foreach (string key in keysToRemove)
-                tasks.Add(Cache.RemoveByPrefixAsync(key));
-
-            tasks.Add(base.InvalidateCachedQueriesAsync(documents, options));
-            return Task.WhenAll(tasks);
-        }
+public sealed class WebHookRepository : RepositoryOwnedByOrganizationAndProject<WebHook>, IWebHookRepository
+{
+    public WebHookRepository(ExceptionlessElasticConfiguration configuration, MiniValidationValidator validator,
+        AppOptions options)
+        : base(configuration.WebHooks, validator, options)
+    {
     }
+
+    public Task<FindResults<WebHook>> GetByUrlAsync(string targetUrl)
+    {
+        return FindAsync(q => q.FieldEquals(w => w.Url, targetUrl).Sort(f => f.CreatedUtc));
+    }
+
+    public Task<FindResults<WebHook>> GetByOrganizationIdOrProjectIdAsync(string organizationId, string projectId)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(organizationId);
+        ArgumentException.ThrowIfNullOrEmpty(projectId);
+
+        // Match organization-level webhooks (organization matches, no project) OR project-specific webhooks
+        return FindAsync(q => q
+            .FieldOr(g => g
+                .FieldAnd(a => a
+                    .FieldEquals(w => w.OrganizationId, organizationId)
+                    .FieldEmpty(w => w.ProjectId))
+                .FieldEquals(w => w.ProjectId, projectId))
+            .Sort(f => f.CreatedUtc), o => o.Cache(PagedCacheKey(organizationId, projectId)));
+    }
+
+    public override Task<FindResults<WebHook>> GetByProjectIdAsync(string projectId, CommandOptionsDescriptor<WebHook>? options = null)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(projectId);
+
+        return FindAsync(q => q.Project(projectId).Sort(f => f.CreatedUtc), options);
+    }
+
+    public async Task MarkDisabledAsync(string id)
+    {
+        var webHook = await GetByIdAsync(id);
+        if (webHook is null)
+        {
+            _logger.LogWarning("WebHook {WebHookId} not found when marking as disabled", id);
+            return;
+        }
+
+        if (!webHook.IsEnabled)
+            return;
+
+        webHook.IsEnabled = false;
+        await SaveAsync(webHook, o => o.Cache());
+    }
+
+    protected override async Task InvalidateCacheAsync(IReadOnlyCollection<ModifiedDocument<WebHook>> documents, ChangeType? changeType = null)
+    {
+        var originalAndModifiedDocuments = documents.UnionOriginalAndModified();
+        var keysToRemove = originalAndModifiedDocuments.Select(CacheKey).Distinct();
+        await Cache.RemoveAllAsync(keysToRemove);
+
+        var pagedKeysToRemove = originalAndModifiedDocuments.Select(d => PagedCacheKey(d.OrganizationId, d.ProjectId)).Distinct();
+        foreach (string key in pagedKeysToRemove)
+            await Cache.RemoveByPrefixAsync(key);
+
+        await base.InvalidateCacheAsync(documents, changeType);
+    }
+
+    private static string CacheKey(WebHook webHook) => String.Concat("Organization:", webHook.OrganizationId, ":Project:", webHook.ProjectId);
+    private static string PagedCacheKey(string organizationId, string projectId) => String.Concat("paged:Organization:", organizationId, ":Project:", projectId);
 }

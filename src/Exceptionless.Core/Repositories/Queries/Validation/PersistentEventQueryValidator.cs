@@ -1,105 +1,141 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
+﻿using Exceptionless.Core.Repositories.Configuration;
+using Foundatio.Parsers.LuceneQueries;
 using Foundatio.Parsers.LuceneQueries.Visitors;
-using Exceptionless.Core.Repositories.Configuration;
-using Foundatio.Parsers.ElasticQueries.Visitors;
 using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Queries.Validation {
-    public sealed class PersistentEventQueryValidator : QueryValidator {
-        private readonly HashSet<string> _freeQueryFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+namespace Exceptionless.Core.Queries.Validation;
+
+public sealed class PersistentEventQueryValidator : AppQueryValidator
+{
+    private static readonly HashSet<string> _freeQueryFields = new(StringComparer.OrdinalIgnoreCase) {
+            EventIndex.Alias.Environment,
             "date",
-            "is_hidden",
-            "is_fixed",
             "type",
+            EventIndex.Alias.ReferenceId,
             "reference_id",
+            EventIndex.Alias.OrganizationId,
             "organization_id",
+            EventIndex.Alias.ProjectId,
             "project_id",
-            "stack_id"
+            EventIndex.Alias.StackId,
+            "stack_id",
+            "status"
         };
 
-        private static readonly HashSet<string> _freeAggregationFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+    private static readonly HashSet<string> _freeAggregationFields = new(StringComparer.OrdinalIgnoreCase) {
+            EventIndex.Alias.Environment,
             "date",
             "type",
             "value",
             "count",
+            EventIndex.Alias.IsFirstOccurrence,
             "is_first_occurrence",
-            "stack_id",
-            "data.@user.identity"
+            "stack",
+            EventIndex.Alias.StackId,
+            EventIndex.Alias.User,
+            "data.@user.identity",
+            "status"
         };
 
-        private static readonly HashSet<string> _allowedAggregationFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+    private static readonly HashSet<string> _allowedAggregationFields = new(StringComparer.OrdinalIgnoreCase) {
+            EventIndex.Alias.Environment,
             "date",
             "source",
             "tags",
             "type",
+            "status",
             "value",
             "count",
             "geo",
-            "is_fixed",
-            "is_hidden",
+            EventIndex.Alias.IsFirstOccurrence,
             "is_first_occurrence",
+            EventIndex.Alias.OrganizationId,
             "organization_id",
+            EventIndex.Alias.ProjectId,
             "project_id",
+            EventIndex.Alias.StackId,
             "stack_id",
             "os",
+            "os.major",
+            "os.version",
             "error.code",
             "error.type",
             "error.targettype",
             "error.targetmethod",
-            "data.@environment.machine_name",
+            EventIndex.Alias.MachineArchitecture,
             "data.@environment.architecture",
+            EventIndex.Alias.MachineName,
+            "data.@environment.machine_name",
+            EventIndex.Alias.LocationCountry,
             "data.@location.country",
+            EventIndex.Alias.LocationLevel1,
             "data.@location.level1",
+            EventIndex.Alias.LocationLevel2,
             "data.@location.level2",
+            EventIndex.Alias.LocationLocality,
             "data.@location.locality",
+            EventIndex.Alias.Browser,
+            $"{EventIndex.Alias.Browser}.major",
             "data.@request.data.@browser",
             "data.@request.data.@browser_major_version",
+            EventIndex.Alias.Device,
             "data.@request.data.@device",
             "data.@request.data.@os_version",
             "data.@request.data.@os_major_version",
+            EventIndex.Alias.RequestIsBot,
             "data.@request.data.@is_bot",
+            EventIndex.Alias.Version,
             "data.@version",
-            "data.@user.identity"
+            EventIndex.Alias.User,
+            "data.@user.identity",
+            EventIndex.Alias.Level,
+            "data.@level"
         };
 
-        public PersistentEventQueryValidator(ExceptionlessElasticConfiguration configuration, ILoggerFactory loggerFactory) : base(configuration.Events.Event.QueryParser, loggerFactory) {}
+    public PersistentEventQueryValidator(ExceptionlessElasticConfiguration configuration, ILoggerFactory loggerFactory) : base(configuration.Events.QueryParser, loggerFactory) { }
 
-        protected override QueryProcessResult ApplyQueryRules(QueryValidationInfo info) {
-            return new QueryProcessResult {
-                IsValid = info.IsValid,
-                UsesPremiumFeatures = !info.ReferencedFields.All(_freeQueryFields.Contains)
-            };
-        }
+    internal static bool IsFreeQueryField(string field)
+    {
+        return _freeQueryFields.Contains(field);
+    }
 
-        protected override QueryProcessResult ApplyAggregationRules(QueryValidationInfo info) {
-            if (!info.IsValid)
-                return new QueryProcessResult { Message = "Invalid aggregation" };
+    protected override QueryProcessResult ApplyQueryRules(QueryValidationResult result)
+    {
+        return new QueryProcessResult
+        {
+            IsValid = result.IsValid,
+            UsesPremiumFeatures = !result.ReferencedFields.All(IsFreeQueryField)
+        };
+    }
 
-            if (info.MaxNodeDepth > 6)
-                return new QueryProcessResult { Message = "Aggregation max depth exceeded" };
+    protected override QueryProcessResult ApplyAggregationRules(QueryValidationResult result)
+    {
+        if (!result.IsValid)
+            return new QueryProcessResult { Message = "Invalid aggregation" };
 
-            if (info.Operations.Values.Sum(o => o.Count) > 10)
-                return new QueryProcessResult { Message = "Aggregation count exceeded" };
+        if (result.MaxNodeDepth > 6)
+            return new QueryProcessResult { Message = "Aggregation max depth exceeded" };
 
-            // Only allow fields that are numeric or have high commonality.
-            if (!info.ReferencedFields.All(_allowedAggregationFields.Contains))
-                return new QueryProcessResult { Message = "One or more aggregation fields are not allowed" };
+        if (result.Operations.Values.Sum(o => o.Count) > 10)
+            return new QueryProcessResult { Message = "Aggregation count exceeded" };
 
-            // Distinct queries are expensive.
-            if (info.Operations.TryGetValue(AggregationType.Cardinality, out var values) && values.Count > 3)
-                return new QueryProcessResult { Message = "Cardinality aggregation count exceeded" };
+        // Only allow fields that are numeric or have high commonality.
+        if (!result.ReferencedFields.All(_allowedAggregationFields.Contains))
+            return new QueryProcessResult { Message = "One or more aggregation fields are not allowed" };
 
-            // Term queries are expensive.
-            if (info.Operations.TryGetValue(AggregationType.Terms, out values) && (values.Count > 3))
-                return new QueryProcessResult { Message = "Terms aggregation count exceeded" };
+        // Distinct queries are expensive.
+        if (result.Operations.TryGetValue(AggregationType.Cardinality, out var values) && values.Count > 3)
+            return new QueryProcessResult { Message = "Cardinality aggregation count exceeded" };
 
-            bool usesPremiumFeatures = !info.ReferencedFields.All(_freeAggregationFields.Contains);
-            return new QueryProcessResult {
-                IsValid = info.IsValid,
-                UsesPremiumFeatures = usesPremiumFeatures
-            };
-        }
+        // Term queries are expensive.
+        if (result.Operations.TryGetValue(AggregationType.Terms, out values) && (values.Count > 3))
+            return new QueryProcessResult { Message = "Terms aggregation count exceeded" };
+
+        bool usesPremiumFeatures = !result.ReferencedFields.All(_freeAggregationFields.Contains);
+        return new QueryProcessResult
+        {
+            IsValid = result.IsValid,
+            UsesPremiumFeatures = usesPremiumFeatures
+        };
     }
 }

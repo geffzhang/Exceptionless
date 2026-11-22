@@ -1,0 +1,29 @@
+<script lang="ts">
+    import type { FacetedFilterProps } from '#comp/faceted-filter/index.ts';
+
+    import * as FacetedFilter from '#comp/faceted-filter/index.ts';
+
+    import type { BooleanFilter } from './models.svelte';
+
+    let { filter, filterChanged, filterRemoved, ...props }: FacetedFilterProps<BooleanFilter> = $props();
+
+    function toggleHidden() {
+        filter.hidden = !filter.hidden;
+        filterChanged(filter);
+    }
+</script>
+
+<FacetedFilter.Boolean
+    changed={(value) => {
+        filter.value = value;
+        filterChanged(filter);
+    }}
+    remove={() => {
+        filter.value = undefined;
+        filterRemoved(filter);
+    }}
+    hidden={filter.hidden}
+    {toggleHidden}
+    value={filter.value}
+    {...props}
+></FacetedFilter.Boolean>

@@ -1,0 +1,180 @@
+<script lang="ts">
+    import { PUBLIC_STRIPE_PUBLISHABLE_KEY } from '$app/env/public';
+    import { resolve } from '$app/paths';
+    import { page } from '$app/state';
+    import CreditCard from '@lucide/svelte/icons/credit-card';
+    import File from '@lucide/svelte/icons/file';
+    import MoreHorizontal from '@lucide/svelte/icons/more-horizontal';
+
+    import ErrorMessage from '#comp/error-message.svelte';
+    import Currency from '#comp/formatters/currency.svelte';
+    import DateTime from '#comp/formatters/date-time.svelte';
+    import { A } from '#comp/typography/index.ts';
+    import { Button } from '#comp/ui/button/index.ts';
+    import * as DropdownMenu from '#comp/ui/dropdown-menu/index.ts';
+    import { Skeleton } from '#comp/ui/skeleton/index.ts';
+    import * as Table from '#comp/ui/table/index.ts';
+    import { ChangePlanDialog } from '#features/billing/index.ts';
+    import { getInvoiceStatusLabel } from '#features/billing/invoice.ts';
+    import { getInvoicesQuery, getOrganizationQuery } from '#features/organizations/api.svelte.ts';
+    import GlobalUser from '#features/users/components/global-user.svelte';
+    import { createQueryParameters } from '#shared/query-params/index.ts';
+
+    const organizationQuery = getOrganizationQuery({
+        route: {
+            get id() {
+                return page.params.organizationId;
+            }
+        }
+    });
+
+    const invoicesQuery = getInvoicesQuery({
+        route: {
+            get organizationId() {
+                return page.params.organizationId!;
+            }
+        }
+    });
+
+    const canChangePlan = $derived(organizationQuery.isSuccess && !!PUBLIC_STRIPE_PUBLISHABLE_KEY);
+
+    const params = createQueryParameters({
+        defaults: {
+            changePlan: false
+        },
+        history: 'push',
+        schema: {
+            changePlan: 'boolean'
+        }
+    });
+
+    let changePlanDialogOpen = $state(!!params.changePlan);
+
+    function handleChangePlan() {
+        changePlanDialogOpen = true;
+        params.changePlan = true;
+    }
+
+    function handleChangePlanClose() {
+        changePlanDialogOpen = false;
+        params.changePlan = false;
+    }
+
+    function handleOpenInvoice(invoiceId: string) {
+        window.open(
+            resolve('/(app)/payment/[id]', {
+                id: invoiceId
+            }),
+            '_blank'
+        );
+    }
+
+    function handleViewStripeInvoice(invoiceId: string) {
+        window.open(`https://manage.stripe.com/invoices/in_${encodeURIComponent(invoiceId)}`, '_blank');
+    }
+</script>
+
+<div class="space-y-6">
+    {#if organizationQuery.isLoading}
+        <div class="space-y-4">
+            <Skeleton class="h-12 w-3/4" />
+            <Skeleton class="h-50 w-full" />
+        </div>
+    {:else if organizationQuery.error}
+        <ErrorMessage message="Unable to load organization data." />
+    {:else}
+        <div class="space-y-6">
+            <p>
+                You are currently on the
+                {#if canChangePlan}
+                    <A onclick={handleChangePlan}>
+                        <strong>{organizationQuery.data?.plan_name}</strong> plan
+                    </A>
+                {:else}
+                    <strong>{organizationQuery.data?.plan_name}</strong> plan
+                {/if}.
+                {#if canChangePlan}
+                    <A onclick={handleChangePlan}>Change your plan or billing information.</A>
+                {/if}
+            </p>
+
+            {#if invoicesQuery.isLoading}
+                <div class="space-y-2">
+                    <Skeleton class="h-8 w-full" />
+                    <Skeleton class="h-8 w-full" />
+                    <Skeleton class="h-8 w-full" />
+                </div>
+            {:else if invoicesQuery.error}
+                <ErrorMessage message="Unable to load invoice data." />
+            {:else}
+                <div class="overflow-hidden rounded-md border">
+                    <Table.Root>
+                        <Table.Header>
+                            <Table.Row>
+                                <Table.Head>Payment Number</Table.Head>
+                                <Table.Head>Date</Table.Head>
+                                <Table.Head>Amount</Table.Head>
+                                <Table.Head>Status</Table.Head>
+                                <Table.Head class="w-25">Actions</Table.Head>
+                            </Table.Row>
+                        </Table.Header>
+                        <Table.Body>
+                            {#if invoicesQuery.data?.data && invoicesQuery.data.data.length > 0}
+                                {#each invoicesQuery.data.data as invoice (invoice.id)}
+                                    <Table.Row>
+                                        <Table.Cell class="hover:bg-muted/50 cursor-pointer" onclick={() => handleOpenInvoice(invoice.id)}>
+                                            {invoice.id}
+                                        </Table.Cell>
+                                        <Table.Cell class="hover:bg-muted/50 cursor-pointer" onclick={() => handleOpenInvoice(invoice.id)}>
+                                            <DateTime value={invoice.date} />
+                                        </Table.Cell>
+                                        <Table.Cell class="hover:bg-muted/50 cursor-pointer" onclick={() => handleOpenInvoice(invoice.id)}>
+                                            <Currency value={invoice.total} />
+                                        </Table.Cell>
+                                        <Table.Cell class="hover:bg-muted/50 cursor-pointer" onclick={() => handleOpenInvoice(invoice.id)}>
+                                            {getInvoiceStatusLabel(invoice.status, invoice.total)}
+                                        </Table.Cell>
+                                        <Table.Cell>
+                                            <DropdownMenu.Root>
+                                                <DropdownMenu.Trigger>
+                                                    {#snippet child({ props })}
+                                                        <Button {...props} variant="outline" size="sm">
+                                                            <MoreHorizontal class="size-4" />
+                                                            <span class="sr-only">Actions</span>
+                                                        </Button>
+                                                    {/snippet}
+                                                </DropdownMenu.Trigger>
+                                                <DropdownMenu.Content align="end">
+                                                    <DropdownMenu.Item onclick={() => handleOpenInvoice(invoice.id)}>
+                                                        <File class="mr-2 size-4" />
+                                                        View Payment
+                                                    </DropdownMenu.Item>
+                                                    <GlobalUser>
+                                                        <DropdownMenu.Item onclick={() => handleViewStripeInvoice(invoice.id)}>
+                                                            <CreditCard class="mr-2 size-4" />
+                                                            View Stripe Invoice
+                                                        </DropdownMenu.Item>
+                                                    </GlobalUser>
+                                                </DropdownMenu.Content>
+                                            </DropdownMenu.Root>
+                                        </Table.Cell>
+                                    </Table.Row>
+                                {/each}
+                            {:else}
+                                <Table.Row>
+                                    <Table.Cell colspan={4} class="text-center">
+                                        <strong>No invoices were found.</strong>
+                                    </Table.Cell>
+                                </Table.Row>
+                            {/if}
+                        </Table.Body>
+                    </Table.Root>
+                </div>
+            {/if}
+        </div>
+    {/if}
+</div>
+
+{#if changePlanDialogOpen && organizationQuery.data}
+    <ChangePlanDialog onclose={handleChangePlanClose} organization={organizationQuery.data} />
+{/if}

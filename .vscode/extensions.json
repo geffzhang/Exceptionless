@@ -1,8 +1,18 @@
 {
   "recommendations": [
-    "ms-vscode.csharp",
+    "bradlc.vscode-tailwindcss",
+    "dbaeumer.vscode-eslint",
+    "esbenp.prettier-vscode",
+    "humao.rest-client",
+    "microsoft-aspire.aspire-vscode",
+    "ms-dotnettools.csdevkit",
+    "ms-kubernetes-tools.vscode-kubernetes-tools",
+    "ms-playwright.playwright",
+    "ms-vscode-remote.remote-containers",
+    "selemondev.vscode-shadcn-svelte",
     "streetsidesoftware.code-spell-checker",
+    "svelte.svelte-vscode",
     "tintoy.msbuild-project-tools",
-    "humao.rest-client"
+    "vitest.explorer"
   ]
 }

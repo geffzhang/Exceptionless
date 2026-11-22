@@ -1,0 +1,29 @@
+<script lang="ts">
+    import { builderContext, type FacetFilterBuilder, type IFilter } from '#comp/faceted-filter/index.ts';
+
+    import { StringFilter } from './models.svelte';
+    import StringFacetedFilter from './string-faceted-filter.svelte';
+
+    interface Props {
+        priority?: number;
+        term: string;
+        title?: string;
+    }
+
+    const { priority = 0, term, title = 'String' }: Props = $props();
+
+    const builder: FacetFilterBuilder<StringFilter> = {
+        component: StringFacetedFilter,
+        create: (filter?: StringFilter) => filter ?? new StringFilter(term),
+        get priority() {
+            return priority;
+        },
+        get title() {
+            return title;
+        }
+    };
+
+    $effect(() => {
+        builderContext.set(`string-${term}`, builder as unknown as FacetFilterBuilder<IFilter>);
+    });
+</script>

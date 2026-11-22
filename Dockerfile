@@ -1,56 +1,156 @@
-FROM microsoft/dotnet:2.1.401-sdk-alpine3.7 AS build  
+FROM mcr.microsoft.com/dotnet/sdk:11.0.100 AS build
+ARG MinVerVersionOverride
 WORKDIR /app
 
-COPY ./*.sln ./NuGet.Config ./
-COPY ./build/*.props ./build/
+COPY ./NuGet.Config ./
+COPY ./src/*.props ./src/
+COPY ./build/packages/* ./build/packages/
 
-# Copy the main source project files
+# Copy the source project files needed for the runtime images.
 COPY src/*/*.csproj ./
 RUN for file in $(ls *.csproj); do mkdir -p src/${file%.*}/ && mv $file src/${file%.*}/; done
 
-# Copy the individual jobs (temporary)
-COPY src/Jobs/*/*.csproj ./
-RUN for file in $(ls *.csproj); do mkdir -p src/Jobs/${file%.*}/ && mv $file src/Jobs/${file%.*}/; done
+RUN dotnet restore ./src/Exceptionless.Web/Exceptionless.Web.csproj \
+    && dotnet restore ./src/Exceptionless.Job/Exceptionless.Job.csproj
 
-# Copy the test project files
-COPY tests/*/*.csproj ./
-RUN for file in $(ls *.csproj); do mkdir -p tests/${file%.*}/ && mv $file tests/${file%.*}/; done
-
-RUN dotnet restore
-
-# Copy everything else and build app
+# Copy everything else and build the source projects once.
 COPY . .
-RUN dotnet build
+RUN dotnet build ./src/Exceptionless.Web/Exceptionless.Web.csproj -c Release --no-restore /p:MinVerVersionOverride=${MinVerVersionOverride} \
+    && dotnet build ./src/Exceptionless.Job/Exceptionless.Job.csproj -c Release --no-restore /p:MinVerVersionOverride=${MinVerVersionOverride}
+
+FROM build AS build-node
+RUN apt-get update -yq \
+    && apt-get install -yq curl ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
+    && apt-get install -yq nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
 # testrunner
 
 FROM build AS testrunner
 WORKDIR /app/tests/Exceptionless.Tests
-# TODO: Switch to using xunit runner with junit export format once xunit 2.4 comes out
-ENTRYPOINT [ "dotnet", "test", "--verbosity", "minimal", "--logger:trx" ]
+ENTRYPOINT ["dotnet", "test", "--results-directory", "/app/artifacts", "--logger:trx"]
 
 # job-publish
 
 FROM build AS job-publish
 WORKDIR /app/src/Exceptionless.Job
-RUN dotnet publish -c Release -o out
+
+RUN dotnet publish -c Release -o out --no-build
 
 # job
 
-FROM microsoft/dotnet:2.1.3-runtime-alpine3.7 AS job
+FROM mcr.microsoft.com/dotnet/aspnet:11.0.0 AS job
 WORKDIR /app
 COPY --from=job-publish /app/src/Exceptionless.Job/out ./
+
+ENV ASPNETCORE_URLS=http://+:8080
+
+EXPOSE 8080
+
 ENTRYPOINT [ "dotnet", "Exceptionless.Job.dll" ]
 
 # api-publish
 
 FROM build AS api-publish
 WORKDIR /app/src/Exceptionless.Web
-RUN dotnet publish -c Release -o out
+
+RUN dotnet publish -c Release -o out --no-build /p:SkipSpaPublish=true
 
 # api
 
-FROM microsoft/dotnet:2.1.3-aspnetcore-runtime-alpine3.7 AS api
+FROM mcr.microsoft.com/dotnet/aspnet:11.0.0 AS api
 WORKDIR /app
 COPY --from=api-publish /app/src/Exceptionless.Web/out ./
+
+ENV ASPNETCORE_URLS=http://+:8080
+
+EXPOSE 8080
+
 ENTRYPOINT [ "dotnet", "Exceptionless.Web.dll" ]
+
+# app-publish
+
+FROM build-node AS app-publish
+WORKDIR /app/src/Exceptionless.Web
+RUN dotnet publish -c Release -o out --no-build
+
+# app
+
+FROM mcr.microsoft.com/dotnet/aspnet:11.0.0 AS app
+
+WORKDIR /app
+COPY --from=app-publish /app/src/Exceptionless.Web/out ./
+COPY ./build/app-docker-entrypoint.sh ./
+COPY ./build/update-config.sh /usr/local/bin/update-config
+
+ENV EX_ConnectionStrings__Storage=provider=folder;path=/app/storage \
+    EX_RunJobsInProcess=true \
+    ASPNETCORE_URLS=http://+:8080
+
+RUN chmod +x /app/app-docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/update-config
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/app-docker-entrypoint.sh"]
+
+# completely self-contained
+
+FROM exceptionless/elasticsearch:8.19.22 AS exceptionless
+
+WORKDIR /app
+COPY --from=job-publish /app/src/Exceptionless.Job/out ./
+COPY --from=app-publish /app/src/Exceptionless.Web/out ./
+COPY ./build/docker-entrypoint.sh ./
+COPY ./build/update-config.sh /usr/local/bin/update-config
+COPY ./build/supervisord.conf /etc/
+
+USER root
+
+# install dotnet and supervisor
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    supervisor \
+    wget \
+    dos2unix \
+    ca-certificates \
+    \
+    # .NET dependencies
+    libc6 \
+    libgcc-s1 \
+    libicu74 \
+    libssl3 \
+    libstdc++6 \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && dos2unix /app/docker-entrypoint.sh
+
+ENV discovery.type=single-node \
+    xpack.security.enabled=false \
+    ES_JAVA_OPTS="-Xms1g -Xmx1g" \
+    ASPNETCORE_URLS=http://+:8080 \
+    DOTNET_RUNNING_IN_CONTAINER=true \
+    EX_ConnectionStrings__Storage=provider=folder;path=/app/storage \
+    EX_ConnectionStrings__Elasticsearch=server=http://localhost:9200 \
+    EX_RunJobsInProcess=true
+
+RUN chmod +x /app/docker-entrypoint.sh && \
+    chmod +x /usr/local/bin/update-config && \
+    chown -R elasticsearch:elasticsearch /app && \
+    mkdir -p /var/log/supervisor >/dev/null 2>&1 && \
+    chown -R elasticsearch:elasticsearch /var/log/supervisor
+
+USER elasticsearch
+
+RUN wget https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh && \
+    chmod +x dotnet-install.sh && \
+    ./dotnet-install.sh --version 11.0.0 --runtime aspnetcore && \
+    rm dotnet-install.sh
+
+EXPOSE 8080 9200
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+
+# build locally
+# docker buildx build --target exceptionless --platform linux/amd64,linux/arm64 --load --tag exceptionless .

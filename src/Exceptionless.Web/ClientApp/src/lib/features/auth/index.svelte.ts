@@ -1,0 +1,289 @@
+import { PUBLIC_ENABLE_ACCOUNT_CREATION, PUBLIC_GITHUB_APPID, PUBLIC_GOOGLE_APPID, PUBLIC_MICROSOFT_APPID, PUBLIC_SLACK_APPID } from '$app/env/public';
+import { goto } from '$app/navigation';
+import { resolve } from '$app/paths';
+import { useFetchClient } from '@foundatiofx/fetchclient';
+import { toast } from 'svelte-sonner';
+
+import { gotoRedirect } from '#features/navigation/redirect.ts';
+import { getVisibleUrl } from '#features/navigation/visible-url.ts';
+import { getProblemMessage } from '#shared/validation.ts';
+
+import type { TokenResult } from './models';
+
+import { accessToken } from './state.svelte';
+
+// Re-export all API functions for backward compatibility
+export {
+    cancelResetPassword,
+    changePassword,
+    forgotPassword,
+    getIntercomTokenQuery,
+    isEmailAddressTaken,
+    login,
+    logout,
+    resetPassword,
+    signup,
+    unlinkOAuthAccount
+} from './api.svelte';
+
+export { accessToken } from './state.svelte';
+// Re-export validators
+export { validateEmailAvailability } from './validators';
+
+export interface ExternalLoginOptions {
+    inviteToken?: null | string;
+    /** Links the provider account to the signed-in user instead of signing in as the provider's user. */
+    linkToCurrentUser?: boolean;
+    redirectUrl?: string;
+}
+
+export interface OAuthLoginOptions extends ExternalLoginOptions, OAuthPopupOptions {}
+
+export interface OAuthPopupOptions {
+    authUrl: string;
+    clientId: string;
+    extraParams?: Record<string, string>;
+    popupOptions?: { height: number; width: number };
+    provider: SupportedOAuthProviders;
+    scope: string;
+}
+
+export interface OAuthResponseData {
+    code: string;
+    state: string;
+}
+
+export type SupportedOAuthProviders = 'github' | 'google' | 'microsoft' | 'slack';
+
+export const enableAccountCreation = PUBLIC_ENABLE_ACCOUNT_CREATION === 'true';
+export const gitHubClientId = PUBLIC_GITHUB_APPID;
+export const googleClientId = PUBLIC_GOOGLE_APPID;
+export const microsoftClientId = PUBLIC_MICROSOFT_APPID;
+export const slackClientId = PUBLIC_SLACK_APPID;
+export const enableOAuthLogin = gitHubClientId || googleClientId || microsoftClientId;
+
+// OAuth login functions (interactive popup-based, not pure API calls)
+
+export async function githubLogin(options: ExternalLoginOptions = {}) {
+    if (!gitHubClientId) {
+        throw new Error('GitHub client id not set');
+    }
+
+    await oauthLogin({
+        authUrl: 'https://github.com/login/oauth/authorize',
+        clientId: gitHubClientId,
+        ...options,
+        popupOptions: {
+            height: 618,
+            width: 1020
+        },
+        provider: 'github',
+        scope: 'user:email'
+    });
+}
+
+export async function googleLogin(options: ExternalLoginOptions = {}) {
+    if (!googleClientId) {
+        throw new Error('Google client id not set');
+    }
+
+    await oauthLogin({
+        authUrl: 'https://accounts.google.com/o/oauth2/auth/oauthchooseaccount',
+        clientId: googleClientId,
+        extraParams: {
+            display: 'popup',
+            flowName: 'GeneralOAuthFlow',
+            o2v: '1',
+            service: 'lso',
+            state: encodeURIComponent(Math.random().toString(36).substring(2))
+        },
+        ...options,
+        provider: 'google',
+        scope: 'openid profile email'
+    });
+}
+
+export async function gotoLogin() {
+    const url = getVisibleUrl();
+    const loginPath = resolve('/(auth)/login');
+    const isAuthPath = url.pathname === loginPath || url.pathname === `${loginPath}/`;
+    const returnUrl = `${url.pathname}${url.search}${url.hash}`;
+    const redirect = url.pathname === resolve('/(app)') || isAuthPath ? loginPath : `${loginPath}?redirect=${encodeURIComponent(returnUrl)}`;
+    await goto(redirect, {
+        replace: true
+    });
+}
+
+export async function microsoftLogin(options: ExternalLoginOptions = {}) {
+    if (!microsoftClientId) {
+        throw new Error('Microsoft client id not set');
+    }
+
+    await oauthLogin({
+        authUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
+        clientId: microsoftClientId,
+        extraParams: {
+            state: createOAuthState()
+        },
+        ...options,
+        provider: 'microsoft',
+        scope: 'User.Read'
+    });
+}
+
+export async function slackOAuthLogin(): Promise<string> {
+    if (!slackClientId) {
+        throw new Error('Slack client id not set');
+    }
+
+    const data = await openOAuthPopup({
+        authUrl: 'https://slack.com/oauth/authorize',
+        clientId: slackClientId,
+        extraParams: {
+            state: encodeURIComponent(Math.random().toString(36).substring(2))
+        },
+        popupOptions: {
+            height: 630,
+            width: 580
+        },
+        provider: 'slack',
+        scope: 'incoming-webhook'
+    });
+
+    return data.code;
+}
+
+// OAuth helpers
+
+function createOAuthState() {
+    if (typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+async function oauthLogin(options: OAuthLoginOptions) {
+    const data = await openOAuthPopup(options);
+
+    // The API links the provider to whoever the request authenticates as, so a sign-in must not send the current session.
+    const client = useFetchClient(
+        options.linkToCurrentUser
+            ? undefined
+            : {
+                  accessTokenFunc: () => null
+              }
+    );
+    const response = await client.postJSON<TokenResult>(
+        `auth/${options.provider}`,
+        {
+            clientId: options.clientId,
+            code: data.code,
+            inviteToken: options.inviteToken,
+            redirectUri: window.location.origin,
+            state: data.state
+        },
+        {
+            expectedStatusCodes: [401, 403, 422]
+        }
+    );
+
+    if (response.ok && response.data?.token) {
+        accessToken.current = response.data.token;
+        await gotoRedirect(options.redirectUrl || resolve('/(app)'));
+    } else {
+        toast.error(getProblemMessage(response.problem, 'Unable to sign in. Please try again.'));
+    }
+}
+
+async function openOAuthPopup(options: OAuthPopupOptions): Promise<OAuthResponseData> {
+    const width = options.popupOptions?.width || 500;
+    const height = options.popupOptions?.height || 500;
+    const features = {
+        height: height,
+        left: window.screenX + (window.outerWidth - width) / 2,
+        top: window.screenY + (window.outerHeight - height) / 2.5,
+        width: width
+    };
+
+    const redirectUrl = window.location.origin;
+    const params = Object.assign(
+        {
+            client_id: options.clientId,
+            redirect_uri: redirectUrl,
+            response_type: 'code',
+            scope: options.scope
+        },
+        options.extraParams
+    );
+
+    const url = `${options.authUrl}?${new URLSearchParams(params).toString()}`;
+    const popup = window.open(url, options.provider, stringifyOptions(features));
+    if (!popup) {
+        throw new Error('Failed to open popup window');
+    }
+
+    popup.focus();
+
+    const data = await waitForUrl(popup!, redirectUrl);
+    if (options.extraParams?.state && data.state !== options.extraParams.state) {
+        throw new Error('Invalid state');
+    }
+
+    return data;
+}
+
+function stringifyOptions(options: object): string {
+    const parts = [];
+
+    for (const [key, value] of Object.entries(options)) {
+        parts.push(key + '=' + value);
+    }
+
+    return parts.join(',');
+}
+
+function waitForUrl(popup: Window, redirectUri: string): Promise<OAuthResponseData> {
+    return new Promise((resolve, reject) => {
+        const polling = setInterval(() => {
+            if (!popup || popup.closed || popup.closed === undefined) {
+                clearInterval(polling);
+                reject(new Error('The popup window was closed'));
+            }
+
+            try {
+                if (popup?.location.href.startsWith(redirectUri)) {
+                    if (popup.location.search || popup.location.hash) {
+                        const query = Object.fromEntries(new URLSearchParams(popup.location.search.substring(1).replace(/\/$/, '')));
+                        const hash = Object.fromEntries(new URLSearchParams(popup.location.hash.substring(1).replace(/[/$]/, '')));
+                        const params = Object.assign({}, query, hash) as {
+                            code: string;
+                            state: string;
+                        };
+
+                        if ('error' in params && (params as { error: string }).error) {
+                            reject(new Error((params as { error: string }).error));
+                        } else {
+                            resolve(params as OAuthResponseData);
+                        }
+                    } else {
+                        reject(
+                            new Error(
+                                'OAuth redirect has occurred but no query or hash parameters were found. ' +
+                                    'They were either not set during the redirect, or were removed—typically by a ' +
+                                    'routing library before they could be read.'
+                            )
+                        );
+                    }
+
+                    clearInterval(polling);
+                    popup?.close();
+                }
+            } catch (error) {
+                console.error(error);
+                // Ignore DOMException: Blocked a frame with origin from accessing a cross-origin frame.
+                // A hack to get around same-origin security policy errors in IE.
+            }
+        }, 500);
+    });
+}

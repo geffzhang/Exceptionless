@@ -1,51 +1,23 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
-  <Import Project="..\..\build\common.props" />
-  <PropertyGroup>
-    <TargetFramework>netstandard2.0</TargetFramework>
-  </PropertyGroup>
+<Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
-    <None Remove="Mail\Templates\event-notice.html" />
-    <None Remove="Mail\Templates\organization-added.html" />
-    <None Remove="Mail\Templates\organization-invited.html" />
-    <None Remove="Mail\Templates\organization-notice.html" />
-    <None Remove="Mail\Templates\organization-payment-failed.html" />
-    <None Remove="Mail\Templates\project-daily-summary.html" />
-    <None Remove="Mail\Templates\user-email-verify.html" />
-    <None Remove="Mail\Templates\user-password-reset.html" />
+    <None Update="Seed\predefined-saved-views.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
-    <EmbeddedResource Include="Mail\Templates\event-notice.html" />
-    <EmbeddedResource Include="Mail\Templates\organization-added.html" />
-    <EmbeddedResource Include="Mail\Templates\organization-invited.html" />
-    <EmbeddedResource Include="Mail\Templates\organization-notice.html" />
-    <EmbeddedResource Include="Mail\Templates\organization-payment-failed.html" />
-    <EmbeddedResource Include="Mail\Templates\project-daily-summary.html" />
-    <EmbeddedResource Include="Mail\Templates\user-email-verify.html" />
-    <EmbeddedResource Include="Mail\Templates\user-password-reset.html" />
-  </ItemGroup>
-  <ItemGroup>
-    <PackageReference Include="AutoMapper" Version="7.0.1" />
-    <PackageReference Include="AutoMapper.Collection" Version="4.0.0" />
-    <PackageReference Include="FluentValidation" Version="8.0.100" />
-    <PackageReference Include="Foundatio" Version="7.0.1738" />
-    <PackageReference Include="Foundatio.Jobs.Commands" Version="7.0.1738" />
-    <PackageReference Include="Foundatio.JsonNet" Version="7.0.1738" />
-    <PackageReference Include="Foundatio.Repositories.Elasticsearch" Version="5.6.790" />
-    <PackageReference Include="Handlebars.Net" Version="1.9.5" />
-    <PackageReference Include="MaxMind.GeoIP2" Version="3.0.0" />
-    <PackageReference Include="McSherry.SemanticVersioning" Version="1.2.1" />
-    <PackageReference Include="Microsoft.Extensions.CommandLineUtils" Version="1.1.1" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="2.1.1" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="2.1.1" />
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="2.1.1" />
-    <PackageReference Include="Microsoft.Extensions.Logging" Version="2.1.1" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="2.1.1" />
-    <PackageReference Include="NEST" Version="5.6.3" />
-    <PackageReference Include="Newtonsoft.Json" Version="11.0.2" />
-    <PackageReference Include="Stripe.net" Version="19.6.0" />
-
-    <PackageReference Include="System.DirectoryServices" Version="4.5.0" />
-    <PackageReference Include="System.Reflection.Emit.Lightweight" Version="4.3.0" />
-    <PackageReference Include="UAParser" Version="3.0.0" />
+    <PackageReference Include="Exceptionless.DateTimeExtensions" Version="6.1.0" />
+    <PackageReference Include="Exceptionless.RandomData" Version="2.0.1" />
+    <PackageReference Include="Foundatio.Extensions.Hosting" Version="13.0.5" />
+    <!-- Required at runtime by the repository package's index configuration hashing. -->
+    <PackageReference Include="System.IO.Hashing" Version="11.0.0" />
+    <PackageReference Include="MiniValidation" Version="0.10.0" />
+    <PackageReference Include="McSherry.SemanticVersioning" Version="1.5.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="11.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="11.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="11.0.0" />
+    <PackageReference Include="Stripe.net" Version="53.1.0" />
+    <PackageReference Include="System.DirectoryServices" Version="11.0.0" />
+    <PackageReference Include="UAParser" Version="3.1.47" />
+    <PackageReference Include="Foundatio.Repositories.Elasticsearch" Version="8.0.2-preview.elasticsearch-mapping-issue-investigation.0.3" Condition="'$(ReferenceFoundatioRepositoriesSource)' == '' OR '$(ReferenceFoundatioRepositoriesSource)' == 'false'" />
+    <ProjectReference Include="..\..\..\..\Foundatio\Foundatio.Repositories\src\Foundatio.Repositories.Elasticsearch\Foundatio.Repositories.Elasticsearch.csproj" Condition="'$(ReferenceFoundatioRepositoriesSource)' == 'true'" />
+    <ProjectReference Include="..\Exceptionless.EmailTemplates\Exceptionless.EmailTemplates.csproj" />
   </ItemGroup>
 </Project>

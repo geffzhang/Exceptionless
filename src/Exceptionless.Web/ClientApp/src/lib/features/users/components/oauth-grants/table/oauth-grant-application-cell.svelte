@@ -1,0 +1,20 @@
+<script lang="ts">
+    import type { OAuthGrant } from '#features/users/models.ts';
+
+    import TimeAgo from '#comp/formatters/time-ago.svelte';
+    import { Badge } from '#comp/ui/badge/index.ts';
+
+    interface Props {
+        grant: OAuthGrant;
+    }
+
+    let { grant }: Props = $props();
+</script>
+
+<div class="min-w-0 space-y-1 whitespace-normal">
+    <div class="truncate font-medium" title={grant.application_name}>{grant.application_name}</div>
+    <div class="text-muted-foreground text-xs">Updated <TimeAgo value={grant.updated_utc} /></div>
+    {#if grant.is_application_disabled}
+        <Badge variant="outline">Disabled</Badge>
+    {/if}
+</div>

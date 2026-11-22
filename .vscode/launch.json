@@ -1,47 +1,109 @@
 {
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "Api",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "Build",
-      "program": "${workspaceRoot}/src/Exceptionless.Web/bin/Debug/netcoreapp2.1/Exceptionless.Web.dll",
-      "args": [],
-      "cwd": "${workspaceRoot}/src/Exceptionless.Web",
-      "stopAtEntry": false,
-      "console": "integratedTerminal",
-      "launchBrowser": {
-          "enabled": true,
-          "args": "${auto-detect-url}",
-          "windows": {
-              "command": "cmd.exe",
-              "args": "/C start ${auto-detect-url}"
-          },
-          "osx": {
-              "command": "open"
-          },
-          "linux": {
-              "command": "xdg-open"
-          }
-      },
-      "env": {
-          "AppMode": "Development"
-      }
-    },
-    {
-      "name": "Job",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "Build",
-      "program": "${workspaceRoot}/src/Exceptionless.Job/bin/Debug/netcoreapp2.1/Exceptionless.Job.dll",
-      "args": [],
-      "cwd": "${workspaceRoot}/src/Exceptionless.Job",
-      "stopAtEntry": false,
-      "console": "integratedTerminal",
-      "env": {
-          "AppMode": "Development"
-      }
-    }
-  ]
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "aspire",
+            "request": "launch",
+            "name": "Aspire",
+            "program": "${workspaceFolder}/src/Exceptionless.AppHost/Exceptionless.AppHost.csproj"
+        },
+        {
+            "name": "Web",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/src/Exceptionless.Web/bin/Debug/net11.0/Exceptionless.Web.dll",
+            "args": [],
+            "cwd": "${workspaceFolder}/src/Exceptionless.Web",
+            "stopAtEntry": false,
+            "serverReadyAction": {
+                "action": "openExternally",
+                "pattern": "\\bNow listening on:\\s+(https?://\\S+)"
+            },
+            "env": {
+                "AppMode": "Development"
+            }
+        },
+        {
+            "name": "Job",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/src/Exceptionless.Job/bin/Debug/net11.0/Exceptionless.Job.dll",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "console": "internalConsole",
+            "env": {
+                "AppMode": "Development"
+            }
+        },
+        {
+            "name": ".NET Core Attach",
+            "type": "coreclr",
+            "request": "attach"
+        },
+        {
+            "name": "frontend: Attach to Chrome",
+            "port": 9222,
+            "request": "attach",
+            "type": "chrome",
+            "webRoot": "${workspaceFolder}/src/Exceptionless.Web/ClientApp"
+        },
+        {
+            "name": "frontend: Attach to Edge",
+            "port": 9222,
+            "request": "attach",
+            "type": "msedge",
+            "webRoot": "${workspaceFolder}/src/Exceptionless.Web/ClientApp"
+        },
+        {
+            "type": "msedge",
+            "request": "launch",
+            "name": "frontend: Web (Edge)",
+            "url": "https://web-ex.dev.localhost:7131/",
+            "webRoot": "${workspaceFolder}/src/Exceptionless.Web/ClientApp",
+            "preLaunchTask": "npm run dev"
+        },
+        {
+            "type": "msedge",
+            "request": "launch",
+            "name": "frontend: Web Dev Api (Edge)",
+            "url": "https://web-ex.dev.localhost:7131/",
+            "webRoot": "${workspaceFolder}/src/Exceptionless.Web/ClientApp",
+            "preLaunchTask": "npm run dev:api"
+        },
+        {
+            "type": "msedge",
+            "request": "launch",
+            "name": "frontend: Storybook (Edge)",
+            "url": "http://localhost:6006",
+            "webRoot": "${workspaceFolder}/src/Exceptionless.Web/ClientApp",
+            "preLaunchTask": "npm run storybook"
+        },
+        {
+            "type": "chrome",
+            "request": "launch",
+            "name": "frontend: Web (Chrome)",
+            "url": "https://web-ex.dev.localhost:7131/",
+            "webRoot": "${workspaceFolder}/src/Exceptionless.Web/ClientApp",
+            "preLaunchTask": "npm run dev"
+        },
+        {
+            "type": "chrome",
+            "request": "launch",
+            "name": "frontend: Web Dev Api (Chrome)",
+            "url": "https://web-ex.dev.localhost:7131/",
+            "webRoot": "${workspaceFolder}/src/Exceptionless.Web/ClientApp",
+            "preLaunchTask": "npm run dev:api"
+        },
+        {
+            "type": "chrome",
+            "request": "launch",
+            "name": "frontend: Storybook (Chrome)",
+            "url": "http://localhost:6006",
+            "webRoot": "${workspaceFolder}/src/Exceptionless.Web/ClientApp",
+            "preLaunchTask": "npm run storybook"
+        }
+    ]
 }

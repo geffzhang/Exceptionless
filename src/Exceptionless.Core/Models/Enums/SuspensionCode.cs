@@ -1,10 +1,10 @@
-﻿using System;
+﻿namespace Exceptionless.Core.Models;
 
-namespace Exceptionless.Core.Models {
-    public enum SuspensionCode {
-        Billing,
-        Overage,
-        Abuse,
-        Other = 100
-    }
+public enum SuspensionCode
+{
+    Billing,
+    Overage,
+    Abuse,
+    PlanLimit,
+    Other = 100
 }

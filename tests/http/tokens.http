@@ -1,0 +1,49 @@
+@apiUrl = http://localhost:7110/api/v2
+@email = admin@exceptionless.test
+@password = tester
+@organizationId = 537650f3b77efe23a47914f3
+@projectId = 537650f3b77efe23a47914f4
+
+### login to test account
+# @name login
+POST {{apiUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "{{email}}",
+    "password": "{{password}}"
+}
+
+###
+
+@token = {{login.response.body.$.token}}
+
+### Get By Project Id
+GET {{apiUrl}}/projects/{{projectId}}/tokens
+Authorization: Bearer {{token}}
+
+### Create a project API key
+# @name newClientToken
+POST {{apiUrl}}/tokens
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "organization_id": "{{organizationId}}",
+    "project_id": "{{projectId}}",
+    "notes": "HTTP sample API key"
+}
+
+###
+@clientToken = {{newClientToken.response.body.$.id}}
+
+### Update the key description
+PATCH {{apiUrl}}/tokens/{{clientToken}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "notes": "updated token" }
+
+### Revoke the sample API key
+DELETE {{apiUrl}}/tokens/{{clientToken}}
+Authorization: Bearer {{token}}

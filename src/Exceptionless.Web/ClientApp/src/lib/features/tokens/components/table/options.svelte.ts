@@ -1,0 +1,91 @@
+import type { FetchClientResponse, ProblemDetails } from '@foundatiofx/fetchclient';
+import type { CreateQueryResult } from '@tanstack/svelte-query';
+
+import { type ColumnDef, renderComponent, type StockFeatures } from '@tanstack/svelte-table';
+
+import type { ViewToken } from '#features/tokens/models.ts';
+
+import { getSharedTableOptions } from '#features/shared/table.svelte.ts';
+import TokenActionsCell from '#features/tokens/components/table/token-actions-cell.svelte';
+import TokenIdCell from '#features/tokens/components/table/token-id-cell.svelte';
+import TokenScopesCell from '#features/tokens/components/table/token-scopes-cell.svelte';
+
+import type { GetProjectTokensParams } from '../../api.svelte';
+
+export function getColumns<TToken extends ViewToken>(): ColumnDef<StockFeatures, TToken, unknown>[] {
+    const columns: ColumnDef<StockFeatures, TToken, unknown>[] = [
+        {
+            accessorKey: 'id',
+            cell: (info) =>
+                renderComponent(TokenIdCell, {
+                    token: info.row.original
+                }),
+            enableHiding: false,
+            enableSorting: false,
+            header: 'Token',
+            meta: {
+                class: 'w-45'
+            }
+        },
+        {
+            accessorKey: 'scopes',
+            cell: (info) =>
+                renderComponent(TokenScopesCell, {
+                    scopes: info.getValue<string[]>()
+                }),
+            enableHiding: true,
+            enableSorting: false,
+            header: 'Scope',
+            meta: {
+                class: 'w-45'
+            }
+        },
+        {
+            accessorKey: 'notes',
+            cell: (info) => info.getValue(),
+            enableHiding: true,
+            enableSorting: false,
+            header: 'Notes',
+            meta: {
+                class: 'w-50'
+            }
+        },
+        {
+            cell: (info) =>
+                renderComponent(TokenActionsCell, {
+                    token: info.row.original
+                }),
+            enableHiding: false,
+            enableSorting: false,
+            header: '',
+            id: 'actions',
+            meta: {
+                class: 'w-12 min-w-12 max-w-12 text-right'
+            }
+        }
+    ];
+
+    return columns;
+}
+
+export function getTableOptions<TToken extends ViewToken>(
+    queryParameters: GetProjectTokensParams,
+    queryResponse: CreateQueryResult<FetchClientResponse<TToken[]>, ProblemDetails>
+) {
+    return getSharedTableOptions<TToken>({
+        columnPersistenceKey: 'tokens-column-visibility',
+        get columns() {
+            return getColumns<TToken>();
+        },
+        paginationStrategy: 'offset',
+        get queryData() {
+            return queryResponse.data?.data ?? [];
+        },
+        get queryMeta() {
+            return queryResponse.data?.meta;
+        },
+        get queryParameters() {
+            return queryParameters;
+        }
+    });
+}

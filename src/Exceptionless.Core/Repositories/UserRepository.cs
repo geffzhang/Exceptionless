@@ -1,94 +1,176 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Repositories.Configuration;
-using FluentValidation;
+using Exceptionless.Core.Validation;
 using Foundatio.Repositories;
 using Foundatio.Repositories.Models;
 using Foundatio.Repositories.Options;
-using Nest;
 using User = Exceptionless.Core.Models.User;
 
-namespace Exceptionless.Core.Repositories {
-    public class UserRepository : RepositoryBase<User>, IUserRepository {
-        public UserRepository(ExceptionlessElasticConfiguration configuration, IValidator<User> validator)
-            : base(configuration.Organizations.User, validator) {
-            FieldsRequiredForRemove.AddRange(new Field[] { ElasticType.GetPropertyName(u => u.EmailAddress), ElasticType.GetPropertyName(u => u.OrganizationIds) });
-            DocumentsAdded.AddHandler(OnDocumentsAdded);
-        }
+namespace Exceptionless.Core.Repositories;
 
-        public async Task<User> GetByEmailAddressAsync(string emailAddress) {
-            if (String.IsNullOrWhiteSpace(emailAddress))
-                return null;
+public class UserRepository : RepositoryBase<User>, IUserRepository
+{
+    private const int MaximumProductTourEntries = 100;
 
-            emailAddress = emailAddress.Trim().ToLowerInvariant();
-            var hit = await FindOneAsync(q => q.ElasticFilter(Query<User>.Term(u => u.EmailAddress.Suffix("keyword"), emailAddress)), o => o.CacheKey(String.Concat("Email:", emailAddress))).AnyContext();
-            return hit?.Document;
-        }
-
-        public async Task<User> GetByPasswordResetTokenAsync(string token) {
-            if (String.IsNullOrEmpty(token))
-                return null;
-
-            var hit = await FindOneAsync(q => q.ElasticFilter(Query<User>.Term(u => u.PasswordResetToken, token))).AnyContext();
-            return hit?.Document;
-        }
-
-        public async Task<User> GetUserByOAuthProviderAsync(string provider, string providerUserId) {
-            if (String.IsNullOrEmpty(provider) || String.IsNullOrEmpty(providerUserId))
-                return null;
-
-            provider = provider.ToLowerInvariant();
-            var filter = Query<User>.Term(u => u.OAuthAccounts.First().ProviderUserId, providerUserId);
-            var results = (await FindAsync(q => q.ElasticFilter(filter)).AnyContext()).Documents;
-            return results.FirstOrDefault(u => u.OAuthAccounts.Any(o => o.Provider == provider));
-        }
-
-        public async Task<User> GetByVerifyEmailAddressTokenAsync(string token) {
-            if (String.IsNullOrEmpty(token))
-                return null;
-
-            var filter = Query<User>.Term(u => u.VerifyEmailAddressToken, token);
-            var hit = await FindOneAsync(q => q.ElasticFilter(filter)).AnyContext();
-            return hit?.Document;
-        }
-
-        public Task<FindResults<User>> GetByOrganizationIdAsync(string organizationId, CommandOptionsDescriptor<User> options = null) {
-            if (String.IsNullOrEmpty(organizationId))
-                return Task.FromResult<FindResults<User>>(new FindResults<User>());
-
-            var commandOptions = options.Configure();
-            if (commandOptions.ShouldUseCache())
-                throw new Exception("Caching of paged queries is not allowed");
-
-            var filter = Query<User>.Term(u => u.OrganizationIds, organizationId);
-            return FindAsync(q => q.ElasticFilter(filter).SortAscending(u => u.EmailAddress.Suffix("keyword")), o => commandOptions);
-        }
-
-        protected override Task InvalidateCacheAsync(IReadOnlyCollection<ModifiedDocument<User>> documents, ICommandOptions options = null) {
-            if (!IsCacheEnabled)
-                return Task.CompletedTask;
-
-            var users = documents.UnionOriginalAndModified();
-            var keysToRemove = users.Select(u => String.Concat("Email:", u.EmailAddress.ToLowerInvariant().Trim())).Distinct().ToList();
-            return Task.WhenAll(
-                Cache.RemoveAllAsync(keysToRemove),
-                InvalidateCachedQueriesAsync(users, options),
-                base.InvalidateCacheAsync(documents, options)
-            );
-        }
-
-        private Task OnDocumentsAdded(object sender, DocumentsEventArgs<User> documents) {
-            if (!IsCacheEnabled)
-                return Task.CompletedTask;
-
-            return InvalidateCachedQueriesAsync(documents.Documents, documents.Options);
-        }
-
-        protected virtual Task InvalidateCachedQueriesAsync(IReadOnlyCollection<User> documents, ICommandOptions options = null) {
-            return Task.CompletedTask;
-        }
+    public UserRepository(ExceptionlessElasticConfiguration configuration, MiniValidationValidator validator, AppOptions options)
+        : base(configuration.Users, validator, options)
+    {
+        DefaultConsistency = Consistency.Immediate;
+        AddRequiredField(u => u.EmailAddress, u => u.OrganizationIds);
     }
+
+    public async Task<User?> RecordProductTourAsync(User user, string stateKey, DateTime recordedUtc)
+    {
+        const string script = """
+            Instant recordedAt(def value) {
+                if (value instanceof String) {
+                    try {
+                        return Instant.parse(value);
+                    } catch (DateTimeParseException e) {}
+                }
+                return Instant.MIN;
+            }
+
+            if (ctx._source.product_tours == null) {
+                ctx._source.product_tours = [:];
+            }
+            if (ctx._source.product_tours[params.key] instanceof String) {
+                ctx.op = 'none';
+            } else {
+                ctx._source.product_tours[params.key] = params.recorded_utc;
+                while (ctx._source.product_tours.size() > params.maximum_entries) {
+                    def oldestKey = null;
+                    def oldestDate = Instant.MAX;
+                    for (def entry : ctx._source.product_tours.entrySet()) {
+                        if (entry.getKey() == params.key) {
+                            continue;
+                        }
+                        def date = recordedAt(entry.getValue());
+                        if (oldestKey == null || date.isBefore(oldestDate) ||
+                            (date.equals(oldestDate) && entry.getKey().compareTo(oldestKey) < 0)) {
+                            oldestKey = entry.getKey();
+                            oldestDate = date;
+                        }
+                    }
+                    ctx._source.product_tours.remove(oldestKey);
+                }
+            }
+            """;
+
+        await PatchAsync(user.Id, new ScriptPatch(script)
+        {
+            Params = new Dictionary<string, object>
+            {
+                ["key"] = stateKey,
+                ["maximum_entries"] = MaximumProductTourEntries,
+                ["recorded_utc"] = recordedUtc.ToString("O")
+            }
+        });
+        await Cache.RemoveAsync(EmailCacheKey(user.EmailAddress));
+
+        var updatedUser = await GetByIdAsync(user.Id, o => o.Cache(false));
+        // A concurrent writer may have advanced the document since this read; do not cache this snapshot.
+        if (updatedUser is not null)
+            await InvalidateCacheAsync(updatedUser);
+
+        return updatedUser;
+    }
+
+    public async Task<User?> UpdateProfileAsync(User user, string? fullName, bool? emailNotificationsEnabled)
+    {
+        var fields = new Dictionary<string, object?>();
+        if (fullName is not null)
+            fields[InferField(u => u.FullName)] = fullName;
+        if (emailNotificationsEnabled.HasValue)
+            fields[InferField(u => u.EmailNotificationsEnabled)] = emailNotificationsEnabled.Value;
+
+        if (fields.Count == 0)
+            return user;
+
+        await PatchAsync(user.Id, new PartialPatch(fields));
+        // Server-side patches invalidate by ID; also clear the email lookup cache.
+        await InvalidateCacheAsync(user);
+        return await GetByIdAsync(user.Id, o => o.Cache(false));
+    }
+
+    public Task<bool> SetSavedViewOrdersAsync(User user, CommandOptionsDescriptor<User>? options = null)
+    {
+        var savedViewOrders = user.SavedViewOrders.ToList();
+        return PatchAsync(user.Id, new ActionPatch<User>(currentUser =>
+        {
+            currentUser.SavedViewOrders.Clear();
+            foreach (var savedViewOrder in savedViewOrders)
+                currentUser.SavedViewOrders.Add(savedViewOrder);
+        }), options);
+    }
+
+    public async Task<User?> GetByEmailAddressAsync(string emailAddress)
+    {
+        if (String.IsNullOrWhiteSpace(emailAddress))
+            return null;
+
+        emailAddress = emailAddress.Trim().ToLowerInvariant();
+        var hit = await FindOneAsync(q => q.FieldEquals(u => u.EmailAddress, emailAddress), o => o.Cache(EmailCacheKey(emailAddress)));
+        return hit?.Document;
+    }
+
+    public async Task<User?> GetByPasswordResetTokenAsync(string token)
+    {
+        if (String.IsNullOrEmpty(token))
+            return null;
+
+        var hit = await FindOneAsync(q => q.FieldEquals(u => u.PasswordResetToken, token));
+        return hit?.Document;
+    }
+
+    public async Task<User?> GetUserByOAuthProviderAsync(string provider, string providerUserId)
+    {
+        if (String.IsNullOrEmpty(provider) || String.IsNullOrEmpty(providerUserId))
+            return null;
+
+        provider = provider.ToLowerInvariant();
+        var results = (await FindAsync(q => q.FieldEquals(u => u.OAuthAccounts.First().ProviderUserId, providerUserId))).Documents;
+        return results.FirstOrDefault(u => u.OAuthAccounts.Any(o => o.Provider == provider));
+    }
+
+    public async Task<User?> GetByVerifyEmailAddressTokenAsync(string token)
+    {
+        if (String.IsNullOrEmpty(token))
+            return null;
+
+        var hit = await FindOneAsync(q => q.FieldEquals(u => u.VerifyEmailAddressToken, token));
+        return hit?.Document;
+    }
+
+    public Task<FindResults<User>> GetByOrganizationIdAsync(string organizationId, CommandOptionsDescriptor<User>? options = null)
+    {
+        if (String.IsNullOrEmpty(organizationId))
+            return Task.FromResult(new FindResults<User>());
+
+        var commandOptions = options.Configure();
+        if (commandOptions.ShouldUseCache())
+            throw new Exception("Caching of paged queries is not allowed");
+
+        return FindAsync(q => q.FieldEquals(u => u.OrganizationIds, organizationId).SortAscending(u => u.EmailAddress), o => commandOptions);
+    }
+
+    protected override async Task AddDocumentsToCacheAsync(ICollection<FindHit<User>> findHits, ICommandOptions options, bool isDirtyRead)
+    {
+        await base.AddDocumentsToCacheAsync(findHits, options, isDirtyRead);
+
+        var cacheEntries = new Dictionary<string, FindHit<User>>();
+        foreach (var hit in findHits.Where(d => !String.IsNullOrEmpty(d.Document?.EmailAddress)))
+            cacheEntries.Add(EmailCacheKey(hit.Document!.EmailAddress), hit);
+
+        if (cacheEntries.Count > 0)
+            await AddDocumentsToCacheWithKeyAsync(cacheEntries, options.GetExpiresIn());
+    }
+
+    protected override Task InvalidateCacheAsync(IReadOnlyCollection<ModifiedDocument<User>> documents, ChangeType? changeType = null)
+    {
+        var keysToRemove = documents.UnionOriginalAndModified().Select(u => EmailCacheKey(u.EmailAddress)).Distinct();
+        return Task.WhenAll(Cache.RemoveAllAsync(keysToRemove), base.InvalidateCacheAsync(documents, changeType));
+    }
+
+    private static string EmailCacheKey(string emailAddress) => String.Concat("Email:", emailAddress.Trim().ToLowerInvariant());
 }

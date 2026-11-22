@@ -7,13 +7,27 @@ Serilog:
   MinimumLevel:
     Default: Information
     Override:
-      Microsoft: Warning
-      System: Warning
-      Foundatio.Utility.ScheduledTimer: Warning
+      Exceptionless.Job.Program: Information
       Foundatio.Metrics: Warning
+      Foundatio.Utility.ScheduledTimer: Warning
+      Microsoft: Warning
+      Microsoft.AspNetCore.Hosting.Diagnostics: Warning
+      Microsoft.Hosting.Lifetime: Information
+      OpenTelemetry: Information
+      StackExchange.Redis: Warning
+      StartupActions: Information
+      System: Warning
   WriteTo:
   - Name: Console
+    Args:
+      theme: "Serilog.Sinks.SystemConsole.Themes.AnsiConsoleTheme::Literate, Serilog.Sinks.Console"
   Enrich:
   - FromLogContext
   - WithMachineName
   - WithThreadId
+
+Apm:
+  ServiceName: exceptionless
+  EnableLogs: true
+  FullDetails: true
+  Debug: false

@@ -1,0 +1,21 @@
+apiVersion:  v1
+kind: Pod
+metadata:
+  name: ex-dev-manual-migration
+  namespace: ex-dev
+spec:
+  restartPolicy: Never
+  containers:
+    - name: ex-dev-manual-data-migration
+      image: exceptionless/job-ci:7.0.1-pre4.24
+      resources:
+        requests:
+          memory: 75Mi
+          cpu: 200m
+        limits:
+          memory: 125Mi
+          cpu: 400m
+      args: [Migration]
+      envFrom:
+        - configMapRef:
+            name: ex-dev-config

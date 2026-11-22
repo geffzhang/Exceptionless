@@ -1,33 +1,37 @@
-﻿using System;
+﻿using System.Text.Json.Nodes;
 using Exceptionless.Core.Pipeline;
-using Newtonsoft.Json.Linq;
+using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Plugins.EventUpgrader {
-    [Priority(844)]
-    public class V1R844EventUpgrade : PluginBase, IEventUpgraderPlugin {
-        public void Upgrade(EventUpgraderContext ctx) {
-            if (ctx.Version > new Version(1, 0, 0, 844))
-                return;
+namespace Exceptionless.Core.Plugins.EventUpgrader;
 
-            foreach (var doc in ctx.Documents) {
+[Priority(844)]
+public class V1R844EventUpgrade : PluginBase, IEventUpgraderPlugin
+{
+    public V1R844EventUpgrade(AppOptions options, ILoggerFactory loggerFactory) : base(options, loggerFactory) { }
 
-                if (!(doc["RequestInfo"] is JObject requestInfo) || !requestInfo.HasValues)
-                    return;
+    public void Upgrade(EventUpgraderContext ctx)
+    {
+        if (ctx.Version > new Version(1, 0, 0, 844))
+            return;
 
-                if (requestInfo["Cookies"] != null && requestInfo["Cookies"].HasValues) {
-                    if (requestInfo["Cookies"] is JObject cookies)
-                        cookies.Remove("");
-                }
+        foreach (var doc in ctx.Documents)
+        {
+            if (doc is not JsonObject docObj || docObj["RequestInfo"] is not JsonObject { Count: > 0 } requestInfo)
+                continue;
 
-                if (requestInfo["Form"] != null && requestInfo["Form"].HasValues) {
-                    if (requestInfo["Form"] is JObject form)
-                        form.Remove("");
-                }
+            if (requestInfo["Cookies"] is JsonObject { Count: > 0 } cookies)
+            {
+                cookies.Remove("");
+            }
 
-                if (requestInfo["QueryString"] != null && requestInfo["QueryString"].HasValues) {
-                    if (requestInfo["QueryString"] is JObject queryString)
-                        queryString.Remove("");
-                }
+            if (requestInfo["Form"] is JsonObject { Count: > 0 } form)
+            {
+                form.Remove("");
+            }
+
+            if (requestInfo["QueryString"] is JsonObject { Count: > 0 } queryString)
+            {
+                queryString.Remove("");
             }
         }
     }

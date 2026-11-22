@@ -1,0 +1,308 @@
+<script lang="ts">
+    import type { ProblemDetails } from '@foundatiofx/fetchclient';
+
+    import { resolve } from '$app/paths';
+    import { page } from '$app/state';
+    import { createTable } from '@tanstack/svelte-table';
+    import { useEventListener, watch } from 'runed';
+    import { toast } from 'svelte-sonner';
+
+    import type { IFilter } from '#comp/faceted-filter/index.ts';
+    import type { Stack } from '#features/stacks/models.ts';
+
+    import DataTableViewOptions from '#comp/data-table/data-table-view-options.svelte';
+    import * as DataTable from '#comp/data-table/index.ts';
+    import * as FacetedFilter from '#comp/faceted-filter/index.ts';
+    import RefreshButton from '#comp/refresh-button.svelte';
+    import { Muted } from '#comp/typography/index.ts';
+    import { showBillingDialogOnUpgradeProblem } from '#features/billing/index.ts';
+    import {
+        buildFilterCacheKey,
+        filterChanged,
+        filterRemoved,
+        getFiltersFromCache,
+        toFilter,
+        updateFilterCache
+    } from '#features/events/components/filters/helpers.svelte.ts';
+    import { StatusFilter, StringFilter, TagFilter } from '#features/events/components/filters/index.ts';
+    import { organization } from '#features/organizations/context.svelte.ts';
+    import { removeTableSelection } from '#features/shared/table.svelte.ts';
+    import { type GetProjectStacksParams, getProjectStacksQuery } from '#features/stacks/api.svelte.ts';
+    import StackFacetedFilterBuilder from '#features/stacks/components/filters/stack-faceted-filter-builder.svelte';
+    import StackDetailSheet from '#features/stacks/components/stack-detail-sheet.svelte';
+    import TableStacksBulkActionsDropdownMenu from '#features/stacks/components/stacks-bulk-actions-dropdown-menu.svelte';
+    import { getTableOptions } from '#features/stacks/components/table/options.svelte.ts';
+    import StacksDataTable from '#features/stacks/components/table/stacks-data-table.svelte';
+    import { StackStatus } from '#features/stacks/models.ts';
+    import { describeStackFilter, isStackFilterSupported, splitSupportedStackFilters } from '#features/stacks/stack-filter-support.ts';
+    import { ChangeType, type WebSocketMessageValue } from '#features/websockets/models.ts';
+    import { DEFAULT_LIMIT } from '#shared/api/api.svelte.ts';
+    import { createQueryParameters } from '#shared/query-params/index.ts';
+
+    import { getEventsNavigationOptionsForFilter, redirectToEventsWithFilter } from '../../../redirect-to-events.svelte';
+
+    const projectId = $derived(page.params.projectId);
+    let selectedStackId = $state<string>();
+
+    const DEFAULT_PARAMS = {
+        filter: '(status:ignored OR status:discarded)',
+        limit: DEFAULT_LIMIT,
+        page: 1,
+        sort: '-last'
+    };
+
+    const DEFAULT_FILTERS = [new StatusFilter([StackStatus.Ignored, StackStatus.Discarded])];
+
+    function filterCacheKey(filter: null | string): string {
+        return buildFilterCacheKey(projectId, page.url.pathname, filter);
+    }
+
+    updateFilterCache(filterCacheKey(DEFAULT_PARAMS.filter), DEFAULT_FILTERS);
+    const queryParams = createQueryParameters({
+        defaults: DEFAULT_PARAMS,
+        history: 'push',
+        schema: {
+            filter: 'string',
+            limit: 'number',
+            page: 'number',
+            sort: 'string'
+        }
+    });
+
+    watch(
+        () => projectId,
+        () => {
+            selectedStackId = undefined;
+            updateFilterCache(filterCacheKey(DEFAULT_PARAMS.filter), DEFAULT_FILTERS);
+            queryParams.update(DEFAULT_PARAMS);
+            reset();
+        },
+        {
+            lazy: true
+        }
+    );
+
+    function normalizeStackKeywordFilters(nextFilters: FacetedFilter.IFilter[]): FacetedFilter.IFilter[] {
+        if (nextFilters.length !== 1 || nextFilters[0]?.type !== 'keyword') {
+            return nextFilters;
+        }
+
+        const filter = nextFilters[0] as { value?: string };
+        const keywordValue = filter.value?.trim();
+        if (!keywordValue) {
+            return nextFilters;
+        }
+
+        const stackMatch = /^stack:"?([^"\s]+)"?$/i.exec(keywordValue);
+        if (!stackMatch?.[1]) {
+            return nextFilters;
+        }
+
+        return [new StringFilter('stack', stackMatch[1])];
+    }
+
+    function sanitizeStackFilters(nextFilters: FacetedFilter.IFilter[], notify = false): FacetedFilter.IFilter[] {
+        const normalizedFilters = normalizeStackKeywordFilters(nextFilters);
+        const { supported, unsupported } = splitSupportedStackFilters(normalizedFilters);
+        if (unsupported.length === 0) {
+            return normalizedFilters;
+        }
+
+        const sanitizedFilter = toFilter(supported);
+        if (queryParams.filter !== sanitizedFilter) {
+            queryParams.filter = sanitizedFilter;
+        }
+
+        updateFilterCache(filterCacheKey(sanitizedFilter), supported);
+
+        if (notify) {
+            const removed = unsupported.map((filter) => describeStackFilter(filter)).join(', ');
+            toast.error(`Removed unsupported stack filters: ${removed}.`);
+        }
+
+        return supported;
+    }
+
+    let filters = $state(sanitizeStackFilters(getFiltersFromCache(filterCacheKey(queryParams.filter), queryParams.filter)));
+    watch(
+        [() => queryParams.filter],
+        ([filter]) => {
+            table.resetRowSelection();
+            filters = sanitizeStackFilters(getFiltersFromCache(filterCacheKey(filter), filter), true);
+        },
+        {
+            lazy: true
+        }
+    );
+
+    $effect(() => {
+        queryParams.limit ??= DEFAULT_LIMIT;
+        queryParams.page ??= 1;
+        queryParams.sort ??= '-last';
+    });
+
+    function handleTagClick(tag: string) {
+        onFilterChanged(new TagFilter([tag]));
+    }
+
+    function onFilterChanged(addedOrUpdated: FacetedFilter.IFilter) {
+        if (!isStackFilterSupported(addedOrUpdated)) {
+            toast.error(`"${describeStackFilter(addedOrUpdated)}" is not supported in stack management.`);
+            return;
+        }
+
+        const isNew = !filters?.some((f) => f.id === addedOrUpdated.id);
+        const updatedFilters = filterChanged(filters ?? [], addedOrUpdated);
+        updateFilters(updatedFilters);
+        if (isNew) {
+            filters = sanitizeStackFilters(updatedFilters);
+        }
+    }
+
+    function onFilterRemoved(removed?: FacetedFilter.IFilter): void {
+        if (!removed) {
+            updateFilters([]);
+            filters = [];
+            return;
+        }
+
+        const updatedFilters = filterRemoved(filters ?? [], removed);
+        updateFilters(updatedFilters);
+        filters = updatedFilters;
+    }
+
+    function updateFilters(updatedFilters: FacetedFilter.IFilter[]): void {
+        const sanitizedFilters = sanitizeStackFilters(updatedFilters);
+        const filter = toFilter(sanitizedFilters);
+        if (queryParams.filter !== filter) {
+            table.resetRowSelection();
+        }
+
+        updateFilterCache(filterCacheKey(filter), sanitizedFilters);
+        queryParams.page = 1;
+        queryParams.filter = filter;
+    }
+
+    const stacksQueryParameters: GetProjectStacksParams = $state({
+        get filter() {
+            return queryParams.filter!;
+        },
+        set filter(value) {
+            queryParams.filter = value;
+        },
+        get limit() {
+            return queryParams.limit!;
+        },
+        set limit(value) {
+            queryParams.limit = value;
+        },
+        get page() {
+            return queryParams.page!;
+        },
+        set page(value) {
+            queryParams.page = value;
+        },
+        get sort() {
+            return queryParams.sort!;
+        },
+        set sort(value) {
+            queryParams.sort = value;
+        }
+    });
+
+    const stacksQuery = getProjectStacksQuery({
+        get params() {
+            return stacksQueryParameters;
+        },
+        route: {
+            get projectId() {
+                return projectId;
+            }
+        }
+    });
+
+    function handleStackError(problem: ProblemDetails): void {
+        selectedStackId = undefined;
+        if (!showBillingDialogOnUpgradeProblem(problem, organization.current)) {
+            toast.error('Unable to load stack event details.');
+        }
+    }
+
+    async function handleStackFilterChanged(filter: IFilter): Promise<void> {
+        await redirectToEventsWithFilter(organization.current, filter, getEventsNavigationOptionsForFilter(filter));
+    }
+
+    function rowClick(row: Stack): void {
+        selectedStackId = row.id;
+    }
+
+    function rowHref(row: Stack): string {
+        return resolve('/(app)/project/[projectId]/stacks/[stackId]', {
+            projectId: projectId ?? '',
+            stackId: row.id
+        });
+    }
+
+    const table = createTable(getTableOptions(stacksQueryParameters, stacksQuery, handleTagClick));
+
+    async function handleRefresh() {
+        table.resetRowSelection();
+        await stacksQuery.refetch();
+    }
+
+    function onStackChanged(message: WebSocketMessageValue<'StackChanged'>) {
+        if ((message.organization_id && message.organization_id !== organization.current) || (message.project_id && message.project_id !== projectId)) {
+            return;
+        }
+
+        if (message.id && message.change_type === ChangeType.Removed) {
+            if (message.id === selectedStackId) {
+                selectedStackId = undefined;
+            }
+
+            removeTableSelection(table, message.id);
+        }
+    }
+
+    function reset() {
+        table.resetRowSelection();
+        table.setPageIndex(0);
+    }
+
+    useEventListener(document, 'StackChanged', (event) => onStackChanged((event as CustomEvent).detail));
+</script>
+
+<div class="flex flex-col">
+    <div class="mb-4 flex flex-wrap items-start gap-2">
+        <Muted class="w-full shrink-0">Manage project stacks, including restoring ignored or discarded stacks</Muted>
+        <div class="order-3 flex w-full flex-wrap items-start gap-1.5 md:order-none md:w-auto md:min-w-0 md:flex-1">
+            <FacetedFilter.Root changed={onFilterChanged} {filters} remove={onFilterRemoved}>
+                <StackFacetedFilterBuilder includeProject={false} />
+            </FacetedFilter.Root>
+        </div>
+        <div class="ml-auto flex shrink-0 items-start gap-2">
+            <RefreshButton onRefresh={handleRefresh} isRefreshing={stacksQuery.isFetching} size="icon-lg" title="Refresh results" />
+            <DataTableViewOptions size="icon-lg" {table} />
+        </div>
+    </div>
+
+    <StacksDataTable bind:limit={queryParams.limit!} isLoading={stacksQuery.isLoading} {rowClick} {rowHref} {table}>
+        {#snippet footerChildren()}
+            <div class="flex min-w-0 items-center gap-3">
+                <TableStacksBulkActionsDropdownMenu {table} />
+                <DataTable.Selection {table} />
+            </div>
+
+            <DataTable.Pager bind:value={queryParams.limit!} {table} variant="floating" />
+        {/snippet}
+    </StacksDataTable>
+</div>
+
+<StackDetailSheet
+    bind:stackId={selectedStackId}
+    filterChanged={handleStackFilterChanged}
+    onClose={() => {
+        selectedStackId = undefined;
+    }}
+    onError={handleStackError}
+/>

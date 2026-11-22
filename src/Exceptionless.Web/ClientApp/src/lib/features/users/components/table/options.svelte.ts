@@ -1,0 +1,90 @@
+import type { FetchClientResponse, ProblemDetails } from '@foundatiofx/fetchclient';
+import type { CreateQueryResult } from '@tanstack/svelte-query';
+
+import { type ColumnDef, renderComponent, type StockFeatures } from '@tanstack/svelte-table';
+
+import type { ViewUser } from '#features/users/models.ts';
+
+import BooleanFormatter from '#features/shared/components/formatters/boolean.svelte';
+import { getSharedTableOptions } from '#features/shared/table.svelte.ts';
+import UserActionsCell from '#features/users/components/table/user-actions-cell.svelte';
+
+import type { GetOrganizationUsersParams } from '../../api.svelte';
+
+export function getColumns<TUser extends ViewUser>(organizationId: string): ColumnDef<StockFeatures, TUser, unknown>[] {
+    const columns: ColumnDef<StockFeatures, TUser, unknown>[] = [
+        {
+            accessorKey: 'email_address',
+            cell: (info) => info.getValue(),
+            enableHiding: false,
+            enableSorting: false,
+            header: 'Email Address',
+            meta: {
+                class: 'w-50'
+            }
+        },
+        {
+            accessorKey: 'full_name',
+            cell: (info) => info.getValue(),
+            enableHiding: false,
+            enableSorting: false,
+            header: 'Name',
+            meta: {
+                class: 'w-50'
+            }
+        },
+        {
+            accessorKey: 'is_invite',
+            cell: (info) =>
+                renderComponent(BooleanFormatter, {
+                    value: info.getValue() as boolean
+                }),
+            enableHiding: true,
+            enableSorting: false,
+            header: 'Invited',
+            meta: {
+                class: 'w-25'
+            }
+        }
+    ];
+
+    columns.push({
+        cell: (info) =>
+            renderComponent(UserActionsCell, {
+                organizationId,
+                user: info.row.original
+            }),
+        enableHiding: false,
+        enableSorting: false,
+        header: '',
+        id: 'actions',
+        meta: {
+            class: 'w-12 min-w-12 max-w-12 text-right'
+        }
+    });
+
+    return columns;
+}
+
+export function getTableOptions<TUser extends ViewUser>(
+    queryParameters: GetOrganizationUsersParams,
+    queryResponse: CreateQueryResult<FetchClientResponse<TUser[]>, ProblemDetails>,
+    organizationId: (() => string) | string
+) {
+    return getSharedTableOptions<TUser>({
+        columnPersistenceKey: 'users-column-visibility',
+        get columns() {
+            return getColumns<TUser>(typeof organizationId === 'function' ? organizationId() : organizationId);
+        },
+        paginationStrategy: 'offset',
+        get queryData() {
+            return queryResponse.data?.data ?? [];
+        },
+        get queryMeta() {
+            return queryResponse.data?.meta;
+        },
+        get queryParameters() {
+            return queryParameters;
+        }
+    });
+}

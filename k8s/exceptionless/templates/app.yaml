@@ -1,0 +1,232 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ template "exceptionless.fullname" . }}-app
+  labels:
+    app: {{ template "exceptionless.name" . }}
+    component: {{ template "exceptionless.fullname" . }}-app
+    tier: {{ template "exceptionless.fullname" . }}-app
+    chart: {{ template "exceptionless.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+spec:
+  {{- if not (kindIs "invalid" ( .Values.app | default dict ).replicaCount) }}
+  replicas: {{ .Values.app.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      component: {{ template "exceptionless.fullname" . }}-app
+  template:
+    metadata:
+      labels:
+        app: {{ template "exceptionless.name" . }}
+        component: {{ template "exceptionless.fullname" . }}-app
+        tier: {{ template "exceptionless.fullname" . }}-app
+        chart: {{ template "exceptionless.chart" . }}
+        release: {{ .Release.Name }}
+        heritage: {{ .Release.Service }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              component: {{ template "exceptionless.fullname" . }}-app
+      containers:
+        - name: {{ template "exceptionless.name" . }}-app
+          image: "{{ .Values.app.image.repository }}:{{ .Values.version }}"
+          imagePullPolicy: {{ .Values.app.image.pullPolicy }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests:
+              memory: 500Mi
+              cpu: 100m
+            limits:
+              memory: 1200Mi
+              cpu: 500m
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ template "exceptionless.fullname" . }}-config
+          env:
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: K8S_POD_IP
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: status.podIP
+            - name: K8S_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+{{- include "exceptionless.otel-env" . | indent 12 }}
+            - name: RunJobsInProcess
+              value: 'false'
+{{- if (empty .Values.storage.connectionString) }}
+          volumeMounts:
+            - mountPath: "/app/storage"
+              name: storage
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: {{ template "exceptionless.fullname" . }}-storage
+{{- end }}
+
+{{- if not (kindIs "invalid" ( .Values.app | default dict ).maxReplicaCount) }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ template "exceptionless.fullname" . }}-app-scaler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ template "exceptionless.fullname" . }}-app
+  minReplicas: {{ if not (kindIs "invalid" ( .Values.app | default dict ).minReplicaCount) }}{{ .Values.app.minReplicaCount }}{{ else }}{{ 2 }}{{ end }}
+  maxReplicas: {{ .Values.app.maxReplicaCount }}
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+{{- end }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "exceptionless.fullname" . }}-app
+  labels:
+    app: {{ template "exceptionless.name" . }}
+    component: {{ template "exceptionless.fullname" . }}-app
+    chart: {{ template "exceptionless.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 443
+      targetPort: https
+      protocol: TCP
+      name: https
+  selector:
+    component: {{ template "exceptionless.fullname" . }}-app
+
+---
+{{- if .Values.ingress.enabled }}
+---
+apiVersion: alb.networking.azure.io/v1
+kind: IngressExtension
+metadata:
+  name: {{ template "exceptionless.fullname" . }}-app-http-to-https
+spec:
+  rules:
+  {{- range .Values.app.domains }}
+    - host: {{ . }}
+      requestRedirect:
+        statusCode: 301
+        scheme: https
+  {{- end }}
+
+---
+apiVersion: alb.networking.azure.io/v1
+kind: IngressExtension
+metadata:
+  name: {{ template "exceptionless.fullname" . }}-app-backend-settings
+spec:
+  backendSettings:
+    - service: {{ template "exceptionless.fullname" . }}-app
+      ports:
+        - port: 80
+          protocol: HTTP
+      timeouts:
+        # Exie allows up to two minutes for provider and tool rounds. Use an explicit
+        # bounded timeout with enough headroom for the response to finish cleanly.
+        requestTimeout: {{ .Values.ingress.appRequestTimeout }}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ template "exceptionless.fullname" . }}-app-ingress-agc
+  annotations:
+    alb.networking.azure.io/alb-name: {{ .Values.ingress.albName }}
+    alb.networking.azure.io/alb-namespace: {{ .Values.ingress.albNamespace }}
+    alb.networking.azure.io/alb-frontend: {{ template "exceptionless.fullname" . }}-fe
+    alb.networking.azure.io/alb-ingress-extension: {{ template "exceptionless.fullname" . }}-app-backend-settings
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer }}
+spec:
+  ingressClassName: azure-alb-external
+  tls:
+  - hosts:
+    {{- range .Values.app.domains }}
+    - {{ . }}
+    {{- end }}
+    secretName: {{ template "exceptionless.fullname" . }}-app-agc-tls
+  rules:
+  {{- range .Values.app.domains }}
+  - host: {{ . }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ template "exceptionless.fullname" $ }}-app
+            port:
+              number: 80
+  {{- end }}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ template "exceptionless.fullname" . }}-app-ingress-agc-http
+  annotations:
+    alb.networking.azure.io/alb-name: {{ .Values.ingress.albName }}
+    alb.networking.azure.io/alb-namespace: {{ .Values.ingress.albNamespace }}
+    alb.networking.azure.io/alb-frontend: {{ template "exceptionless.fullname" . }}-fe
+    alb.networking.azure.io/alb-ingress-extension: {{ template "exceptionless.fullname" . }}-app-http-to-https
+spec:
+  ingressClassName: azure-alb-external
+  rules:
+  {{- range .Values.app.domains }}
+  - host: {{ . }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ template "exceptionless.fullname" $ }}-app
+            port:
+              number: 80
+  {{- end }}
+{{- end }}

@@ -1,0 +1,22 @@
+<script lang="ts">
+    import type { SimpleErrorInfo } from '#features/events/models/event-data.ts';
+
+    import { Code } from '#comp/typography/index.ts';
+    import { getErrors } from '#features/events/persistent-event.ts';
+
+    import SimpleStackTraceFrames from './simple-stack-trace-frames.svelte';
+    import SimpleStackTraceHeader from './simple-stack-trace-header.svelte';
+
+    interface Props {
+        error: SimpleErrorInfo;
+    }
+
+    let { error }: Props = $props();
+
+    const errors = $derived(getErrors(error));
+</script>
+
+<pre class="bg-muted/50 border-border max-w-full overflow-x-auto rounded-xl border p-2 whitespace-pre"><Code class="bg-transparent px-0 py-0"
+        >{#each errors.reverse() as error, index (index)}<SimpleStackTraceHeader {error} /><SimpleStackTraceFrames {error} />{#if index < errors.length - 1}<br
+                />{/if}{/each}</Code
+    ></pre>

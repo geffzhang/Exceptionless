@@ -1,0 +1,2137 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text;
+using System.Text.Json;
+using Exceptionless.Core.Authorization;
+using Exceptionless.Core.Configuration;
+using Exceptionless.Core.Extensions;
+using Exceptionless.Core.Mail;
+using Exceptionless.Core.Models;
+using Exceptionless.Core.Queues.Models;
+using Exceptionless.Core.Repositories;
+using Exceptionless.Core.Services;
+using Exceptionless.Core.Utility;
+using Exceptionless.DateTimeExtensions;
+using Exceptionless.Tests.Authentication;
+using Exceptionless.Tests.Extensions;
+using Exceptionless.Tests.Mail;
+using Exceptionless.Tests.Utility;
+using Exceptionless.Web.Models;
+using Exceptionless.Web.Security;
+using FluentRest;
+using Foundatio.Queues;
+using Foundatio.Repositories;
+using Foundatio.Repositories.Utility;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.DependencyInjection;
+using Xunit;
+using User = Exceptionless.Core.Models.User;
+
+namespace Exceptionless.Tests.Api.Endpoints;
+
+public class AuthEndpointTests : IntegrationTestsBase
+{
+    private readonly AuthOptions _authOptions;
+    private readonly IntercomOptions _intercomOptions;
+    private readonly IUserRepository _userRepository;
+    private readonly IOrganizationRepository _organizationRepository;
+    private readonly ITokenRepository _tokenRepository;
+    private readonly IOAuthTokenRepository _oauthTokenRepository;
+    private readonly AuthOptionsState _originalAuthOptions;
+
+    public AuthEndpointTests(ITestOutputHelper output, AppWebHostFactory factory) : base(output, factory)
+    {
+        _authOptions = GetService<AuthOptions>();
+        _originalAuthOptions = AuthOptionsState.Capture(_authOptions);
+        _intercomOptions = GetService<IntercomOptions>();
+
+        _organizationRepository = GetService<IOrganizationRepository>();
+        _userRepository = GetService<IUserRepository>();
+        _tokenRepository = GetService<ITokenRepository>();
+        _oauthTokenRepository = GetService<IOAuthTokenRepository>();
+    }
+
+    protected override void RegisterServices(IServiceCollection services)
+    {
+        base.RegisterServices(services);
+        services.AddSingleton<CountingMailer>();
+        services.ReplaceSingleton<IMailer>(sp => sp.GetRequiredService<CountingMailer>());
+    }
+
+    protected override async Task ResetDataAsync()
+    {
+        await base.ResetDataAsync();
+        GetService<CountingMailer>().Reset();
+        ConfigureAuthOptions();
+        var service = GetService<SampleDataService>();
+        await service.CreateDataAsync();
+    }
+
+    public override ValueTask DisposeAsync()
+    {
+        _originalAuthOptions.Apply(_authOptions);
+        return base.DisposeAsync();
+    }
+
+    private void ConfigureAuthOptions()
+    {
+        _authOptions.EnableAccountCreation = true;
+        _authOptions.EnableActiveDirectoryAuth = false;
+        _authOptions.GitHubId = "github-client-id";
+        _authOptions.GitHubSecret = "github-client-secret";
+        _authOptions.GoogleId = "google-client-id";
+        _authOptions.GoogleSecret = "google-client-secret";
+        _authOptions.MicrosoftId = "microsoft-client-id";
+        _authOptions.MicrosoftSecret = "microsoft-client-secret";
+    }
+
+    [Fact]
+    public async Task CannotSignupWithoutPassword()
+    {
+        var problemDetails = await SendRequestAsAsync<ValidationProblemDetails>(r => r
+            .Post()
+            .AppendPath("auth/signup")
+            .Content(new Signup
+            {
+                Name = "hello",
+                Email = "test@domain.com",
+                Password = null!
+            })
+            .StatusCodeShouldBeUnprocessableEntity()
+        );
+
+        Assert.NotNull(problemDetails);
+        Assert.Single(problemDetails.Errors);
+        Assert.Contains(problemDetails.Errors, error => String.Equals(error.Key, "password"));
+    }
+
+    [Theory]
+    [InlineData(true, TestDomainLoginProvider.ValidUsername, TestDomainLoginProvider.ValidPassword)]
+    [InlineData(true, "test1.2@exceptionless.io", TestDomainLoginProvider.ValidPassword)]
+    [InlineData(false, "test1@exceptionless.io", "Password1$")]
+    public Task CannotSignupWhenAccountCreationDisabledWithNoTokenAsync(bool enableAdAuth, string email, string password)
+    {
+        _authOptions.EnableAccountCreation = false;
+        _authOptions.EnableActiveDirectoryAuth = enableAdAuth;
+
+        if (enableAdAuth && email == TestDomainLoginProvider.ValidUsername)
+        {
+            var provider = new TestDomainLoginProvider();
+            email = provider.GetEmailAddressFromUsername(email);
+        }
+
+        return SendRequestAsync(r => r
+            .Post()
+            .AppendPath("auth/signup")
+            .Content(new Signup
+            {
+                Name = "Test",
+                Email = email,
+                Password = password,
+                InviteToken = null
+            })
+            .StatusCodeShouldBeForbidden()
+        );
+    }
+
+    [Theory]
+    [InlineData(true, TestDomainLoginProvider.ValidUsername, TestDomainLoginProvider.ValidPassword)]
+    [InlineData(true, "test2.2@exceptionless.io", TestDomainLoginProvider.ValidPassword)]
+    [InlineData(false, "test2@exceptionless.io", "Password1$")]
+    public Task CannotSignupWhenAccountCreationDisabledWithInvalidTokenAsync(bool enableAdAuth, string email, string password)
+    {
+        _authOptions.EnableAccountCreation = false;
+        _authOptions.EnableActiveDirectoryAuth = enableAdAuth;
+
+        if (enableAdAuth && email == TestDomainLoginProvider.ValidUsername)
+        {
+            var provider = new TestDomainLoginProvider();
+            email = provider.GetEmailAddressFromUsername(email);
+        }
+
+        return SendRequestAsync(r => r
+            .Post()
+            .AppendPath("auth/signup")
+            .Content(new Signup
+            {
+                Name = "Test",
+                Email = email,
+                Password = password,
+                InviteToken = StringExtensions.GetNewToken()
+            })
+            .StatusCodeShouldBeForbidden()
+        );
+    }
+
+    [Theory]
+    [InlineData(true, TestDomainLoginProvider.ValidUsername, TestDomainLoginProvider.ValidPassword)]
+    [InlineData(false, "test3@exceptionless.io", "Password1$")]
+    public async Task CanSignupWhenAccountCreationDisabledWithValidTokenAsync(bool enableAdAuth, string email, string password)
+    {
+        _authOptions.EnableAccountCreation = false;
+        _authOptions.EnableActiveDirectoryAuth = enableAdAuth;
+
+        if (enableAdAuth && email == TestDomainLoginProvider.ValidUsername)
+        {
+            var provider = new TestDomainLoginProvider();
+            email = provider.GetEmailAddressFromUsername(email);
+        }
+
+        var results = await _organizationRepository.GetAllAsync();
+        var organization = results.Documents.First();
+
+        var invite = new Invite
+        {
+            Token = StringExtensions.GetNewToken(),
+            EmailAddress = email.ToLowerInvariant(),
+            DateAdded = DateTime.UtcNow
+        };
+        organization.Invites.Add(invite);
+        organization = await _organizationRepository.SaveAsync(organization, o => o.ImmediateConsistency());
+        Assert.NotNull(organization.GetInvite(invite.Token));
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+           .Post()
+           .AppendPath("auth/signup")
+           .Content(new Signup
+           {
+               Name = "Test",
+               Email = email,
+               Password = password,
+               InviteToken = invite.Token
+           })
+           .StatusCodeShouldBeOk()
+       );
+
+        Assert.NotNull(result);
+        Assert.False(String.IsNullOrEmpty(result.Token));
+
+        var user = await _userRepository.GetByEmailAddressAsync(email);
+        Assert.NotNull(user);
+        Assert.Equal("Test", user.FullName);
+        Assert.Equal(email, user.EmailAddress);
+        Assert.NotEqual(password, user.Password);
+        Assert.Contains(user.OrganizationIds, o => String.Equals(o, organization.Id));
+
+        // Assert user is verified due to the invite.
+        Assert.True(user.IsEmailAddressVerified);
+        Assert.Null(user.VerifyEmailAddressToken);
+        Assert.Equal(DateTime.MinValue, user.VerifyEmailAddressTokenExpiration);
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task Signup_UnverifiedAddress_SendsWelcomeOnlyWithoutAnInvite(bool withInviteForAnotherAddress, bool expectedIsNewAccount)
+    {
+        // Arrange
+        _authOptions.EnableAccountCreation = true;
+        _authOptions.EnableActiveDirectoryAuth = false;
+        const string email = "welcome-check@exceptionless.io";
+
+        var organizations = await _organizationRepository.GetAllAsync();
+        var organization = organizations.Documents.First();
+        string? inviteToken = null;
+        if (withInviteForAnotherAddress)
+        {
+            var invite = new Invite
+            {
+                Token = StringExtensions.GetNewToken(),
+                EmailAddress = "invited-original@exceptionless.io",
+                DateAdded = DateTime.UtcNow
+            };
+            organization.Invites.Add(invite);
+            await _organizationRepository.SaveAsync(organization, o => o.ImmediateConsistency());
+            inviteToken = invite.Token;
+        }
+
+        // Act
+        await SendRequestAsync(r => r
+           .Post()
+           .AppendPath("auth/signup")
+           .Content(new Signup
+           {
+               Name = "Welcome Check",
+               Email = email,
+               Password = "Password1$",
+               InviteToken = inviteToken
+           })
+           .StatusCodeShouldBeOk()
+        );
+
+        // Assert
+        var user = await _userRepository.GetByEmailAddressAsync(email);
+        Assert.NotNull(user);
+        Assert.False(user.IsEmailAddressVerified);
+        Assert.Equal(withInviteForAnotherAddress, user.OrganizationIds.Contains(organization.Id));
+
+        // Invited users join an organization that already has apps, so their email skips the "connect your app" welcome.
+        var call = Assert.Single(GetService<CountingMailer>().UserEmailVerifyCalls);
+        Assert.Equal(email, call.EmailAddress);
+        Assert.Equal(expectedIsNewAccount, call.IsNewAccount);
+    }
+
+    [Fact]
+    public async Task CanSignupWhenAccountCreationDisabledWithValidTokenAndInvalidAdAccountAsync()
+    {
+        _authOptions.EnableAccountCreation = false;
+        _authOptions.EnableActiveDirectoryAuth = true;
+
+        const string email = "test-user1@exceptionless.io";
+        const string password = "invalidAccount1";
+
+        var organizations = await _organizationRepository.GetAllAsync();
+        var organization = organizations.Documents.First();
+        var invite = new Invite
+        {
+            Token = StringExtensions.GetNewToken(),
+            EmailAddress = email.ToLowerInvariant(),
+            DateAdded = DateTime.UtcNow
+        };
+
+        organization.Invites.Add(invite);
+        await _organizationRepository.SaveAsync(organization, o => o.ImmediateConsistency());
+        Assert.NotNull(organization.GetInvite(invite.Token));
+
+        await SendRequestAsync(r => r
+           .Post()
+           .AppendPath("auth/signup")
+           .Content(new Signup
+           {
+               Name = "Test",
+               Email = email,
+               Password = password,
+               InviteToken = invite.Token
+           })
+           .StatusCodeShouldBeUnauthorized()
+        );
+    }
+
+    [Fact]
+    public async Task CanSignupWhenAccountCreationEnabledWithNoTokenAsync()
+    {
+        _authOptions.EnableAccountCreation = true;
+
+        const string email = "test4@exceptionless.io";
+        const string password = "Password1$";
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+           .Post()
+           .AppendPath("auth/signup")
+           .Content(new Signup
+           {
+               Name = "Test",
+               Email = email,
+               Password = password,
+               InviteToken = null
+           })
+           .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.False(String.IsNullOrEmpty(result.Token));
+
+        var user = await _userRepository.GetByEmailAddressAsync(email);
+        Assert.NotNull(user);
+        Assert.Equal("Test", user.FullName);
+        Assert.Equal(email, user.EmailAddress);
+        Assert.NotEqual(password, user.Password);
+        Assert.Empty(user.OrganizationIds);
+
+        Assert.False(user.IsEmailAddressVerified);
+        Assert.NotNull(user.VerifyEmailAddressToken);
+        Assert.NotEqual(DateTime.MinValue, user.VerifyEmailAddressTokenExpiration);
+    }
+
+    [Fact]
+    public async Task CanSignupWhenAccountCreationEnabledWithNoTokenAndValidAdAccountAsync()
+    {
+        _authOptions.EnableAccountCreation = true;
+        _authOptions.EnableActiveDirectoryAuth = true;
+
+        var provider = new TestDomainLoginProvider();
+        string email = provider.GetEmailAddressFromUsername(TestDomainLoginProvider.ValidUsername);
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+           .Post()
+           .AppendPath("auth/signup")
+           .Content(new Signup
+           {
+               Name = "Test",
+               Email = email,
+               Password = TestDomainLoginProvider.ValidPassword,
+               InviteToken = null
+           })
+           .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.False(String.IsNullOrEmpty(result.Token));
+    }
+
+    [Fact]
+    public Task CanSignupWhenAccountCreationEnabledWithNoTokenAndInvalidAdAccountAsync()
+    {
+        _authOptions.EnableAccountCreation = true;
+        _authOptions.EnableActiveDirectoryAuth = true;
+
+        return SendRequestAsync(r => r
+           .Post()
+           .AppendPath("auth/signup")
+           .Content(new Signup
+           {
+               Name = "Test",
+               Email = "testuser2@exceptionless.io",
+               Password = "literallydoesntmatter",
+               InviteToken = null
+           })
+           .StatusCodeShouldBeUnauthorized()
+        );
+    }
+
+    [Fact]
+    public async Task CanSignupWhenAccountCreationEnabledWithValidTokenAsync()
+    {
+        _authOptions.EnableAccountCreation = true;
+
+        var organizations = await _organizationRepository.GetAllAsync();
+        var organization = organizations.Documents.First();
+        const string email = "test5@exceptionless.io";
+        const string name = "Test";
+        const string password = "Password1$";
+
+        var invite = new Invite
+        {
+            Token = StringExtensions.GetNewToken(),
+            EmailAddress = email.ToLowerInvariant(),
+            DateAdded = DateTime.UtcNow
+        };
+
+        organization.Invites.Clear();
+        organization.Invites.Add(invite);
+        await _organizationRepository.SaveAsync(organization, o => o.ImmediateConsistency());
+        Assert.NotNull(organization.GetInvite(invite.Token));
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+           .Post()
+           .AppendPath("auth/signup")
+           .Content(new Signup
+           {
+               Name = name,
+               Email = email,
+               Password = password,
+               InviteToken = invite.Token
+           })
+           .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.False(String.IsNullOrEmpty(result.Token));
+
+        await RefreshDataAsync();
+
+        var user = await _userRepository.GetByEmailAddressAsync(email);
+        Assert.NotNull(user);
+        Assert.Equal("Test", user.FullName);
+        Assert.NotEmpty(user.OrganizationIds);
+        Assert.NotNull(user.Salt);
+        Assert.True(user.IsEmailAddressVerified);
+        Assert.Equal(password.ToSaltedHash(user.Salt), user.Password);
+        Assert.Contains(organization.Id, user.OrganizationIds);
+
+        organization = await _organizationRepository.GetByIdAsync(organization.Id);
+        Assert.NotNull(organization);
+        Assert.Empty(organization.Invites);
+
+        var token = await _tokenRepository.GetByIdAsync(result.Token);
+        Assert.NotNull(token);
+        Assert.Equal(user.Id, token.UserId);
+        Assert.Equal(TokenType.Authentication, token.Type);
+
+        var mailQueue = GetService<IQueue<MailMessage>>() as InMemoryQueue<MailMessage>;
+        Assert.NotNull(mailQueue);
+        Assert.Equal(0, (await mailQueue.GetQueueStatsAsync()).Enqueued);
+    }
+
+    [Fact]
+    public async Task CanSignupWhenAccountCreationEnabledWithValidTokenAndValidAdAccountAsync()
+    {
+        _authOptions.EnableAccountCreation = true;
+        _authOptions.EnableActiveDirectoryAuth = true;
+
+        var provider = new TestDomainLoginProvider();
+        string email = provider.GetEmailAddressFromUsername(TestDomainLoginProvider.ValidUsername);
+
+        var results = await _organizationRepository.GetAllAsync();
+        var organization = results.Documents.First();
+        var invite = new Invite
+        {
+            Token = StringExtensions.GetNewToken(),
+            EmailAddress = email.ToLowerInvariant(),
+            DateAdded = DateTime.UtcNow
+        };
+        organization.Invites.Add(invite);
+        await _organizationRepository.SaveAsync(organization, o => o.ImmediateConsistency());
+        Assert.NotNull(organization.GetInvite(invite.Token));
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+           .Post()
+           .AppendPath("auth/signup")
+           .Content(new Signup
+           {
+               Name = "Test",
+               Email = email,
+               Password = TestDomainLoginProvider.ValidPassword,
+               InviteToken = invite.Token
+           })
+           .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.False(String.IsNullOrEmpty(result.Token));
+    }
+
+    [Fact]
+    public async Task CanSignupWhenAccountCreationEnabledWithValidTokenAndInvalidAdAccountAsync()
+    {
+        _authOptions.EnableAccountCreation = true;
+        _authOptions.EnableActiveDirectoryAuth = true;
+
+        string email = "test-user4@exceptionless.io";
+        var results = await _organizationRepository.GetAllAsync();
+        var organization = results.Documents.First();
+        var invite = new Invite
+        {
+            Token = StringExtensions.GetNewToken(),
+            EmailAddress = email.ToLowerInvariant(),
+            DateAdded = DateTime.UtcNow
+        };
+        organization.Invites.Add(invite);
+        await _organizationRepository.SaveAsync(organization, o => o.ImmediateConsistency());
+        Assert.NotNull(organization.GetInvite(invite.Token));
+
+        await SendRequestAsync(r => r
+           .Post()
+           .AppendPath("auth/signup")
+           .Content(new Signup
+           {
+               Name = "Test",
+               Email = email,
+               Password = TestDomainLoginProvider.ValidPassword,
+               InviteToken = invite.Token
+           })
+           .StatusCodeShouldBeUnauthorized()
+        );
+    }
+
+    [Fact]
+    public async Task SignupShouldFailWhenUsingExistingAccountWithNoPasswordOrInvalidPassword()
+    {
+        const string email = "test6@exceptionless.io";
+        const string password = "Test6 password";
+        const string salt = "1234567890123456";
+        string passwordHash = password.ToSaltedHash(salt);
+
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = passwordHash,
+            Salt = salt,
+            FullName = "User 6"
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        var problemDetails = await SendRequestAsAsync<ValidationProblemDetails>(r => r
+            .Post()
+            .AppendPath("auth/signup")
+            .Content(new Signup
+            {
+                Name = "Random Name",
+                Email = email,
+                Password = null!
+            })
+            .StatusCodeShouldBeUnprocessableEntity()
+        );
+
+        Assert.NotNull(problemDetails);
+        Assert.Single(problemDetails.Errors);
+        Assert.Contains(problemDetails.Errors, error => String.Equals(error.Key, "password"));
+
+        // The Svelte signup form uses this title to explain that the account already exists.
+        var existingAccountProblem = await SendRequestAsAsync<Microsoft.AspNetCore.Mvc.ProblemDetails>(r => r
+            .Post()
+            .AppendPath("auth/signup")
+            .Content(new Signup
+            {
+                Name = "Random Name",
+                Email = email,
+                Password = "invalidPass"
+            })
+            .StatusCodeShouldBeUnauthorized()
+        );
+
+        Assert.NotNull(existingAccountProblem);
+        Assert.Equal("Login failed.", existingAccountProblem.Title);
+    }
+
+    [Fact]
+    public async Task FacebookAsync_RemovedProvider_ReturnsNotFound()
+    {
+        // Arrange is handled by the configured authentication fixture.
+
+        // Act
+        var response = await SendRequestAsync(request => request
+            .Post()
+            .AppendPaths("auth", "facebook")
+            .Content(new ExternalAuthInfo { ClientId = "facebook-client-id", Code = "facebook-user", RedirectUri = "http://localhost" })
+            .StatusCodeShouldBeNotFound());
+
+        // Assert
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task GitHubAsync_WithConfiguredProvider_ReturnsToken()
+    {
+        // Arrange
+        const string code = "github-user";
+
+        // Act
+        var result = await SendExternalLoginAsync("github", code);
+
+        // Assert
+        await AssertExternalLoginAsync(result, "github", code);
+    }
+
+    [Fact]
+    public async Task GoogleAsync_WithConfiguredProvider_ReturnsToken()
+    {
+        // Arrange
+        const string code = "google-user";
+
+        // Act
+        var result = await SendExternalLoginAsync("google", code);
+
+        // Assert
+        await AssertExternalLoginAsync(result, "google", code);
+    }
+
+    [Fact]
+    public async Task MicrosoftAsync_WithLinkedIdentity_ReturnsToken()
+    {
+        // Arrange
+        const string code = "microsoft-user";
+        var user = new User { EmailAddress = TestOAuthProviderClient.GetEmailAddress(code), FullName = "Microsoft User" };
+        user.MarkEmailAddressVerified();
+        user.AddOAuthAccount("Microsoft", code, user.EmailAddress);
+        await _userRepository.AddAsync(user, o => o.ImmediateConsistency());
+
+        // Act
+        var result = await SendExternalLoginAsync("microsoft", code);
+
+        // Assert
+        await AssertExternalLoginAsync(result, "microsoft", code);
+    }
+
+    [Fact]
+    public async Task GitHubAsync_WithoutInviteAndAuthenticatedSession_LinksCurrentUser()
+    {
+        // Arrange
+        const string code = "github-linked-user";
+        var currentUser = await _userRepository.GetByEmailAddressAsync(SampleDataService.TEST_ORG_USER_EMAIL);
+        Assert.NotNull(currentUser);
+
+        // Act
+        var result = await SendRequestAsAsync<TokenResult>(request => request
+            .Post()
+            .AsTestOrganizationUser()
+            .AppendPaths("auth", "github")
+            .Content(new ExternalAuthInfo
+            {
+                ClientId = "client-id",
+                Code = code,
+                RedirectUri = "http://localhost/callback"
+            })
+            .StatusCodeShouldBeOk()
+        );
+
+        // Assert
+        Assert.NotNull(result);
+        var token = await _tokenRepository.GetByIdAsync(result.Token);
+        Assert.NotNull(token);
+        Assert.Equal(currentUser.Id, token.UserId);
+
+        currentUser = await _userRepository.GetByIdAsync(currentUser.Id);
+        Assert.NotNull(currentUser);
+        Assert.Contains(currentUser.OAuthAccounts, account => account.Provider == "github" && account.ProviderUserId == code);
+    }
+
+    [Fact]
+    public async Task GitHubAsync_WithValidInviteAndAccountCreationDisabled_CreatesInvitedUser()
+    {
+        // Arrange
+        _authOptions.EnableAccountCreation = false;
+        const string code = "github-invited-user";
+        string email = TestOAuthProviderClient.GetEmailAddress(code);
+        var organization = (await _organizationRepository.GetAllAsync()).Documents.First();
+        var invite = new Invite
+        {
+            Token = StringExtensions.GetNewToken(),
+            EmailAddress = email,
+            DateAdded = DateTime.UtcNow
+        };
+        organization.Invites.Add(invite);
+        await _organizationRepository.SaveAsync(organization, options => options.ImmediateConsistency());
+
+        // Act
+        var result = await SendExternalLoginAsync("github", code, invite.Token);
+
+        // Assert
+        await AssertExternalLoginAsync(result, "github", code);
+        var user = await _userRepository.GetByEmailAddressAsync(email);
+        Assert.NotNull(user);
+        Assert.Contains(organization.Id, user.OrganizationIds);
+        var updatedOrganization = await _organizationRepository.GetByIdAsync(organization.Id);
+        Assert.NotNull(updatedOrganization);
+        Assert.DoesNotContain(updatedOrganization.Invites, candidate => candidate.Token == invite.Token);
+    }
+
+    [Fact]
+    public async Task GitHubAsync_WithValidInviteAndAuthenticatedSession_AuthenticatesInvitedUser()
+    {
+        // Arrange
+        const string code = "github-existing-invited-user";
+        string invitedEmail = TestOAuthProviderClient.GetEmailAddress(code);
+        var initialLogin = await SendExternalLoginAsync("github", code);
+        Assert.NotNull(initialLogin);
+
+        var invitedUser = await _userRepository.GetByEmailAddressAsync(invitedEmail);
+        Assert.NotNull(invitedUser);
+        var currentUser = await _userRepository.GetByEmailAddressAsync(SampleDataService.TEST_ORG_USER_EMAIL);
+        Assert.NotNull(currentUser);
+        string[] currentOrganizationIds = currentUser.OrganizationIds.ToArray();
+
+        var organization = (await _organizationRepository.GetAllAsync()).Documents.First();
+        var invite = new Invite
+        {
+            Token = StringExtensions.GetNewToken(),
+            EmailAddress = invitedEmail,
+            DateAdded = DateTime.UtcNow
+        };
+        organization.Invites.Add(invite);
+        await _organizationRepository.SaveAsync(organization, options => options.ImmediateConsistency());
+
+        // Act
+        var result = await SendRequestAsAsync<TokenResult>(request => request
+            .Post()
+            .AsTestOrganizationUser()
+            .AppendPaths("auth", "github")
+            .Content(new ExternalAuthInfo
+            {
+                ClientId = "client-id",
+                Code = code,
+                InviteToken = invite.Token,
+                RedirectUri = "http://localhost/callback"
+            })
+            .StatusCodeShouldBeOk()
+        );
+
+        // Assert
+        Assert.NotNull(result);
+        var token = await _tokenRepository.GetByIdAsync(result.Token);
+        Assert.NotNull(token);
+        Assert.Equal(invitedUser.Id, token.UserId);
+
+        invitedUser = await _userRepository.GetByIdAsync(invitedUser.Id);
+        Assert.NotNull(invitedUser);
+        Assert.Contains(invitedUser.OAuthAccounts, account => account.Provider == "github" && account.ProviderUserId == code);
+        Assert.Contains(organization.Id, invitedUser.OrganizationIds);
+
+        currentUser = await _userRepository.GetByIdAsync(currentUser.Id);
+        Assert.NotNull(currentUser);
+        Assert.DoesNotContain(currentUser.OAuthAccounts, account => account.Provider == "github" && account.ProviderUserId == code);
+        Assert.Equal(currentOrganizationIds, currentUser.OrganizationIds);
+
+        var updatedOrganization = await _organizationRepository.GetByIdAsync(organization.Id);
+        Assert.NotNull(updatedOrganization);
+        Assert.DoesNotContain(updatedOrganization.Invites, candidate => candidate.Token == invite.Token);
+    }
+
+    [Fact]
+    public async Task GitHubAsync_WithInvalidInviteAndAccountCreationDisabled_IsForbidden()
+    {
+        // Arrange
+        _authOptions.EnableAccountCreation = false;
+        const string code = "github-invited-user";
+        string email = TestOAuthProviderClient.GetEmailAddress(code);
+
+        // Act
+        await SendRequestAsync(r => r
+            .Post()
+            .AppendPaths("auth", "github")
+            .Content(new ExternalAuthInfo
+            {
+                ClientId = "client-id",
+                Code = code,
+                InviteToken = StringExtensions.GetNewToken(),
+                RedirectUri = "http://localhost/callback"
+            })
+            .StatusCodeShouldBeForbidden()
+        );
+
+        // Assert
+        Assert.Null(await _userRepository.GetByEmailAddressAsync(email));
+    }
+
+    [Fact]
+    public async Task LoginValidAsync()
+    {
+        _authOptions.EnableActiveDirectoryAuth = false;
+
+        const string email = "test6@exceptionless.io";
+        const string password = "Test6 password";
+        const string salt = "1234567890123456";
+        string passwordHash = password.ToSaltedHash(salt);
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = passwordHash,
+            Salt = salt,
+            FullName = "User 6"
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+           .Post()
+           .AppendPath("auth/login")
+           .Content(new Login
+           {
+               Email = email,
+               Password = password
+           })
+           .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.False(String.IsNullOrEmpty(result.Token));
+    }
+
+    [Fact]
+    public async Task RemoveExternalLoginAsync_WithLinkedAccount_RemovesAccount()
+    {
+        // Arrange
+        const string providerName = "github";
+        const string providerUserId = "github-remove-user";
+        var user = await _userRepository.GetByEmailAddressAsync(SampleDataService.TEST_ORG_USER_EMAIL);
+        Assert.NotNull(user);
+        user.AddOAuthAccount(providerName, providerUserId, user.EmailAddress);
+        await _userRepository.SaveAsync(user, o => o.ImmediateConsistency().Cache());
+
+        // Act
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .AsTestOrganizationUser()
+            .AppendPaths("auth", "unlink", providerName)
+            .Content(new ValueFromBody<string>(providerUserId))
+            .StatusCodeShouldBeOk()
+        );
+
+        // Assert
+        Assert.NotNull(result);
+        Assert.False(String.IsNullOrEmpty(result.Token));
+        var updatedUser = await _userRepository.GetByIdAsync(user.Id);
+        Assert.NotNull(updatedUser);
+        Assert.DoesNotContain(updatedUser.OAuthAccounts, account => account.Provider == providerName && account.ProviderUserId == providerUserId);
+    }
+
+    [Fact]
+    public Task RemoveExternalLoginAsync_WithoutProviderUserId_ReturnsBadRequest()
+    {
+        // Arrange
+        var providerUserId = new ValueFromBody<string>(String.Empty);
+
+        // Act & Assert
+        return SendRequestAsync(r => r
+            .Post()
+            .AsTestOrganizationUser()
+            .AppendPaths("auth", "unlink", "github")
+            .Content(providerUserId)
+            .StatusCodeShouldBeBadRequest()
+        );
+    }
+
+    [Fact]
+    public async Task LoginInvalidPasswordAsync()
+    {
+        _authOptions.EnableActiveDirectoryAuth = false;
+
+        const string email = "test7@exceptionless.io";
+        const string password = "Test7 password";
+        const string salt = "1234567890123456";
+        string passwordHash = password.ToSaltedHash(salt);
+
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = passwordHash,
+            Salt = salt,
+            FullName = "User 7"
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        await SendRequestAsync(r => r
+           .Post()
+           .AppendPath("auth/login")
+           .Content(new Login
+           {
+               Email = email,
+               Password = "This password ain't right"
+           })
+           .StatusCodeShouldBeUnauthorized()
+        );
+    }
+
+    [Fact]
+    public async Task LoginNoSuchUserAsync()
+    {
+        _authOptions.EnableActiveDirectoryAuth = false;
+
+        const string email = "test8@exceptionless.io";
+        const string password = "Test8 password";
+        const string salt = "1234567890123456";
+        string passwordHash = password.ToSaltedHash(salt);
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = passwordHash,
+            Salt = salt,
+            FullName = "User 8"
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        await SendRequestAsync(r => r
+           .Post()
+           .AppendPath("auth/login")
+           .Content(new Login
+           {
+               Email = "Thisguydoesntexist@exceptionless.io",
+               Password = "This password ain't right"
+           })
+           .StatusCodeShouldBeUnauthorized()
+        );
+    }
+
+    [Fact]
+    public async Task LoginValidExistingActiveDirectoryAsync()
+    {
+        _authOptions.EnableActiveDirectoryAuth = true;
+
+        var provider = new TestDomainLoginProvider();
+        string email = provider.GetEmailAddressFromUsername(TestDomainLoginProvider.ValidUsername);
+        var user = new User
+        {
+            EmailAddress = email,
+            FullName = "User 6"
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+           .Post()
+           .AppendPath("auth/login")
+           .Content(new Login
+           {
+               Email = email,
+               Password = TestDomainLoginProvider.ValidPassword
+           })
+           .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.False(String.IsNullOrEmpty(result.Token));
+    }
+
+    [Fact]
+    public Task LoginValidNonExistentActiveDirectoryAsync()
+    {
+        _authOptions.EnableActiveDirectoryAuth = true;
+
+        var provider = new TestDomainLoginProvider();
+        string email = provider.GetEmailAddressFromUsername(TestDomainLoginProvider.ValidUsername);
+
+        return SendRequestAsync(r => r
+           .Post()
+           .AppendPath("auth/login")
+           .Content(new Login
+           {
+               Email = email,
+               Password = TestDomainLoginProvider.ValidPassword
+           })
+           .StatusCodeShouldBeUnauthorized()
+        );
+    }
+
+    [Fact]
+    public async Task LoginInvalidNonExistentActiveDirectoryAsync()
+    {
+        _authOptions.EnableActiveDirectoryAuth = true;
+        var provider = new TestDomainLoginProvider();
+        string email = provider.GetEmailAddressFromUsername(TestDomainLoginProvider.ValidUsername);
+
+        await SendRequestAsync(r => r
+           .Post()
+           .AppendPath("auth/login")
+           .Content(new Login
+           {
+               Email = $"{email}.au",
+               Password = "Totallywrongpassword1234"
+           })
+           .StatusCodeShouldBeUnauthorized()
+        );
+
+        // Verify that a user account was not added
+        var user = await _userRepository.GetByEmailAddressAsync($"{email}.au");
+        Assert.Null(user);
+    }
+
+    [Fact]
+    public async Task LoginInvalidExistingActiveDirectoryAsync()
+    {
+        _authOptions.EnableActiveDirectoryAuth = true;
+
+        var provider = new TestDomainLoginProvider();
+        string email = provider.GetEmailAddressFromUsername(TestDomainLoginProvider.ValidUsername);
+        var user = new User
+        {
+            EmailAddress = email,
+            FullName = "User 6"
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        await SendRequestAsync(r => r
+           .Post()
+           .AppendPath("auth/login")
+           .Content(new Login
+           {
+               Email = email,
+               Password = "Totallywrongpassword1234"
+           })
+           .StatusCodeShouldBeUnauthorized()
+        );
+    }
+
+    [Fact]
+    public async Task LoginInvalidExistingActiveDirectoryAccountUsingUserNameLoginAsync()
+    {
+        _authOptions.EnableActiveDirectoryAuth = true;
+
+        var provider = new TestDomainLoginProvider();
+        string email = provider.GetEmailAddressFromUsername(TestDomainLoginProvider.ValidUsername);
+        var user = new User
+        {
+            EmailAddress = email,
+            FullName = "User 6"
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        await SendRequestAsync(r => r
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login
+            {
+                Email = TestDomainLoginProvider.ValidUsername,
+                Password = "Totallywrongpassword1234"
+            })
+            .StatusCodeShouldBeUnauthorized()
+        );
+    }
+
+    [Theory]
+    [InlineData("Basic", "client:{token}")]
+    [InlineData("Basic", "{token}:")]
+    [InlineData("bAsIc", "{token}:x-oauth-basic")]
+    [InlineData("Basic   ", "client:{token}")]
+    public async Task BasicAuthentication_AuthenticationToken_ReturnsCurrentUser(string scheme, string credentialsTemplate)
+    {
+        // Arrange
+        var login = await SendRequestAsAsync<TokenResult>(request => request
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login { Email = SampleDataService.TEST_USER_EMAIL, Password = SampleDataService.TEST_USER_PASSWORD })
+            .StatusCodeShouldBeOk());
+        Assert.NotNull(login);
+        string credentials = credentialsTemplate.Replace("{token}", login.Token, StringComparison.Ordinal);
+        using var client = CreateHttpClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, "users/me");
+        request.Headers.TryAddWithoutValidation("Authorization", $"{scheme} {Convert.ToBase64String(Encoding.UTF8.GetBytes(credentials))}");
+
+        // Act
+        using var response = await client.SendAsync(request, TestCancellationToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("Basic !!!not-base64!!!")]
+    [InlineData("Basic")]
+    [InlineData("Basic ")]
+    [InlineData("Basic Og==")]
+    [InlineData("Basic ICA6cGFzc3dvcmQ=")]
+    public async Task BasicAuthentication_MalformedHeader_ReturnsUnauthorized(string authorization)
+    {
+        // Arrange
+        using var client = CreateHttpClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, "users/me");
+        request.Headers.TryAddWithoutValidation("Authorization", authorization);
+
+        // Act
+        using var response = await client.SendAsync(request, TestCancellationToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task AuthenticateAsync_InactiveUserToken_ReturnsUnauthorized()
+    {
+        // Arrange
+        const string email = "inactive-token-user@exceptionless.test";
+        const string salt = "1234567890123456";
+
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = TestConstants.UserPassword.ToSaltedHash(salt),
+            Salt = salt,
+            FullName = "Inactive Token User",
+            Roles = AuthorizationRoles.AllScopes
+        };
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        var login = await SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login { Email = email, Password = TestConstants.UserPassword })
+            .StatusCodeShouldBeOk());
+        Assert.NotNull(login);
+        Assert.False(String.IsNullOrEmpty(login.Token));
+
+        var storedUser = await _userRepository.GetByEmailAddressAsync(email);
+        Assert.NotNull(storedUser);
+        await _userRepository.SaveAsync(storedUser with { IsActive = false }, o => o.ImmediateConsistency());
+
+        // Act
+        var response = await SendRequestAsync(r => r
+            .BearerToken(login.Token)
+            .AppendPath("users/me")
+            .StatusCodeShouldBeUnauthorized());
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task BasicAuthentication_PasswordContainingColons_ReturnsCurrentUser()
+    {
+        // Arrange
+        const string password = "Pass:word:1$";
+        var user = await _userRepository.GetByEmailAddressAsync(SampleDataService.TEST_USER_EMAIL);
+        Assert.NotNull(user);
+        Assert.NotNull(user.Salt);
+        user.Password = password.ToSaltedHash(user.Salt);
+        await _userRepository.SaveAsync(user, options => options.ImmediateConsistency());
+
+        // Act
+        var response = await SendRequestAsync(request => request
+            .BasicAuthorization(user.EmailAddress, password).AppendPath("users/me").StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("Basic")]
+    [InlineData("Basic !!!not-base64!!!")]
+    [InlineData("Basic Og==")]
+    public async Task BasicAuthentication_UnparseableCredentials_ReturnsNoResult(string authorization)
+    {
+        // Arrange
+        using var scope = _server.Services.CreateScope();
+        var context = new DefaultHttpContext { RequestServices = scope.ServiceProvider };
+        context.Request.Headers.Authorization = authorization;
+        context.Request.QueryString = new QueryString("?api_key=" + SampleDataService.TEST_API_KEY);
+
+        // Act
+        var result = await context.AuthenticateAsync(ApiKeyAuthenticationOptions.ApiKeySchema);
+
+        // Assert
+        Assert.True(result.None);
+        Assert.Null(result.Failure);
+        Assert.Null(result.Principal);
+    }
+
+    [Fact]
+    public async Task BasicPasswordLogin_AfterRepeatedFailures_IsThrottled()
+    {
+        // Arrange
+        const string email = "basic-throttle-user@exceptionless.test";
+        const string password = "Password1$";
+        const string salt = "1234567890123456";
+
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = password.ToSaltedHash(salt),
+            Salt = salt,
+            FullName = "Basic Throttle User",
+            Roles = AuthorizationRoles.AllScopes
+        };
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            await SendRequestAsync(r => r
+                .BasicAuthorization(email, "wrong-password")
+                .AppendPath("users/me")
+                .StatusCodeShouldBeUnauthorized());
+        }
+
+        // Act
+        var response = await SendRequestAsync(r => r
+            .BasicAuthorization(email, password)
+            .AppendPath("users/me")
+            .StatusCodeShouldBeUnauthorized());
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task BasicPasswordLogin_ConcurrentValidRequests_AllowSubsequentLogin()
+    {
+        // Arrange
+        using var client = _server.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic",
+            Convert.ToBase64String(Encoding.UTF8.GetBytes($"{SampleDataService.TEST_USER_EMAIL}:{SampleDataService.TEST_USER_PASSWORD}")));
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var requests = Enumerable.Range(0, 30).Select(async request =>
+        {
+            await start.Task;
+            using var response = await client.GetAsync("api/v2/users/me", TestCancellationToken);
+            return response.StatusCode;
+        }).ToArray();
+
+        // Act
+        start.SetResult();
+        var results = await Task.WhenAll(requests);
+        using var next = await client.GetAsync("api/v2/users/me", TestCancellationToken);
+
+        // Assert
+        // HTTP bursts can exhaust the bounded admission wait; a later valid login must still work.
+        Assert.Contains(HttpStatusCode.OK, results);
+        Assert.All(results, statusCode => Assert.True(statusCode is HttpStatusCode.OK or HttpStatusCode.Unauthorized));
+        Assert.Equal(HttpStatusCode.OK, next.StatusCode);
+    }
+
+    [Fact]
+    public async Task BasicPasswordLogin_FailuresThroughLogin_AreThrottled()
+    {
+        // Arrange
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            await SendRequestAsync(request => request
+                .Post()
+                .AppendPath("auth/login")
+                .Content(new Login { Email = SampleDataService.TEST_USER_EMAIL, Password = "wrong-password" })
+                .StatusCodeShouldBeUnauthorized());
+        }
+
+        // Act
+        var response = await SendRequestAsync(request => request
+            .BasicAuthorization(SampleDataService.TEST_USER_EMAIL, SampleDataService.TEST_USER_PASSWORD)
+            .AppendPath("users/me")
+            .StatusCodeShouldBeUnauthorized());
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task BasicPasswordLogin_MissingRemoteIpAddress_ReturnsCurrentUser()
+    {
+        // Arrange
+        using var client = _server.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, "api/v2/users/me");
+        string credentials = $"{SampleDataService.TEST_USER_EMAIL}:{SampleDataService.TEST_USER_PASSWORD}";
+        request.Headers.Authorization = new AuthenticationHeaderValue("Basic",
+            Convert.ToBase64String(Encoding.UTF8.GetBytes(credentials)));
+
+        // Act
+        using var response = await client.SendAsync(request, TestCancellationToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(null, "hash")]
+    [InlineData("", "hash")]
+    [InlineData("salt", null)]
+    [InlineData("salt", "")]
+    public async Task BasicPasswordLogin_MissingStoredCredentials_ReturnsUnauthorized(string? salt, string? passwordHash)
+    {
+        // Arrange
+        var user = new User
+        {
+            EmailAddress = "missing-credentials@exceptionless.test",
+            FullName = "Missing Credentials",
+            Salt = salt,
+            Password = passwordHash,
+            Roles = new HashSet<string>([AuthorizationRoles.Client, AuthorizationRoles.User])
+        };
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user, options => options.ImmediateConsistency());
+
+        // Act
+        var response = await SendRequestAsync(request => request
+            .BasicAuthorization(user.EmailAddress, "Password1$")
+            .AppendPath("users/me")
+            .StatusCodeShouldBeUnauthorized());
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PasswordLogin_FailuresThroughBasic_AreThrottled()
+    {
+        // Arrange
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            await SendRequestAsync(request => request
+                .BasicAuthorization(SampleDataService.TEST_USER_EMAIL, "wrong-password")
+                .AppendPath("users/me")
+                .StatusCodeShouldBeUnauthorized());
+        }
+
+        // Act
+        var problem = await SendRequestAsAsync<Microsoft.AspNetCore.Mvc.ProblemDetails>(request => request
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login { Email = SampleDataService.TEST_USER_EMAIL, Password = SampleDataService.TEST_USER_PASSWORD })
+            .StatusCodeShouldBeUnauthorized());
+
+        // Assert: the Svelte login form uses this title to show a rate limit message.
+        Assert.NotNull(problem);
+        Assert.Equal("Login denied.", problem.Title);
+    }
+
+    [Fact]
+    public async Task PasswordLogin_MissingRemoteIpAddress_StillEnforcesUserLimit()
+    {
+        // Arrange
+        using var client = _server.CreateClient();
+        long originalTokenCount = (await _tokenRepository.CountAsync()).Total;
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            using var failedResponse = await client.PostAsJsonAsync("api/v2/auth/login",
+                new Login { Email = SampleDataService.TEST_USER_EMAIL, Password = "wrong-password" },
+                TestCancellationToken);
+            Assert.Equal(HttpStatusCode.Unauthorized, failedResponse.StatusCode);
+        }
+
+        // Act
+        using var response = await client.PostAsJsonAsync("api/v2/auth/login",
+            new Login { Email = SampleDataService.TEST_USER_EMAIL, Password = SampleDataService.TEST_USER_PASSWORD },
+            TestCancellationToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal(originalTokenCount, (await _tokenRepository.CountAsync()).Total);
+    }
+
+    [Fact]
+    public async Task PasswordLogin_ThrottlingExpires_LogsInWithoutPasswordResetOrReactivation()
+    {
+        // Arrange
+        TimeProvider.SetUtcNow(new DateTimeOffset(2026, 1, 1, 12, 14, 0, TimeSpan.Zero));
+        using var client = _server.CreateClient();
+        for (int failure = 0; failure < 5; failure++)
+        {
+            using var response = await client.PostAsJsonAsync("api/v2/auth/login",
+                new Login { Email = SampleDataService.TEST_USER_EMAIL, Password = "wrong-password" },
+                TestCancellationToken);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        }
+        var credentials = new Login { Email = SampleDataService.TEST_USER_EMAIL, Password = SampleDataService.TEST_USER_PASSWORD };
+
+        // Act
+        using var blocked = await client.PostAsJsonAsync("api/v2/auth/login", credentials, TestCancellationToken);
+        var throttledUser = await _userRepository.GetByEmailAddressAsync(credentials.Email);
+        TimeProvider.Advance(TimeSpan.FromMinutes(1));
+        using var allowed = await client.PostAsJsonAsync("api/v2/auth/login", credentials, TestCancellationToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.Unauthorized, blocked.StatusCode);
+        Assert.NotNull(throttledUser);
+        Assert.True(throttledUser.IsActive);
+        Assert.Equal(HttpStatusCode.OK, allowed.StatusCode);
+    }
+
+    [Fact]
+    public async Task ChangePassword_StoredOldTokenSurvivesCleanup_CannotAuthenticate()
+    {
+        // Arrange
+        const string newPassword = "ChangedPassword2$";
+        var login = await SendRequestAsAsync<TokenResult>(r => r.Post().AppendPath("auth/login")
+            .Content(new Login { Email = SampleDataService.TEST_USER_EMAIL, Password = SampleDataService.TEST_USER_PASSWORD })
+            .StatusCodeShouldBeOk());
+        Assert.NotNull(login);
+        var oldToken = await _tokenRepository.GetByIdAsync(login.Token, o => o.Cache(false));
+        Assert.NotNull(oldToken);
+        await SendRequestAsync(r => r.BearerToken(login.Token).AppendPath("users/me").StatusCodeShouldBeOk());
+
+        // Act
+        var changed = await SendRequestAsAsync<TokenResult>(r => r.Post().AppendPath("auth/change-password")
+            .BearerToken(login.Token)
+            .Content(new ChangePasswordModel { CurrentPassword = SampleDataService.TEST_USER_PASSWORD, Password = newPassword })
+            .StatusCodeShouldBeOk());
+        // Retain a record as a failed cleanup would, after warming the authentication cache.
+        await _tokenRepository.AddAsync(oldToken, o => o.ImmediateConsistency());
+
+        // Assert
+        Assert.NotNull(changed);
+        Assert.NotEqual(login.Token, changed.Token);
+        await SendRequestAsync(r => r.BearerToken(login.Token).AppendPath("users/me").StatusCodeShouldBeUnauthorized());
+        await SendRequestAsync(r => r.BearerToken(changed.Token).AppendPath("users/me").StatusCodeShouldBeOk());
+        await SendRequestAsync(r => r.BasicAuthorization("client", login.Token).AppendPath("users/me").StatusCodeShouldBeUnauthorized());
+        var user = await _userRepository.GetByEmailAddressAsync(SampleDataService.TEST_USER_EMAIL);
+        Assert.NotNull(user);
+        Assert.False(String.IsNullOrEmpty(user.AuthenticationVersion));
+        Assert.Equal(user.AuthenticationVersion, (await _tokenRepository.GetByIdAsync(changed.Token))!.AuthenticationVersion);
+    }
+
+    [Fact]
+    public async Task CanChangePasswordAsync()
+    {
+        const string email = "test6@exceptionless.io";
+        const string password = "Test6 password";
+        const string salt = "1234567890123456";
+        string passwordHash = password.ToSaltedHash(salt);
+
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = passwordHash,
+            Salt = salt,
+            FullName = "User 6",
+            Roles = AuthorizationRoles.AllScopes
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login
+            {
+                Email = email,
+                Password = password,
+            })
+            .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.NotEmpty(result.Token);
+
+        var token = await _tokenRepository.GetByIdAsync(result.Token);
+        Assert.NotNull(token);
+
+        Assert.NotNull(token.UserId);
+        var actualUser = await _userRepository.GetByIdAsync(token.UserId);
+        Assert.NotNull(actualUser);
+        Assert.Equal(email, actualUser.EmailAddress);
+        var utcNow = TimeProvider.GetUtcNow().UtcDateTime;
+        var oauthToken = await _oauthTokenRepository.AddAsync(new OAuthToken
+        {
+            Id = ObjectId.GenerateNewId().ToString(),
+            UserId = actualUser.Id,
+            ClientId = "test-change-password-client",
+            GrantId = StringExtensions.GetNewToken(),
+            Resource = "http://localhost:7110/mcp",
+            AccessTokenHash = OAuthService.CreateTokenHash("change-password-oauth-access-token"),
+            RefreshTokenHash = OAuthService.CreateTokenHash("change-password-oauth-refresh-token"),
+            OrganizationIds = [TestConstants.OrganizationId],
+            Scopes = [AuthorizationRoles.McpRead, AuthorizationRoles.OfflineAccess],
+            CreatedBy = actualUser.Id,
+            CreatedUtc = utcNow,
+            UpdatedUtc = utcNow
+        }, o => o.ImmediateConsistency());
+
+        const string newPassword = "NewP@ssword2";
+        var changePasswordResult = await SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .BasicAuthorization(email, password)
+            .AppendPath("auth/change-password")
+            .Content(new ChangePasswordModel
+            {
+                CurrentPassword = password,
+                Password = newPassword
+            })
+            .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(changePasswordResult);
+        Assert.NotEmpty(changePasswordResult.Token);
+
+        Assert.Null(await _tokenRepository.GetByIdAsync(result.Token));
+        Assert.Null(await _oauthTokenRepository.GetByIdAsync(oauthToken.Id, o => o.ImmediateConsistency()));
+        Assert.NotNull(await _tokenRepository.GetByIdAsync(changePasswordResult.Token));
+    }
+
+    [Fact]
+    public async Task ChangePasswordShouldFailWithCurrentPasswordAsync()
+    {
+        const string email = "test6@exceptionless.io";
+        const string password = "Test6 password";
+        const string salt = "1234567890123456";
+        string passwordHash = password.ToSaltedHash(salt);
+
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = passwordHash,
+            Salt = salt,
+            FullName = "User 6",
+            Roles = AuthorizationRoles.AllScopes
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login
+            {
+                Email = email,
+                Password = password,
+            })
+            .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.NotEmpty(result.Token);
+
+        var token = await _tokenRepository.GetByIdAsync(result.Token);
+        Assert.NotNull(token);
+
+        Assert.NotNull(token.UserId);
+        var actualUser = await _userRepository.GetByIdAsync(token.UserId);
+        Assert.NotNull(actualUser);
+        Assert.Equal(email, actualUser.EmailAddress);
+
+        var problemDetails = await SendRequestAsAsync<ValidationProblemDetails>(r => r
+            .Post()
+            .BasicAuthorization(email, password)
+            .AppendPath("auth/change-password")
+            .Content(new ChangePasswordModel
+            {
+                CurrentPassword = password,
+                Password = password
+            })
+            .StatusCodeShouldBeUnprocessableEntity()
+        );
+
+        Assert.NotNull(problemDetails);
+        Assert.Single(problemDetails.Errors);
+        Assert.Contains(problemDetails.Errors, error => String.Equals(error.Key, "password"));
+
+        Assert.NotNull(await _tokenRepository.GetByIdAsync(result.Token));
+    }
+
+    [Fact]
+    public async Task CanResetPasswordAsync()
+    {
+        const string email = "test6@exceptionless.io";
+        const string password = "Test6 password";
+        const string salt = "1234567890123456";
+        string passwordHash = password.ToSaltedHash(salt);
+
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = passwordHash,
+            Salt = salt,
+            FullName = "User 6",
+            Roles = AuthorizationRoles.AllScopes
+        };
+
+        user.MarkEmailAddressVerified();
+        user.CreatePasswordResetToken(TimeProvider);
+        Assert.NotNull(user.PasswordResetToken);
+        Assert.True(user.PasswordResetTokenExpiration.IsAfter(TimeProvider.GetUtcNow().UtcDateTime));
+
+        await _userRepository.AddAsync(user);
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login
+            {
+                Email = email,
+                Password = password,
+            })
+            .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.NotEmpty(result.Token);
+
+        var token = await _tokenRepository.GetByIdAsync(result.Token);
+        Assert.NotNull(token);
+
+        Assert.NotNull(token.UserId);
+        var actualUser = await _userRepository.GetByIdAsync(token.UserId);
+        Assert.NotNull(actualUser);
+        Assert.Equal(email, actualUser.EmailAddress);
+        var utcNow = TimeProvider.GetUtcNow().UtcDateTime;
+        var oauthToken = await _oauthTokenRepository.AddAsync(new OAuthToken
+        {
+            Id = ObjectId.GenerateNewId().ToString(),
+            UserId = actualUser.Id,
+            ClientId = "test-change-password-client",
+            GrantId = StringExtensions.GetNewToken(),
+            Resource = "http://localhost:7110/mcp",
+            AccessTokenHash = OAuthService.CreateTokenHash("change-password-oauth-access-token"),
+            RefreshTokenHash = OAuthService.CreateTokenHash("change-password-oauth-refresh-token"),
+            OrganizationIds = [TestConstants.OrganizationId],
+            Scopes = [AuthorizationRoles.McpRead, AuthorizationRoles.OfflineAccess],
+            CreatedBy = actualUser.Id,
+            CreatedUtc = utcNow,
+            UpdatedUtc = utcNow
+        }, o => o.ImmediateConsistency());
+
+        const string newPassword = "NewP@ssword2";
+        await SendRequestAsync(r => r
+            .Post()
+            .BasicAuthorization(email, password)
+            .AppendPath("auth/reset-password")
+            .Content(new ResetPasswordModel
+            {
+                PasswordResetToken = user.PasswordResetToken,
+                Password = newPassword
+            })
+            .StatusCodeShouldBeOk()
+        );
+
+        Assert.Null(await _tokenRepository.GetByIdAsync(result.Token));
+        Assert.Null(await _oauthTokenRepository.GetByIdAsync(oauthToken.Id, o => o.ImmediateConsistency()));
+    }
+
+    [Fact]
+    public async Task ResetPasswordShouldFailWithCurrentPasswordAsync()
+    {
+        const string email = "test6@exceptionless.io";
+        const string password = "Test6 password";
+        const string salt = "1234567890123456";
+        string passwordHash = password.ToSaltedHash(salt);
+
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = passwordHash,
+            Salt = salt,
+            FullName = "User 6",
+            Roles = AuthorizationRoles.AllScopes
+        };
+
+        user.MarkEmailAddressVerified();
+        user.CreatePasswordResetToken(TimeProvider);
+        Assert.NotNull(user.PasswordResetToken);
+        Assert.True(user.PasswordResetTokenExpiration.IsAfter(TimeProvider.GetUtcNow().UtcDateTime));
+
+        await _userRepository.AddAsync(user);
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login
+            {
+                Email = email,
+                Password = password,
+            })
+            .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+        Assert.NotEmpty(result.Token);
+
+        var token = await _tokenRepository.GetByIdAsync(result.Token);
+        Assert.NotNull(token);
+
+        Assert.NotNull(token.UserId);
+        var actualUser = await _userRepository.GetByIdAsync(token.UserId);
+        Assert.NotNull(actualUser);
+        Assert.Equal(email, actualUser.EmailAddress);
+
+        var problemDetails = await SendRequestAsAsync<ValidationProblemDetails>(r => r
+            .Post()
+            .BasicAuthorization(email, password)
+            .AppendPath("auth/reset-password")
+            .Content(new ResetPasswordModel
+            {
+                PasswordResetToken = user.PasswordResetToken,
+                Password = password
+            })
+            .StatusCodeShouldBeUnprocessableEntity()
+        );
+
+        Assert.NotNull(problemDetails);
+        Assert.Single(problemDetails.Errors);
+        Assert.Contains(problemDetails.Errors, error => String.Equals(error.Key, "password"));
+
+        Assert.NotNull(await _tokenRepository.GetByIdAsync(result.Token));
+    }
+
+    [Fact]
+    public async Task ResetPassword_MissingRemoteIpAddress_ClearsUserLoginAttempts()
+    {
+        // Arrange
+        var user = await _userRepository.GetByEmailAddressAsync(SampleDataService.TEST_USER_EMAIL);
+        Assert.NotNull(user);
+        user.CreatePasswordResetToken(TimeProvider);
+        Assert.NotNull(user.PasswordResetToken);
+        await _userRepository.SaveAsync(user, options => options.ImmediateConsistency());
+        var authService = GetService<AuthService>();
+        for (int failure = 0; failure < 5; failure++)
+        {
+            await using var loginAttempt = await authService.TryBeginLoginAsync(user.EmailAddress, "192.0.2.1", TestCancellationToken);
+            Assert.NotNull(loginAttempt);
+            await authService.RecordLoginFailureAsync(loginAttempt);
+        }
+        using var client = _server.CreateClient();
+
+        // Act
+        using var response = await client.PostAsJsonAsync("api/v2/auth/reset-password",
+            new ResetPasswordModel { PasswordResetToken = user.PasswordResetToken, Password = "Password2$" },
+            GetService<JsonSerializerOptions>(),
+            TestCancellationToken);
+        await using var loginAttemptAfterReset = await authService.TryBeginLoginAsync(user.EmailAddress, "192.0.2.1", TestCancellationToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.NotNull(loginAttemptAfterReset);
+    }
+
+    [Theory]
+    [InlineData(false, HttpStatusCode.Unauthorized)]
+    [InlineData(true, HttpStatusCode.OK)]
+    public async Task ResetPassword_PreservesActiveState_OnlyActiveUsersCanLogIn(bool isActive, HttpStatusCode expectedStatus)
+    {
+        // Arrange
+        var user = await _userRepository.GetByEmailAddressAsync(SampleDataService.TEST_USER_EMAIL);
+        Assert.NotNull(user);
+        user = user with { IsActive = isActive };
+        user.CreatePasswordResetToken(TimeProvider);
+        Assert.NotNull(user.PasswordResetToken);
+        await _userRepository.SaveAsync(user, options => options.ImmediateConsistency());
+        using var client = _server.CreateClient();
+        const string newPassword = "Password2$";
+
+        // Act
+        using var reset = await client.PostAsJsonAsync("api/v2/auth/reset-password",
+            new ResetPasswordModel { PasswordResetToken = user.PasswordResetToken, Password = newPassword },
+            GetService<JsonSerializerOptions>(), TestCancellationToken);
+        var storedUser = await _userRepository.GetByIdAsync(user.Id, options => options.ImmediateConsistency());
+        using var login = await client.PostAsJsonAsync("api/v2/auth/login",
+            new Login { Email = user.EmailAddress, Password = newPassword }, TestCancellationToken);
+        using var basicRequest = new HttpRequestMessage(HttpMethod.Get, "api/v2/users/me");
+        basicRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic",
+            Convert.ToBase64String(Encoding.UTF8.GetBytes($"{user.EmailAddress}:{newPassword}")));
+        using var basicLogin = await client.SendAsync(basicRequest, TestCancellationToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, reset.StatusCode);
+        Assert.NotNull(storedUser);
+        Assert.Equal(isActive, storedUser.IsActive);
+        Assert.True(storedUser.IsCorrectPassword(newPassword));
+        Assert.Equal(expectedStatus, login.StatusCode);
+        Assert.Equal(expectedStatus, basicLogin.StatusCode);
+    }
+
+    [Fact]
+    public async Task ForgotPasswordCreatesResetTokenAsync()
+    {
+        const string email = "forgot-password@exceptionless.io";
+        var user = new User
+        {
+            EmailAddress = email,
+            FullName = "Forgot Password",
+            Roles = AuthorizationRoles.AllScopes
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        await SendRequestAsync(r => r
+            .AppendPath($"auth/forgot-password/{email}")
+            .StatusCodeShouldBeOk()
+        );
+
+        var updatedUser = await _userRepository.GetByEmailAddressAsync(email);
+        Assert.NotNull(updatedUser);
+        Assert.False(String.IsNullOrEmpty(updatedUser.PasswordResetToken));
+        Assert.True(updatedUser.PasswordResetTokenExpiration.IsAfter(TimeProvider.GetUtcNow().UtcDateTime));
+    }
+
+    [Fact]
+    public Task ForgotPasswordForUnknownEmailReturnsOkAsync()
+    {
+        return SendRequestAsync(r => r
+            .AppendPath("auth/forgot-password/missing-password-user@exceptionless.io")
+            .StatusCodeShouldBeOk()
+        );
+    }
+
+    [Fact]
+    public async Task CancelResetPasswordAsync_WithNonJsonBody_ReturnsUnsupportedMediaType()
+    {
+        // Arrange
+        const string token = "test-token";
+
+        // Act
+        using var response = await SendRequestAsync(r => r
+            .Post()
+            .AppendPath($"auth/cancel-reset-password/{token}")
+            .Content("ignored", "text/plain")
+            .ExpectedStatus(HttpStatusCode.UnsupportedMediaType));
+
+        // Assert
+        Assert.Equal(HttpStatusCode.UnsupportedMediaType, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task CancelResetPasswordClearsTokenAsync()
+    {
+        const string email = "cancel-reset-password@exceptionless.io";
+        var user = new User
+        {
+            EmailAddress = email,
+            FullName = "Cancel Reset Password",
+            Roles = AuthorizationRoles.AllScopes
+        };
+
+        user.MarkEmailAddressVerified();
+        user.CreatePasswordResetToken(TimeProvider);
+        string token = user.PasswordResetToken!;
+        await _userRepository.AddAsync(user);
+
+        await SendRequestAsync(r => r
+            .Post()
+            .AppendPath($"auth/cancel-reset-password/{token}")
+            .StatusCodeShouldBeOk()
+        );
+
+        var updatedUser = await _userRepository.GetByEmailAddressAsync(email);
+        Assert.NotNull(updatedUser);
+        Assert.Null(updatedUser.PasswordResetToken);
+        Assert.Equal(DateTime.MinValue, updatedUser.PasswordResetTokenExpiration);
+    }
+
+    [Fact]
+    public async Task EmailAddressAvailabilityReturnsCreatedForExistingUserAsync()
+    {
+        const string email = "existing-email-check@exceptionless.io";
+        var user = new User
+        {
+            EmailAddress = email,
+            FullName = "Existing Email Check",
+            Roles = AuthorizationRoles.AllScopes
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        await SendRequestAsync(r => r
+            .AppendPath($"auth/check-email-address/{email}")
+            .StatusCodeShouldBeCreated()
+        );
+    }
+
+    [Fact]
+    public Task EmailAddressAvailabilityReturnsNoContentForMissingUserAsync()
+    {
+        return SendRequestAsync(r => r
+            .AppendPath("auth/check-email-address/missing-email-check@exceptionless.io")
+            .StatusCodeShouldBeNoContent()
+        );
+    }
+
+    [Fact]
+    public async Task CanLogoutUserAsync()
+    {
+        const string email = "test7@exceptionless.io";
+        const string password = "Test7 password";
+        const string salt = "1234567890123456";
+        string passwordHash = password.ToSaltedHash(salt);
+
+        var user = new User
+        {
+            EmailAddress = email,
+            Password = passwordHash,
+            Salt = salt,
+            FullName = "User 7",
+            Roles = AuthorizationRoles.AllScopes
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user);
+
+        var result = await SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login
+            {
+                Email = email,
+                Password = password,
+            })
+            .StatusCodeShouldBeOk()
+        );
+
+        Assert.NotNull(result);
+
+        // Verify that the token is valid
+        var token = await _tokenRepository.GetByIdAsync(result.Token);
+        Assert.NotNull(token);
+        Assert.Equal(TokenType.Authentication, token.Type);
+        Assert.False(token.IsDisabled);
+        Assert.False(token.IsSuspended);
+
+        await SendRequestAsync(r => r
+            .BearerToken(result.Token)
+            .AppendPath("auth/logout")
+            .StatusCodeShouldBeOk()
+        );
+
+        token = await _tokenRepository.GetByIdAsync(result.Token);
+        Assert.Null(token);
+    }
+
+    [Fact]
+    public async Task CanLogoutUserAccessTokenAsync()
+    {
+        var token = await _tokenRepository.GetByIdAsync(TestConstants.UserApiKey);
+        Assert.NotNull(token);
+        Assert.Equal(TokenType.Access, token.Type);
+        Assert.False(token.IsDisabled);
+        Assert.False(token.IsSuspended);
+
+        await SendRequestAsync(r => r
+            .BearerToken(token.Id)
+            .AppendPath("auth/logout")
+            .StatusCodeShouldBeForbidden()
+        );
+
+        token = (await _tokenRepository.GetByIdAsync(token.Id))!;
+        Assert.NotNull(token);
+        Assert.Equal(TokenType.Access, token.Type);
+        Assert.False(token.IsDisabled);
+        Assert.False(token.IsSuspended);
+    }
+
+
+    [Fact]
+    public async Task GetIntercomToken_WithValidAuthenticatedUser_ReturnsJwtAsync()
+    {
+        // Arrange
+        _intercomOptions.IntercomSecret = "test-intercom-secret-with-adequate-length-12345";
+        const string email = "intercom-token@exceptionless.io";
+        const string password = "Test password";
+        const string salt = "1234567890123456";
+        var issuedAt = new DateTimeOffset(2026, 3, 19, 12, 0, 0, TimeSpan.Zero);
+
+        TimeProvider.SetUtcNow(issuedAt);
+
+        var user = new User
+        {
+            EmailAddress = email,
+            FullName = "Intercom User",
+            Password = password.ToSaltedHash(salt),
+            Roles = AuthorizationRoles.AllScopes,
+            Salt = salt
+        };
+
+        user.MarkEmailAddressVerified();
+        await _userRepository.AddAsync(user, o => o.ImmediateConsistency());
+
+        var authToken = await SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .AppendPath("auth/login")
+            .Content(new Login
+            {
+                Email = email,
+                Password = password
+            })
+            .StatusCodeShouldBeOk()
+        );
+        Assert.NotNull(authToken);
+
+        // Act
+        var intercomToken = await SendRequestAsAsync<TokenResult>(r => r
+            .BearerToken(authToken.Token)
+            .AppendPath("auth/intercom")
+            .StatusCodeShouldBeOk()
+        );
+
+        // Assert
+        Assert.NotNull(intercomToken);
+        var jwt = new JwtSecurityTokenHandler().ReadJwtToken(intercomToken.Token);
+        Assert.Equal(user.Id, jwt.Payload["user_id"]);
+        Assert.Equal(issuedAt.UtcDateTime, jwt.Payload.IssuedAt);
+        Assert.Equal(issuedAt.AddHours(1).ToUnixTimeSeconds(), jwt.Payload.Expiration);
+    }
+
+    [Fact]
+    public Task GetIntercomToken_WhenUnauthenticated_ReturnsUnauthorizedAsync()
+    {
+        // Arrange
+        _intercomOptions.IntercomSecret = "test-intercom-secret-with-adequate-length-12345";
+
+        // Act
+        return SendRequestAsync(r => r
+            .AppendPath("auth/intercom")
+            .StatusCodeShouldBeUnauthorized()
+        );
+    }
+
+    [Fact]
+    public async Task GetIntercomToken_WhenIntercomIsDisabled_ReturnsUnprocessableEntityAsync()
+    {
+        // Arrange
+        _intercomOptions.IntercomSecret = null;
+
+        // Act
+        var problemDetails = await SendRequestAsAsync<ValidationProblemDetails>(r => r
+            .BearerToken(TestConstants.UserApiKey)
+            .AppendPath("auth/intercom")
+            .StatusCodeShouldBeUnprocessableEntity()
+        );
+
+        // Assert
+        Assert.NotNull(problemDetails);
+        Assert.True(problemDetails.Errors.TryGetValue("intercom", out string[]? intercomErrors));
+        Assert.Contains("Intercom is not enabled.", intercomErrors);
+    }
+
+    [Fact]
+    public async Task CanLogoutClientAccessTokenAsync()
+    {
+        var token = await _tokenRepository.GetByIdAsync(TestConstants.ApiKey);
+        Assert.NotNull(token);
+        Assert.Equal(TokenType.Access, token.Type);
+        Assert.False(token.IsDisabled);
+        Assert.False(token.IsSuspended);
+
+        await SendRequestAsync(r => r
+            .BearerToken(token.Id)
+            .AppendPath("auth/logout")
+            .StatusCodeShouldBeForbidden()
+        );
+
+        token = (await _tokenRepository.GetByIdAsync(token.Id))!;
+        Assert.NotNull(token);
+        Assert.Equal(TokenType.Access, token.Type);
+        Assert.False(token.IsDisabled);
+        Assert.False(token.IsSuspended);
+    }
+
+    private async Task AssertExternalLoginAsync(TokenResult? result, string providerName, string providerUserId, bool isEmailVerified = true)
+    {
+        Assert.NotNull(result);
+        Assert.False(String.IsNullOrEmpty(result.Token));
+
+        var user = await _userRepository.GetByEmailAddressAsync(TestOAuthProviderClient.GetEmailAddress(providerUserId));
+        Assert.NotNull(user);
+        Assert.Equal(isEmailVerified, user.IsEmailAddressVerified);
+        var account = Assert.Single(user.OAuthAccounts);
+        Assert.Equal(providerName, account.Provider);
+        Assert.Equal(providerUserId, account.ProviderUserId);
+        Assert.Equal(user.EmailAddress, account.Username);
+    }
+
+    private Task<TokenResult?> SendExternalLoginAsync(string providerPath, string code, string? inviteToken = null)
+    {
+        return SendRequestAsAsync<TokenResult>(r => r
+            .Post()
+            .AppendPaths("auth", providerPath)
+            .Content(new ExternalAuthInfo
+            {
+                ClientId = "client-id",
+                Code = code,
+                InviteToken = inviteToken,
+                RedirectUri = "http://localhost/callback"
+            })
+            .StatusCodeShouldBeOk()
+        );
+    }
+
+    private sealed record AuthOptionsState(
+        bool EnableAccountCreation,
+        bool EnableActiveDirectoryAuth,
+        string? GitHubId,
+        string? GitHubSecret,
+        string? GoogleId,
+        string? GoogleSecret,
+        string? MicrosoftId,
+        string? MicrosoftSecret
+    )
+    {
+        public static AuthOptionsState Capture(AuthOptions options)
+        {
+            return new AuthOptionsState(
+                options.EnableAccountCreation,
+                options.EnableActiveDirectoryAuth,
+                options.GitHubId,
+                options.GitHubSecret,
+                options.GoogleId,
+                options.GoogleSecret,
+                options.MicrosoftId,
+                options.MicrosoftSecret);
+        }
+
+        public void Apply(AuthOptions options)
+        {
+            options.EnableAccountCreation = EnableAccountCreation;
+            options.EnableActiveDirectoryAuth = EnableActiveDirectoryAuth;
+            options.GitHubId = GitHubId;
+            options.GitHubSecret = GitHubSecret;
+            options.GoogleId = GoogleId;
+            options.GoogleSecret = GoogleSecret;
+            options.MicrosoftId = MicrosoftId;
+            options.MicrosoftSecret = MicrosoftSecret;
+        }
+    }
+}

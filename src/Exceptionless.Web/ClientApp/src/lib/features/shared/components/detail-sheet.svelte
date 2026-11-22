@@ -1,0 +1,310 @@
+<script lang="ts">
+    import type { Snippet } from 'svelte';
+
+    import { browser } from '$app/env';
+    import { beforeNavigate, goto } from '$app/navigation';
+    import { page } from '$app/state';
+    import Copy from '@lucide/svelte/icons/copy';
+    import ExternalLink from '@lucide/svelte/icons/external-link';
+    import { onMount, untrack } from 'svelte';
+    import { toast } from 'svelte-sonner';
+
+    import { Button } from '#comp/ui/button/index.ts';
+    import * as Sheet from '#comp/ui/sheet/index.ts';
+    import { UseClipboard } from '#lib/hooks/use-clipboard.svelte.ts';
+
+    import {
+        type DetailSheetHistoryEntry,
+        detailSheetHistoryStateKey,
+        getDetailSheetHistoryEntry,
+        type ShallowHistoryUpdate,
+        updateShallowHistory,
+        waitForShallowHistory,
+        withoutDetailSheetHistoryEntry
+    } from '../history-state';
+    import { getHistoryTraversalCount } from '../history-traversal';
+    import { preserveDetailSheetForAssistant } from './detail-sheet-interaction';
+
+    interface LinkNavigationOptions {
+        replace?: boolean;
+        reset?: boolean;
+    }
+
+    interface PendingNavigation {
+        options?: LinkNavigationOptions;
+        url: URL;
+    }
+
+    interface Props {
+        actions?: Snippet;
+        children: Snippet;
+        detailsHref: string;
+        historyKey: string;
+        historyValue: null | string | undefined;
+        onClose: () => void;
+        onOpen: (historyValue: string) => void;
+        open: boolean;
+        title: string;
+    }
+
+    let { actions, children, detailsHref, historyKey, historyValue, onClose, onOpen, open, title }: Props = $props();
+    let historyEntryUrl: string | undefined;
+    let historyEntryValue: string | undefined;
+    let historyReady = $state(false);
+    // Back and Forward are handled once SvelteKit has applied the destination's page state.
+    let handledHistoryTraversals = getHistoryTraversalCount();
+    let ownsHistoryEntry = false;
+    let parentCloseTimer: number | undefined;
+    let pendingNavigation: PendingNavigation | undefined;
+    let selectedLinkNavigationOptions: LinkNavigationOptions | undefined;
+    let wasOpen = false;
+    const clipboard = new UseClipboard();
+
+    function clearOwnedHistoryEntry(): void {
+        historyEntryUrl = undefined;
+        historyEntryValue = undefined;
+        ownsHistoryEntry = false;
+    }
+
+    function consumeOwnedHistoryEntry(): void {
+        if (!browser || !ownsHistoryEntry) {
+            return;
+        }
+
+        const shouldTraverseBack = historyEntryUrl === getBrowserUrl();
+        clearOwnedHistoryEntry();
+        if (shouldTraverseBack) {
+            window.history.back();
+        }
+    }
+
+    async function copyDetailsLink(): Promise<void> {
+        await clipboard.copy(new URL(detailsHref, window.location.href).href);
+        if (clipboard.copied) {
+            toast.success(`${title} link copied`);
+        } else {
+            toast.error(`Unable to copy ${title.toLowerCase()} link`);
+        }
+    }
+
+    function getBrowserUrl(): string {
+        return `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    }
+
+    function getCurrentHistoryEntry(): DetailSheetHistoryEntry | undefined {
+        return getDetailSheetHistoryEntry(page.state, historyKey);
+    }
+
+    function getLinkNavigationOptions(link: HTMLAnchorElement): LinkNavigationOptions | undefined {
+        function getOption(name: string): boolean | undefined {
+            let element: Element | null = link;
+            while (element && element !== document.documentElement) {
+                const value = element.getAttribute(`data-sveltekit-${name}`);
+                if (value !== null) {
+                    return value === '' || value === 'true' ? true : value === 'false' ? false : undefined;
+                }
+
+                element = element.parentElement;
+            }
+
+            return undefined;
+        }
+
+        const options: LinkNavigationOptions = {
+            replace: getOption('replacestate'),
+            reset: getOption('reset')
+        };
+
+        return Object.values(options).some((value) => value !== undefined) ? options : undefined;
+    }
+
+    function handleHistoryTraversal(): void {
+        if (pendingNavigation) {
+            const navigation = pendingNavigation;
+            pendingNavigation = undefined;
+            wasOpen = false;
+            if (navigation.options) {
+                void goto(navigation.url, navigation.options);
+            } else {
+                void goto(navigation.url);
+            }
+
+            onClose();
+            return;
+        }
+
+        const entry = getCurrentHistoryEntry();
+        if (entry) {
+            restoreOwnedHistoryEntry(entry);
+            return;
+        }
+
+        if (!open || !ownsHistoryEntry) {
+            return;
+        }
+
+        clearOwnedHistoryEntry();
+        wasOpen = false;
+        onClose();
+    }
+
+    function handleOpenChange(nextOpen: boolean) {
+        if (!nextOpen) {
+            consumeOwnedHistoryEntry();
+            onClose();
+        }
+    }
+
+    function restoreOwnedHistoryEntry(entry: DetailSheetHistoryEntry): void {
+        historyEntryUrl = getBrowserUrl();
+        historyEntryValue = entry.value;
+        ownsHistoryEntry = true;
+        wasOpen = true;
+
+        if (!open || historyValue !== entry.value) {
+            onOpen(entry.value);
+        }
+    }
+
+    function withHistoryEntry(value: string): NonNullable<ShallowHistoryUpdate['state']> {
+        return (state) => ({
+            ...state,
+            [detailSheetHistoryStateKey]: {
+                key: historyKey,
+                value
+            } satisfies DetailSheetHistoryEntry
+        });
+    }
+
+    beforeNavigate(({ cancel, shallow, to, type, willUnload }) => {
+        if (shallow && type === 'goto') {
+            return;
+        }
+
+        if (willUnload || !browser || type === 'popstate' || !ownsHistoryEntry || !to || historyEntryUrl !== getBrowserUrl()) {
+            return;
+        }
+
+        pendingNavigation = {
+            options: type === 'link' ? selectedLinkNavigationOptions : undefined,
+            url: to.url
+        };
+        cancel();
+        clearOwnedHistoryEntry();
+        window.history.back();
+    });
+
+    $effect(() => {
+        // Tracks the entry's page state, which SvelteKit applies when Back or Forward traverses history.
+        void page.state;
+        untrack(() => {
+            const traversals = getHistoryTraversalCount();
+            if (traversals !== handledHistoryTraversals) {
+                handledHistoryTraversals = traversals;
+                handleHistoryTraversal();
+            }
+        });
+    });
+
+    onMount(() => {
+        function handleDocumentClick(event: MouseEvent): void {
+            const link = event.composedPath().find((target): target is HTMLAnchorElement => target instanceof HTMLAnchorElement);
+            selectedLinkNavigationOptions = link ? getLinkNavigationOptions(link) : undefined;
+        }
+
+        document.addEventListener('click', handleDocumentClick, true);
+
+        // Page state is restored with its history entry, including after a reload.
+        const entry = getCurrentHistoryEntry();
+        if (entry) {
+            restoreOwnedHistoryEntry(entry);
+        }
+
+        historyReady = true;
+        return () => {
+            document.removeEventListener('click', handleDocumentClick, true);
+            window.clearTimeout(parentCloseTimer);
+        };
+    });
+
+    $effect(() => {
+        if (!browser || !historyReady) {
+            return;
+        }
+
+        if (open && historyValue && !wasOpen) {
+            window.clearTimeout(parentCloseTimer);
+            void updateShallowHistory({
+                state: withHistoryEntry(historyValue)
+            });
+            historyEntryUrl = getBrowserUrl();
+            historyEntryValue = historyValue;
+            ownsHistoryEntry = true;
+        } else if (open && historyValue && ownsHistoryEntry && historyEntryValue !== historyValue) {
+            void updateShallowHistory({
+                replace: true,
+                state: withHistoryEntry(historyValue)
+            });
+            historyEntryValue = historyValue;
+        } else if (!open && wasOpen) {
+            // Parent-driven closes can be followed immediately by a URL update (for
+            // example, applying a filter from the sheet). Wait for that update, then
+            // either consume an unchanged same-URL entry or clear the marker while
+            // preserving the newer browser URL.
+            parentCloseTimer = window.setTimeout(async () => {
+                await waitForShallowHistory();
+                const currentEntry = getCurrentHistoryEntry();
+                const shouldTraverseBack = ownsHistoryEntry && currentEntry?.value === historyEntryValue && historyEntryUrl === getBrowserUrl();
+
+                if (shouldTraverseBack) {
+                    clearOwnedHistoryEntry();
+                    window.history.back();
+                } else {
+                    if (ownsHistoryEntry && currentEntry?.value === historyEntryValue) {
+                        void updateShallowHistory({
+                            replace: true,
+                            state: withoutDetailSheetHistoryEntry
+                        });
+                    }
+
+                    clearOwnedHistoryEntry();
+                }
+            }, 0);
+        }
+
+        wasOpen = open;
+    });
+</script>
+
+<Sheet.Root onOpenChange={handleOpenChange} {open}>
+    <Sheet.Content
+        class="bg-background top-15.25! bottom-0! z-40 h-auto! w-[calc(100%-1rem)]! scrollbar-gutter-stable gap-0 overflow-y-auto rounded-l-lg border-l text-base shadow-2xl duration-150 ease-out will-change-transform sm:max-w-full! md:w-5/6!"
+        onInteractOutside={preserveDetailSheetForAssistant}
+        overlayProps={{
+            class: 'top-15.25! z-40 bg-black/5 dark:bg-black/40 supports-backdrop-filter:backdrop-blur-[0.5px]'
+        }}
+        preventScroll={false}
+    >
+        <div class="absolute top-3 right-12 z-10 flex items-center gap-1">
+            {@render actions?.()}
+            <Button
+                aria-label={`Copy ${title.toLowerCase()} link`}
+                onclick={copyDetailsLink}
+                size="icon-sm"
+                title={`Copy ${title.toLowerCase()} link`}
+                variant="ghost"
+            >
+                <Copy aria-hidden="true" />
+            </Button>
+            <Button aria-label="Open details in new window" href={detailsHref} size="icon-sm" title="Open in new window" variant="ghost">
+                <ExternalLink aria-hidden="true" />
+            </Button>
+        </div>
+        <Sheet.Header class="sr-only">
+            <Sheet.Title level={3}>{title}</Sheet.Title>
+        </Sheet.Header>
+        <div class="px-4 pt-4 pb-4">
+            {@render children()}
+        </div>
+    </Sheet.Content>
+</Sheet.Root>

@@ -1,16 +1,18 @@
-﻿using System;
-using Exceptionless.Core.Utility;
+﻿using Exceptionless.Core.Utility;
 
-namespace Exceptionless.Insulation {
-    public class ExceptionlessClientCoreLastReferenceIdManager : ICoreLastReferenceIdManager {
-        private readonly ExceptionlessClient _client;
+namespace Exceptionless.Insulation;
 
-        public ExceptionlessClientCoreLastReferenceIdManager(ExceptionlessClient client) {
-            _client = client;
-        }
+public class ExceptionlessClientCoreLastReferenceIdManager : ICoreLastReferenceIdManager
+{
+    private readonly ExceptionlessClient _client;
 
-        public string GetLastReferenceId() {
-            return _client.GetLastReferenceId();
-        }
+    public ExceptionlessClientCoreLastReferenceIdManager(ExceptionlessClient client)
+    {
+        _client = client;
+    }
+
+    public string GetLastReferenceId()
+    {
+        return _client.GetLastReferenceId();
     }
 }

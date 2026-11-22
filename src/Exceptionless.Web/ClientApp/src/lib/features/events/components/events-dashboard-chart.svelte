@@ -1,0 +1,101 @@
+<script lang="ts">
+    import { scaleUtc } from 'd3-scale';
+    import { curveLinear } from 'd3-shape';
+    import { AreaChart } from 'layerchart';
+
+    import * as Chart from '#comp/ui/chart/index.ts';
+    import { Skeleton } from '#comp/ui/skeleton/index.ts';
+    import { formatDateLabel } from '#features/shared/dates.ts';
+
+    type ChartDataPoint = {
+        date: Date;
+        events: number;
+        stacks: number;
+    };
+
+    let {
+        class: className = '',
+        data,
+        isLoading = false,
+        onRangeSelect
+    }: {
+        class?: string;
+        data: ChartDataPoint[];
+        isLoading?: boolean;
+        onRangeSelect?: (start: Date, end: Date) => void;
+    } = $props();
+
+    const chartConfig = {
+        events: {
+            color: 'var(--chart-1)',
+            label: 'Events'
+        },
+        stacks: {
+            color: 'var(--chart-2)',
+            label: 'Stacks'
+        }
+    } satisfies Chart.ChartConfig;
+
+    const series = [
+        {
+            color: chartConfig.stacks.color,
+            key: 'stacks',
+            label: 'Stacks'
+        },
+        {
+            color: chartConfig.events.color,
+            key: 'events',
+            label: 'Events'
+        }
+    ];
+</script>
+
+<Chart.Shell class={className}>
+    {#if isLoading}
+        <Skeleton class="h-16 w-full rounded" />
+    {:else}
+        <Chart.Container config={chartConfig} class="h-16 w-full">
+            <AreaChart
+                {data}
+                x="date"
+                xScale={scaleUtc()}
+                yDomain={[0, Math.max(1, Math.max(...data.map((d) => d.events)))]}
+                {series}
+                seriesLayout="overlap"
+                axis={false}
+                grid={false}
+                brush={{
+                    onBrushEnd: (e) => {
+                        if (!e.brush.active) {
+                            return;
+                        }
+
+                        const [start, end] = e.brush.x;
+                        if (start instanceof Date && end instanceof Date) {
+                            onRangeSelect?.(start, end);
+                        }
+                    }
+                }}
+                props={{
+                    area: {
+                        curve: curveLinear
+                    },
+                    canvas: {
+                        class: 'cursor-crosshair'
+                    },
+                    svg: {
+                        class: 'cursor-crosshair'
+                    }
+                }}
+            >
+                {#snippet tooltip()}
+                    <Chart.Tooltip
+                        class="min-w-62.5"
+                        indicator="line"
+                        labelFormatter={(v) => formatDateLabel(v instanceof Date ? v : new Date(v as number | string))}
+                    />
+                {/snippet}
+            </AreaChart>
+        </Chart.Container>
+    {/if}
+</Chart.Shell>

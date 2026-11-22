@@ -1,16 +1,12 @@
-﻿using System;
+﻿namespace Exceptionless.Core.Models;
 
-namespace Exceptionless.Core.Models {
-    public class ClientConfiguration {
-        public ClientConfiguration() {
-            Settings = new SettingsDictionary();
-        }
+public class ClientConfiguration
+{
+    public int Version { get; set; }
+    public SettingsDictionary Settings { get; init; } = new();
 
-        public int Version { get; set; }
-        public SettingsDictionary Settings { get; private set; }
-
-        public void IncrementVersion() {
-            Version++;
-        }
+    public void IncrementVersion()
+    {
+        Version++;
     }
 }

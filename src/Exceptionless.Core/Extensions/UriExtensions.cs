@@ -1,27 +1,33 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Collections.Specialized;
-using System.Linq;
+﻿using System.Collections.Specialized;
 
-namespace Exceptionless.Core.Extensions {
-    public static class UriExtensions {
-        public static string ToQueryString(this NameValueCollection collection) {
-            return collection.AsKeyValuePairs().ToQueryString();
-        }
+namespace Exceptionless.Core.Extensions;
 
-        public static string ToQueryString(this IEnumerable<KeyValuePair<string, string>> collection) {
-            return collection.ToConcatenatedString(pair => pair.Key == null ? pair.Value : $"{pair.Key}={Uri.EscapeDataString(pair.Value)}", "&");
-        }
+public static class UriExtensions
+{
+    public static string GetOrigin(this string url) => new Uri(url).GetOrigin();
 
-        /// <summary>
-        /// Converts the legacy NameValueCollection into a strongly-typed KeyValuePair sequence.
-        /// </summary>
-        private static IEnumerable<KeyValuePair<string, string>> AsKeyValuePairs(this NameValueCollection collection) {
-            return collection.AllKeys.Select(key => new KeyValuePair<string, string>(key, collection.Get(key)));
-        }
+    public static string GetOrigin(this Uri uri) => uri.GetLeftPart(UriPartial.Authority);
 
-        public static string GetBaseUrl(this Uri uri) {
-            return uri.Scheme + "://" + uri.Authority + uri.AbsolutePath;
-        }		
+    public static string ToQueryString(this NameValueCollection collection)
+    {
+        return collection.AsKeyValuePairs().ToQueryString();
+    }
+
+    public static string ToQueryString(this IEnumerable<KeyValuePair<string?, string?>> collection)
+    {
+        return collection.ToConcatenatedString(pair => pair.Key is null ? pair.Value : $"{pair.Key}={Uri.EscapeDataString(pair.Value ?? String.Empty)}", "&");
+    }
+
+    /// <summary>
+    /// Converts the legacy NameValueCollection into a strongly-typed KeyValuePair sequence.
+    /// </summary>
+    private static IEnumerable<KeyValuePair<string?, string?>> AsKeyValuePairs(this NameValueCollection collection)
+    {
+        return collection.AllKeys.Select(key => new KeyValuePair<string?, string?>(key, collection.Get(key)));
+    }
+
+    public static string GetBaseUrl(this Uri uri)
+    {
+        return $"{uri.Scheme}://{uri.Authority}{uri.AbsolutePath}";
     }
 }

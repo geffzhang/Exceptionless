@@ -1,185 +1,250 @@
-﻿using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
-using System.IO;
-using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
 using Exceptionless.Core.Billing;
 using Exceptionless.Core.Extensions;
+using Exceptionless.Core.Models;
+using Exceptionless.Core.Models.Billing;
+using Exceptionless.Core.Models.Data;
 using Exceptionless.Core.Pipeline;
 using Exceptionless.Core.Plugins.EventParser;
 using Exceptionless.Core.Plugins.EventProcessor;
-using Exceptionless.Core.Repositories;
-using Exceptionless.Core.Models;
-using Exceptionless.Core.Models.Data;
 using Exceptionless.Core.Queues.Models;
+using Exceptionless.Core.Repositories;
 using Exceptionless.Core.Repositories.Configuration;
+using Exceptionless.Core.Utility;
 using Exceptionless.DateTimeExtensions;
 using Exceptionless.Tests.Utility;
+using Foundatio.Queues;
 using Foundatio.Repositories;
+using Foundatio.Repositories.Extensions;
+using Foundatio.Serializer;
 using Foundatio.Storage;
-using Foundatio.Utility;
 using McSherry.SemanticVersioning;
-using Microsoft.Extensions.Logging;
 using Xunit;
-using Xunit.Abstractions;
 using DataDictionary = Exceptionless.Core.Models.DataDictionary;
-using Nest;
 
-namespace Exceptionless.Tests.Pipeline {
-    public sealed class EventPipelineTests : ElasticTestBase {
-        private readonly EventPipeline _pipeline;
-        private readonly IEventRepository _eventRepository;
-        private readonly IStackRepository _stackRepository;
-        private readonly IOrganizationRepository _organizationRepository;
-        private readonly IProjectRepository _projectRepository;
-        private readonly IUserRepository _userRepository;
+namespace Exceptionless.Tests.Pipeline;
 
-        public EventPipelineTests(ITestOutputHelper output) : base(output) {
-            _eventRepository = GetService<IEventRepository>();
-            _stackRepository = GetService<IStackRepository>();
-            _organizationRepository = GetService<IOrganizationRepository>();
-            _projectRepository = GetService<IProjectRepository>();
-            _userRepository = GetService<IUserRepository>();
-            _pipeline = GetService<EventPipeline>();
+public sealed class EventPipelineTests : IntegrationTestsBase
+{
+    private readonly EventPipeline _pipeline;
+    private readonly EventData _eventData;
+    private readonly IEventRepository _eventRepository;
+    private readonly IStackRepository _stackRepository;
+    private readonly OrganizationData _organizationData;
+    private readonly IOrganizationRepository _organizationRepository;
+    private readonly ProjectData _projectData;
+    private readonly IProjectRepository _projectRepository;
+    private readonly UserData _userData;
+    private readonly IUserRepository _userRepository;
+    private readonly BillingManager _billingManager;
+    private readonly BillingPlans _plans;
+    private readonly ITextSerializer _serializer;
 
-            CreateProjectDataAsync().GetAwaiter().GetResult();
-        }
+    public EventPipelineTests(ITestOutputHelper output, AppWebHostFactory factory) : base(output, factory)
+    {
+        _eventData = GetService<EventData>();
+        _eventRepository = GetService<IEventRepository>();
+        _stackRepository = GetService<IStackRepository>();
+        _organizationData = GetService<OrganizationData>();
+        _organizationRepository = GetService<IOrganizationRepository>();
+        _projectData = GetService<ProjectData>();
+        _projectRepository = GetService<IProjectRepository>();
+        _userData = GetService<UserData>();
+        _userRepository = GetService<IUserRepository>();
+        _pipeline = GetService<EventPipeline>();
+        _billingManager = GetService<BillingManager>();
+        _plans = GetService<BillingPlans>();
+        _serializer = GetService<ITextSerializer>();
+    }
 
-        [Fact]
-        public async Task NoFutureEventsAsync() {
-            var localTime = SystemClock.UtcNow;
-            var ev = GenerateEvent(localTime.AddMinutes(10));
+    protected override async Task ResetDataAsync()
+    {
+        await base.ResetDataAsync();
+        await CreateProjectDataAsync();
+    }
 
-            var context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
+    [Fact]
+    public async Task NoFutureEventsAsync()
+    {
+        var localTime = DateTime.UtcNow;
+        var ev = GenerateEvent(localTime.AddMinutes(10));
+
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+
+        ev = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(ev);
+        Assert.True(ev.Date < localTime.AddMinutes(10));
+        Assert.True(ev.Date - localTime < TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public Task CreateAutoSessionAsync()
+    {
+        return CreateAutoSessionInternalAsync(DateTimeOffset.Now);
+    }
+
+    [Fact]
+    public async Task RunAsync_SameUserInDifferentEnvironments_SharesStackAndSeparatesAutomaticSessions()
+    {
+        // Arrange
+        var organization = _organizationData.GenerateSampleOrganization(_billingManager, _plans);
+        var project = _projectData.GenerateSampleProject();
+        var production = GenerateEvent(DateTimeOffset.Now.AddMinutes(-3), "same-user");
+        production.Environment = " Production ";
+        var staging = GenerateEvent(DateTimeOffset.Now.AddMinutes(-2), "same-user");
+        staging.Data![Event.KnownDataKeys.Error] = production.Data![Event.KnownDataKeys.Error];
+        staging.Environment = "staging";
+        var laterProduction = GenerateEvent(DateTimeOffset.Now.AddMinutes(-1), "same-user");
+        laterProduction.Data![Event.KnownDataKeys.Error] = production.Data[Event.KnownDataKeys.Error];
+        laterProduction.Environment = "PRODUCTION";
+
+        // Act
+        var contexts = new List<EventContext>();
+        foreach (var ev in new[] { production, staging, laterProduction })
+            contexts.Add(await _pipeline.RunAsync(ev, organization, project));
+
+        await RefreshDataAsync();
+        var sessions = await _eventRepository.FindAsync(query => query.FilterExpression("type:session"));
+
+        // Assert
+        foreach (var context in contexts)
+        {
             Assert.False(context.HasError, context.ErrorMessage);
-
-            ev = await _eventRepository.GetByIdAsync(ev.Id);
-            Assert.NotNull(ev);
-            Assert.True(ev.Date < localTime.AddMinutes(10));
-            Assert.True(ev.Date - localTime < TimeSpan.FromSeconds(5));
-        }
-
-        [Fact]
-        public Task CreateAutoSessionAsync() {
-            return CreateAutoSessionInternalAsync(SystemClock.OffsetNow);
-        }
-
-        private async Task CreateAutoSessionInternalAsync(DateTimeOffset date) {
-            var ev = GenerateEvent(date, "blake@exceptionless.io");
-            var context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
-            Assert.False(context.IsCancelled);
             Assert.True(context.IsProcessed);
-
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var events = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(2, events.Total);
-            Assert.Single(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
-
-            var sessionStart = events.Documents.First(e => e.IsSessionStart());
-            Assert.Equal(0, sessionStart.Value);
-            Assert.False(sessionStart.HasSessionEndTime());
         }
 
-        [Fact]
-        public async Task CanUpdateExistingAutoSessionAsync() {
-            var startDate = SystemClock.OffsetNow.SubtractMinutes(5);
-            await CreateAutoSessionInternalAsync(startDate);
+        Assert.Equal(production.StackId, staging.StackId);
+        Assert.Equal(production.GetSessionId(), laterProduction.GetSessionId());
+        Assert.NotEqual(production.GetSessionId(), staging.GetSessionId());
+        Assert.Equal("Production", production.Environment);
+        Assert.Equal("PRODUCTION", laterProduction.Environment);
+        Assert.Equal(2, sessions.Total);
+        Assert.Equal(new[] { "Production", "staging" }, sessions.Documents.Select(ev => ev.Environment).Order(StringComparer.Ordinal).ToArray());
+    }
 
-            var ev = GenerateEvent(startDate.AddMinutes(4), "blake@exceptionless.io");
+    private async Task CreateAutoSessionInternalAsync(DateTimeOffset date)
+    {
+        var ev = GenerateEvent(date, "blake@exceptionless.io");
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+        Assert.False(context.IsCancelled);
+        Assert.True(context.IsProcessed);
 
-            var context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
-            Assert.False(context.IsCancelled);
-            Assert.True(context.IsProcessed);
+        await RefreshDataAsync();
+        var events = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(2, events.Total);
+        Assert.Single(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var events = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(3, events.Total);
-            Assert.Single(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
+        var sessionStart = events.Documents.First(e => e.IsSessionStart());
+        Assert.Equal(0, sessionStart.Value);
+        Assert.False(sessionStart.HasSessionEndTime());
+    }
 
-            var sessionStart = events.Documents.Single(e => e.IsSessionStart());
-            Assert.Equal(240, sessionStart.Value);
-            Assert.False(sessionStart.HasSessionEndTime());
-        }
+    [Fact]
+    public async Task CanUpdateExistingAutoSessionAsync()
+    {
+        var startDate = DateTimeOffset.Now.SubtractMinutes(5);
+        await CreateAutoSessionInternalAsync(startDate);
 
-        [Fact]
-        public async Task IgnoreAutoSessionsWithoutIdentityAsync() {
-            var ev = GenerateEvent(SystemClock.OffsetNow);
-            var context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
-            Assert.False(context.IsCancelled);
-            Assert.True(context.IsProcessed);
+        var ev = GenerateEvent(startDate.AddMinutes(4), "blake@exceptionless.io");
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var events = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(1, events.Total);
-            Assert.Equal(0, events.Documents.Count(e => e.IsSessionStart()));
-            Assert.Empty(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
-        }
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+        Assert.False(context.IsCancelled);
+        Assert.True(context.IsProcessed);
 
-        [Fact]
-        public async Task CreateAutoSessionStartEventsAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
+        await RefreshDataAsync();
+        var events = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(3, events.Total);
+        Assert.Single(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
+
+        var sessionStart = events.Documents.Single(e => e.IsSessionStart());
+        Assert.Equal(240, sessionStart.Value);
+        Assert.False(sessionStart.HasSessionEndTime());
+    }
+
+    [Fact]
+    public async Task IgnoreAutoSessionsWithoutIdentityAsync()
+    {
+        var ev = GenerateEvent(DateTimeOffset.Now);
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+        Assert.False(context.IsCancelled);
+        Assert.True(context.IsProcessed);
+
+        await RefreshDataAsync();
+        var events = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(1, events.Total);
+        Assert.Equal(0, events.Documents.Count(e => e.IsSessionStart()));
+        Assert.Empty(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
+    }
+
+    [Fact]
+    public async Task CreateAutoSessionStartEventsAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate, "blake@exceptionless.io"),
                 GenerateEvent(firstEventDate.AddSeconds(10), "blake@exceptionless.io", Event.KnownTypes.SessionEnd),
                 GenerateEvent(firstEventDate.AddSeconds(20), "blake@exceptionless.io"),
                 GenerateEvent(firstEventDate.AddSeconds(30), "blake@exceptionless.io", Event.KnownTypes.SessionEnd),
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.DoesNotContain(contexts, c => c.IsCancelled);
-            Assert.Contains(contexts, c => c.IsProcessed);
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.DoesNotContain(contexts, c => c.IsCancelled);
+        Assert.Contains(contexts, c => c.IsProcessed);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(6, results.Total);
-            Assert.Equal(2, results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct().Count());
-            Assert.Equal(2, results.Documents.Count(e => e.IsSessionEnd()));
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(6, results.Total);
+        Assert.Equal(2, results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct().Count());
+        Assert.Equal(2, results.Documents.Count(e => e.IsSessionEnd()));
 
-            var sessionStarts = results.Documents.Where(e => e.IsSessionStart()).ToList();
-            Assert.Equal(2, sessionStarts.Count);
-            foreach (var sessionStart in sessionStarts) {
-                Assert.Equal(10, sessionStart.Value);
-                Assert.True(sessionStart.HasSessionEndTime());
-            }
+        var sessionStarts = results.Documents.Where(e => e.IsSessionStart()).ToList();
+        Assert.Equal(2, sessionStarts.Count);
+        foreach (var sessionStart in sessionStarts)
+        {
+            Assert.Equal(10, sessionStart.Value);
+            Assert.True(sessionStart.HasSessionEndTime());
         }
+    }
 
-        [Fact]
-        public async Task UpdateAutoMultipleSessionStartEventDurationsAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
+    [Fact]
+    public async Task UpdateAutoMultipleSessionStartEventDurationsAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate, "blake@exceptionless.io", Event.KnownTypes.Session),
                 GenerateEvent(firstEventDate.AddSeconds(10), "blake@exceptionless.io", Event.KnownTypes.Session),
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.Equal(1, contexts.Count(c => c.IsCancelled));
-            Assert.Contains(contexts, c => c.IsProcessed);
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(1, contexts.Count(c => c.IsCancelled));
+        Assert.Contains(contexts, c => c.IsProcessed);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(1, results.Total);
-            Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
-            Assert.Equal(0, results.Documents.Count(e => e.IsSessionEnd()));
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(1, results.Total);
+        Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
+        Assert.Equal(0, results.Documents.Count(e => e.IsSessionEnd()));
 
-            var sessionStart = results.Documents.Single(e => e.IsSessionStart());
-            Assert.Equal(10, sessionStart.Value);
-            Assert.False(sessionStart.HasSessionEndTime());
-        }
+        var sessionStart = results.Documents.Single(e => e.IsSessionStart());
+        Assert.Equal(10, sessionStart.Value);
+        Assert.False(sessionStart.HasSessionEndTime());
+    }
 
-        [Fact]
-        public async Task UpdateAutoSessionLastActivityAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var lastEventDate = firstEventDate.Add(TimeSpan.FromMinutes(1));
+    [Fact]
+    public async Task UpdateAutoSessionLastActivityAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var lastEventDate = firstEventDate.Add(TimeSpan.FromMinutes(1));
 
-            var events = new List<PersistentEvent> {
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate, "blake@exceptionless.io"),
                 GenerateEvent(firstEventDate.AddSeconds(10), "blake@exceptionless.io"),
                 GenerateEvent(lastEventDate, "blake@exceptionless.io"),
@@ -190,190 +255,199 @@ namespace Exceptionless.Tests.Pipeline {
                 GenerateEvent(lastEventDate, "eric@exceptionless.io")
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.DoesNotContain(contexts, c => c.IsCancelled);
-            Assert.Contains(contexts, c => c.IsProcessed);
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.DoesNotContain(contexts, c => c.IsCancelled);
+        Assert.Contains(contexts, c => c.IsProcessed);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetAllAsync(o => o.PageLimit(15));
-            Assert.Equal(9, results.Total);
-            Assert.Equal(2, results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct().Count());
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd() && e.GetUserIdentity()?.Identity == "blake@exceptionless.io"));
-            Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId()) && e.GetUserIdentity().Identity == "eric@exceptionless.io").Select(e => e.GetSessionId()).Distinct());
-            Assert.Equal(1, results.Documents.Count(e => String.IsNullOrEmpty(e.GetSessionId())));
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
+        await RefreshDataAsync();
+        var results = await _eventRepository.GetAllAsync(o => o.PageLimit(15));
+        Assert.Equal(9, results.Total);
+        Assert.Equal(2, results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct().Count());
+        Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd() && e.GetUserIdentity(_serializer, _logger)?.Identity == "blake@exceptionless.io"));
+        Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId()) && e.GetUserIdentity(_serializer, _logger)?.Identity == "eric@exceptionless.io").Select(e => e.GetSessionId()).Distinct());
+        Assert.Equal(1, results.Documents.Count(e => String.IsNullOrEmpty(e.GetSessionId())));
+        Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
 
-            var sessionStarts = results.Documents.Where(e => e.IsSessionStart()).ToList();
-            Assert.Equal(2, sessionStarts.Count);
+        var sessionStarts = results.Documents.Where(e => e.IsSessionStart()).ToList();
+        Assert.Equal(2, sessionStarts.Count);
 
-            var firstUserSessionStartEvents = sessionStarts.Single(e => e.GetUserIdentity().Identity == "blake@exceptionless.io");
-            Assert.Equal((decimal)(lastEventDate - firstEventDate).TotalSeconds, firstUserSessionStartEvents.Value);
-            Assert.True(firstUserSessionStartEvents.HasSessionEndTime());
+        var firstUserSessionStartEvents = sessionStarts.Single(e => e.GetUserIdentity(_serializer, _logger)?.Identity == "blake@exceptionless.io");
+        Assert.Equal((decimal)(lastEventDate - firstEventDate).TotalSeconds, firstUserSessionStartEvents.Value);
+        Assert.True(firstUserSessionStartEvents.HasSessionEndTime());
 
-            var secondUserSessionStartEvents = sessionStarts.Single(e => e.GetUserIdentity().Identity == "eric@exceptionless.io");
-            Assert.Equal((decimal)(lastEventDate - firstEventDate).TotalSeconds, secondUserSessionStartEvents.Value);
-            Assert.False(secondUserSessionStartEvents.HasSessionEndTime());
-        }
+        var secondUserSessionStartEvents = sessionStarts.Single(e => e.GetUserIdentity(_serializer, _logger)?.Identity == "eric@exceptionless.io");
+        Assert.Equal((decimal)(lastEventDate - firstEventDate).TotalSeconds, secondUserSessionStartEvents.Value);
+        Assert.False(secondUserSessionStartEvents.HasSessionEndTime());
+    }
 
-        [Fact]
-        public async Task CloseExistingAutoSessionAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
-                GenerateEvent(firstEventDate, "blake@exceptionless.io"),
-                GenerateEvent(firstEventDate.AddSeconds(10), "blake@exceptionless.io", Event.KnownTypes.SessionHeartbeat)
+    [Fact]
+    public async Task CloseExistingAutoSessionAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        string identity = "blake@exceptionless.io";
+        var events = new List<PersistentEvent> {
+                GenerateEvent(firstEventDate, identity),
+                GenerateEvent(firstEventDate.AddSeconds(10), identity, Event.KnownTypes.SessionHeartbeat)
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.DoesNotContain(contexts, c => c.IsCancelled);
-            Assert.Contains(contexts, c => c.IsProcessed);
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(1, contexts.Count(c => c is { IsCancelled: true, IsDiscarded: true }));
+        Assert.Contains(contexts, c => c.IsProcessed);
 
-            events = new List<PersistentEvent> {
-                GenerateEvent(firstEventDate.AddSeconds(10), "blake@exceptionless.io", Event.KnownTypes.Session),
-                GenerateEvent(firstEventDate.AddSeconds(20), "blake@exceptionless.io", Event.KnownTypes.SessionEnd)
-            };
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(2, results.Total);
+        Assert.Equal(1, results.Documents.Count(e => e.IsSessionStart()));
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.Equal(1, contexts.Count(c => c.IsCancelled));
-            Assert.Equal(1, contexts.Count(c => c.IsProcessed));
+        events =
+        [
+            GenerateEvent(firstEventDate.AddSeconds(10), identity, Event.KnownTypes.Session),
+            GenerateEvent(firstEventDate.AddSeconds(20), identity, Event.KnownTypes.SessionEnd)
+        ];
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(4, results.Total);
-            Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
+        await RefreshDataAsync();
+        contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(1, contexts.Count(c => c.IsCancelled));
+        Assert.Equal(1, contexts.Count(c => c.IsProcessed));
 
-            var sessionStart = results.Documents.Single(e => e.IsSessionStart());
-            Assert.Equal(20, sessionStart.Value);
-            Assert.True(sessionStart.HasSessionEndTime());
-        }
+        await RefreshDataAsync();
+        results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(3, results.Total);
+        var sessionIds = results.Documents.Select(e => e.GetSessionId()).Distinct();
+        Assert.Single(sessionIds);
+        Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
 
-        [Fact]
-        public async Task IgnoreDuplicateAutoEndSessionsAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
+        var sessionStart = results.Documents.Single(e => e.IsSessionStart());
+        Assert.Equal(20, sessionStart.Value);
+        Assert.True(sessionStart.HasSessionEndTime());
+    }
+
+    [Fact]
+    public async Task IgnoreDuplicateAutoEndSessionsAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate, "blake@exceptionless.io", Event.KnownTypes.SessionEnd),
                 GenerateEvent(firstEventDate.AddSeconds(10), "blake@exceptionless.io", Event.KnownTypes.SessionEnd)
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.Equal(2, contexts.Count(c => c.IsCancelled));
-            Assert.False(contexts.All(c => c.IsProcessed));
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(2, contexts.Count(c => c.IsCancelled));
+        Assert.False(contexts.All(c => c.IsProcessed));
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(0, results.Total);
-        }
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(0, results.Total);
+    }
 
-        [Fact]
-        public async Task WillMarkAutoSessionHeartbeatStackHiddenAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
+    [Fact]
+    public async Task WillMarkAutoSessionHeartbeatStackHiddenAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate.AddSeconds(10), "blake@exceptionless.io", Event.KnownTypes.SessionHeartbeat)
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.Equal(0, contexts.Count(c => c.IsCancelled));
-            Assert.Equal(1, contexts.Count(c => c.IsProcessed));
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(1, contexts.Count(c => c is { IsCancelled: true, IsDiscarded: true }));
+        Assert.Equal(0, contexts.Count(c => c.IsProcessed));
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(2, results.Total);
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionStart()));
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(1, results.Total);
+        var sessionStart = results.Documents.FirstOrDefault(e => e.IsSessionStart());
+        Assert.NotNull(sessionStart);
 
-            var sessionHeartbeat = results.Documents.Single(e => e.IsSessionHeartbeat());
-            Assert.NotNull(sessionHeartbeat);
-            Assert.True(sessionHeartbeat.IsHidden);
+        var stack = await _stackRepository.GetByIdAsync(sessionStart.StackId);
+        Assert.NotNull(stack);
+        Assert.Equal(StackStatus.Ignored, stack.Status);
+    }
 
-            var stack = await _stackRepository.GetByIdAsync(sessionHeartbeat.StackId);
-            Assert.NotNull(stack);
-            Assert.True(stack.IsHidden);
+    [Fact]
+    public Task CreateManualSessionAsync()
+    {
+        return CreateManualSessionInternalAsync(DateTimeOffset.Now);
+    }
 
-            stack = await _stackRepository.GetByIdAsync(results.Documents.First(e => !e.IsSessionHeartbeat()).StackId);
-            Assert.NotNull(stack);
-            Assert.False(stack.IsHidden);
-        }
+    private async Task CreateManualSessionInternalAsync(DateTimeOffset start)
+    {
+        var ev = GenerateEvent(start, sessionId: "12345678");
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+        Assert.False(context.IsCancelled);
+        Assert.True(context.IsProcessed);
 
-        [Fact]
-        public Task CreateManualSessionAsync() {
-            return CreateManualSessionInternalAsync(SystemClock.OffsetNow);
-        }
+        await RefreshDataAsync();
+        var events = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(2, events.Total);
+        Assert.Single(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
 
-        private async Task CreateManualSessionInternalAsync(DateTimeOffset start) {
-            var ev = GenerateEvent(start, sessionId: "12345678");
-            var context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
-            Assert.False(context.IsCancelled);
-            Assert.True(context.IsProcessed);
+        var sessionStartEvent = events.Documents.SingleOrDefault(e => e.IsSessionStart());
+        Assert.NotNull(sessionStartEvent);
+        Assert.Equal(0, sessionStartEvent.Value);
+        Assert.False(sessionStartEvent.HasSessionEndTime());
+    }
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var events = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(2, events.Total);
-            Assert.Single(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
+    [Fact]
+    public async Task CanUpdateExistingManualSessionAsync()
+    {
+        var startDate = DateTimeOffset.Now.SubtractMinutes(5);
+        await CreateManualSessionInternalAsync(startDate);
 
-            var sessionStartEvent = events.Documents.SingleOrDefault(e => e.IsSessionStart());
-            Assert.NotNull(sessionStartEvent);
-            Assert.Equal(0, sessionStartEvent.Value);
-            Assert.False(sessionStartEvent.HasSessionEndTime());
-        }
+        var ev = GenerateEvent(startDate.AddMinutes(4), sessionId: "12345678");
 
-        [Fact]
-        public async Task CanUpdateExistingManualSessionAsync() {
-            var startDate = SystemClock.OffsetNow.SubtractMinutes(5);
-            await CreateManualSessionInternalAsync(startDate);
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+        Assert.False(context.IsCancelled);
+        Assert.True(context.IsProcessed);
 
-            var ev = GenerateEvent(startDate.AddMinutes(4), sessionId: "12345678");
+        await RefreshDataAsync();
+        var events = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(3, events.Total);
+        Assert.Single(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
 
-            var context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
-            Assert.False(context.IsCancelled);
-            Assert.True(context.IsProcessed);
+        var sessionStart = events.Documents.First(e => e.IsSessionStart());
+        Assert.Equal(240, sessionStart.Value);
+        Assert.False(sessionStart.HasSessionEndTime());
+    }
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var events = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(3, events.Total);
-            Assert.Single(events.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
-
-            var sessionStart = events.Documents.First(e => e.IsSessionStart());
-            Assert.Equal(240, sessionStart.Value);
-            Assert.False(sessionStart.HasSessionEndTime());
-        }
-
-        [Fact]
-        public async Task CreateManualSingleSessionStartEventAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
+    [Fact]
+    public async Task CreateManualSingleSessionStartEventAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate, sessionId: "12345678"),
                 GenerateEvent(firstEventDate.AddSeconds(10), type: Event.KnownTypes.Session, sessionId: "12345678"),
                 GenerateEvent(firstEventDate.AddSeconds(20), type: Event.KnownTypes.SessionEnd, sessionId: "12345678"),
                 GenerateEvent(firstEventDate.AddSeconds(30), sessionId: "12345678"),
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.DoesNotContain(contexts, c => c.IsCancelled);
-            Assert.Contains(contexts, c => c.IsProcessed);
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.DoesNotContain(contexts, c => c.IsCancelled);
+        Assert.Contains(contexts, c => c.IsProcessed);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(4, results.Total);
-            Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(4, results.Total);
+        Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
 
-            var sessionStartEvent = results.Documents.SingleOrDefault(e => e.IsSessionStart());
-            Assert.NotNull(sessionStartEvent);
-            Assert.Equal(30, sessionStartEvent.Value);
-            Assert.True(sessionStartEvent.HasSessionEndTime());
-        }
+        var sessionStartEvent = results.Documents.SingleOrDefault(e => e.IsSessionStart());
+        Assert.NotNull(sessionStartEvent);
+        Assert.Equal(30, sessionStartEvent.Value);
+        Assert.True(sessionStartEvent.HasSessionEndTime());
+    }
 
-        [Fact]
-        public async Task CreateManualSessionStartEventAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
+    [Fact]
+    public async Task CreateManualSessionStartEventAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate, sessionId: "12345678"),
                 // This event will be deduplicated as part of the manual session plugin.
                 GenerateEvent(firstEventDate.AddSeconds(10), type: Event.KnownTypes.SessionEnd, sessionId: "12345678"),
@@ -381,429 +455,592 @@ namespace Exceptionless.Tests.Pipeline {
                 GenerateEvent(firstEventDate.AddSeconds(30), type: Event.KnownTypes.SessionEnd, sessionId: "12345678"),
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.Equal(1, contexts.Count(c => c.IsCancelled));
-            Assert.Equal(3, contexts.Count(c => c.IsProcessed));
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(1, contexts.Count(c => c.IsCancelled));
+        Assert.Equal(3, contexts.Count(c => c.IsProcessed));
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(4, results.Total);
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionStart()));
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(4, results.Total);
+        Assert.Equal(1, results.Documents.Count(e => e.IsSessionStart()));
+        Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
 
-            var sessionStartEvent = results.Documents.First(e => e.IsSessionStart());
-            Assert.NotNull(sessionStartEvent);
-            Assert.Equal(30, sessionStartEvent.Value);
-            Assert.True(sessionStartEvent.HasSessionEndTime());
-        }
+        var sessionStartEvent = results.Documents.First(e => e.IsSessionStart());
+        Assert.NotNull(sessionStartEvent);
+        Assert.Equal(30, sessionStartEvent.Value);
+        Assert.True(sessionStartEvent.HasSessionEndTime());
+    }
 
-        [Fact]
-        public async Task UpdateManualSessionLastActivityAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var lastEventDate = firstEventDate.Add(TimeSpan.FromMinutes(1));
+    [Fact]
+    public async Task UpdateManualSessionLastActivityAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var lastEventDate = firstEventDate.Add(TimeSpan.FromMinutes(1));
 
-            var events = new List<PersistentEvent> {
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate, type: Event.KnownTypes.Session, sessionId: "12345678"),
                 GenerateEvent(firstEventDate.AddSeconds(10), sessionId: "12345678"),
                 GenerateEvent(lastEventDate, type: Event.KnownTypes.SessionEnd, sessionId: "12345678")
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.DoesNotContain(contexts, c => c.IsCancelled);
-            Assert.Contains(contexts, c => c.IsProcessed);
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.DoesNotContain(contexts, c => c.IsCancelled);
+        Assert.Contains(contexts, c => c.IsProcessed);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(3, results.Total);
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionStart()));
-            Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
-            Assert.Equal((decimal)(lastEventDate - firstEventDate).TotalSeconds, results.Documents.First(e => e.IsSessionStart()).Value);
-        }
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(3, results.Total);
+        Assert.Equal(1, results.Documents.Count(e => e.IsSessionStart()));
+        Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
+        Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
+        Assert.Equal((decimal)(lastEventDate - firstEventDate).TotalSeconds, results.Documents.First(e => e.IsSessionStart()).Value);
+    }
 
-        [Fact]
-        public async Task CloseExistingManualSessionAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
+    [Fact]
+    public async Task CloseExistingManualSessionAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate, sessionId: "12345678"),
                 GenerateEvent(firstEventDate.AddSeconds(10), type: Event.KnownTypes.SessionHeartbeat, sessionId: "12345678")
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.DoesNotContain(contexts, c => c.IsCancelled);
-            Assert.Contains(contexts, c => c.IsProcessed);
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(1, contexts.Count(c => c is { IsCancelled: true, IsDiscarded: true }));
+        Assert.Contains(contexts, c => c.IsProcessed);
 
-            events = new List<PersistentEvent> {
-                GenerateEvent(firstEventDate.AddSeconds(10), type: Event.KnownTypes.Session, sessionId: "12345678"),
-                GenerateEvent(firstEventDate.AddSeconds(20), type: Event.KnownTypes.SessionEnd, sessionId: "12345678")
-            };
+        events =
+        [
+            GenerateEvent(firstEventDate.AddSeconds(10), type: Event.KnownTypes.Session, sessionId: "12345678"),
+            GenerateEvent(firstEventDate.AddSeconds(20), type: Event.KnownTypes.SessionEnd, sessionId: "12345678")
+        ];
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.Equal(1, contexts.Count(c => c.IsCancelled));
-            Assert.Contains(contexts, c => c.IsProcessed);
+        await RefreshDataAsync();
+        contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(1, contexts.Count(c => c.IsCancelled));
+        Assert.Contains(contexts, c => c.IsProcessed);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(4, results.Total);
-            Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(3, results.Total);
+        Assert.Single(results.Documents.Where(e => !String.IsNullOrEmpty(e.GetSessionId())).Select(e => e.GetSessionId()).Distinct());
+        Assert.Equal(1, results.Documents.Count(e => e.IsSessionEnd()));
 
-            var sessionStarts = results.Documents.Where(e => e.IsSessionStart()).ToList();
-            Assert.Single(sessionStarts);
-            foreach (var sessionStart in sessionStarts) {
-                Assert.Equal(20, sessionStart.Value);
-                Assert.True(sessionStart.HasSessionEndTime());
-            }
+        var sessionStarts = results.Documents.Where(e => e.IsSessionStart()).ToList();
+        Assert.Single(sessionStarts);
+        foreach (var sessionStart in sessionStarts)
+        {
+            Assert.Equal(20, sessionStart.Value);
+            Assert.True(sessionStart.HasSessionEndTime());
         }
+    }
 
-        [Fact]
-        public async Task IgnoreDuplicateManualEndSessionsAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
+    [Fact]
+    public async Task IgnoreDuplicateManualEndSessionsAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate, type: Event.KnownTypes.SessionEnd, sessionId: "12345678"),
                 GenerateEvent(firstEventDate.AddSeconds(10), type: Event.KnownTypes.SessionEnd, sessionId: "12345678")
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.Equal(2, contexts.Count(c => c.IsCancelled));
-            Assert.False(contexts.All(c => c.IsProcessed));
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(2, contexts.Count(c => c.IsCancelled));
+        Assert.False(contexts.All(c => c.IsProcessed));
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(0, results.Total);
-        }
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(0, results.Total);
+    }
 
-        [Fact]
-        public async Task WillMarkManualSessionHeartbeatStackHiddenAsync() {
-            var firstEventDate = SystemClock.OffsetNow.Subtract(TimeSpan.FromMinutes(5));
-            var events = new List<PersistentEvent> {
+    [Fact]
+    public async Task WillMarkManualSessionHeartbeatStackHiddenAsync()
+    {
+        var firstEventDate = DateTimeOffset.Now.Subtract(TimeSpan.FromMinutes(5));
+        var events = new List<PersistentEvent> {
                 GenerateEvent(firstEventDate.AddSeconds(10), type: Event.KnownTypes.SessionHeartbeat, sessionId: "12345678")
             };
 
-            var contexts = await _pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.DoesNotContain(contexts, c => c.HasError);
-            Assert.Equal(0, contexts.Count(c => c.IsCancelled));
-            Assert.Equal(1, contexts.Count(c => c.IsProcessed));
+        var contexts = await _pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.DoesNotContain(contexts, c => c.HasError);
+        Assert.Equal(1, contexts.Count(c => c is { IsCancelled: true, IsDiscarded: true }));
+        Assert.Equal(0, contexts.Count(c => c.IsProcessed));
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            var results = await _eventRepository.GetByFilterAsync(null, null, EventIndexType.Alias.Date, null, DateTime.MinValue, DateTime.MaxValue, null);
-            Assert.Equal(2, results.Total);
-            Assert.Equal(1, results.Documents.Count(e => e.IsSessionStart()));
+        await RefreshDataAsync();
+        var results = await _eventRepository.FindAsync(q => q.SortExpression(EventIndex.Alias.Date));
+        Assert.Equal(1, results.Total);
+        var sessionStart = results.Documents.FirstOrDefault(e => e.IsSessionStart());
+        Assert.NotNull(sessionStart);
 
-            var sessionHeartbeat = results.Documents.Single(e => e.IsSessionHeartbeat());
-            Assert.NotNull(sessionHeartbeat);
-            Assert.True(sessionHeartbeat.IsHidden);
+        var stack = await _stackRepository.GetByIdAsync(sessionStart.StackId);
+        Assert.NotNull(stack);
+        Assert.Equal(StackStatus.Ignored, stack.Status);
+    }
 
-            var stack = await _stackRepository.GetByIdAsync(sessionHeartbeat.StackId);
-            Assert.NotNull(stack);
-            Assert.True(stack.IsHidden);
+    [Fact]
+    public void CanIndexExtendedData()
+    {
+        var ev = _eventData.GenerateEvent(projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, generateData: false, occurrenceDate: DateTime.UtcNow);
+        ev.Data ??= new DataDictionary();
+        ev.Data.Add("First Name", "Eric"); // invalid field name
+        ev.Data.Add("IsVerified", true);
+        ev.Data.Add("IsVerified1", true.ToString());
+        ev.Data.Add("Age", Int32.MaxValue);
+        ev.Data.Add("Age1", Int32.MaxValue.ToString(CultureInfo.InvariantCulture));
+        ev.Data.Add("AgeDec", Decimal.MaxValue);
+        ev.Data.Add("AgeDec1", Decimal.MaxValue.ToString(CultureInfo.InvariantCulture));
+        ev.Data.Add("AgeDbl", Double.MaxValue);
+        ev.Data.Add("AgeDbl1", Double.MaxValue.ToString("r", CultureInfo.InvariantCulture));
+        ev.Data.Add(" Birthday ", DateTime.MinValue);
+        ev.Data.Add("BirthdayWithOffset", DateTimeOffset.MinValue);
+        ev.Data.Add("@excluded", DateTime.MinValue);
+        ev.Data.Add("Address", new { State = "Texas" });
+        ev.SetSessionId("123456789");
 
-            stack = await _stackRepository.GetByIdAsync(results.Documents.First(e => !e.IsSessionHeartbeat()).StackId);
-            Assert.NotNull(stack);
-            Assert.False(stack.IsHidden);
-        }
+        ev.CopyDataToIndex([]);
+        Assert.NotNull(ev.Idx);
 
-        [Fact]
-        public void CanIndexExtendedData() {
-            var ev = EventData.GenerateEvent(projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, generateData: false, occurrenceDate: SystemClock.UtcNow);
-            ev.Data.Add("First Name", "Eric"); // invalid field name
-            ev.Data.Add("IsVerified", true);
-            ev.Data.Add("IsVerified1", true.ToString());
-            ev.Data.Add("Age", Int32.MaxValue);
-            ev.Data.Add("Age1", Int32.MaxValue.ToString(CultureInfo.InvariantCulture));
-            ev.Data.Add("AgeDec", Decimal.MaxValue);
-            ev.Data.Add("AgeDec1", Decimal.MaxValue.ToString(CultureInfo.InvariantCulture));
-            ev.Data.Add("AgeDbl", Double.MaxValue);
-            ev.Data.Add("AgeDbl1", Double.MaxValue.ToString("r", CultureInfo.InvariantCulture));
-            ev.Data.Add(" Birthday ", DateTime.MinValue);
-            ev.Data.Add("BirthdayWithOffset", DateTimeOffset.MinValue);
-            ev.Data.Add("@excluded", DateTime.MinValue);
-            ev.Data.Add("Address", new { State = "Texas" });
-            ev.SetSessionId("123456789");
+        Assert.False(ev.Idx!.ContainsKey("first-name-s"));
+        Assert.True(ev.Idx.ContainsKey("isverified-b"));
+        Assert.True(ev.Idx.ContainsKey("isverified1-b"));
+        Assert.True(ev.Idx.ContainsKey("age-n"));
+        Assert.True(ev.Idx.ContainsKey("age1-n"));
+        Assert.True(ev.Idx.ContainsKey("agedec-n"));
+        Assert.True(ev.Idx.ContainsKey("agedec1-n"));
+        Assert.True(ev.Idx.ContainsKey("agedbl-n"));
+        Assert.True(ev.Idx.ContainsKey("agedbl1-n"));
+        Assert.True(ev.Idx.ContainsKey("birthday-d"));
+        Assert.True(ev.Idx.ContainsKey("birthdaywithoffset-d"));
+        Assert.True(ev.Idx.ContainsKey("session-r"));
+        Assert.Equal(11, ev.Idx.Count);
+    }
 
-            ev.CopyDataToIndex(Array.Empty<string>());
+    [Fact]
+    public async Task SyncStackTagsAsync()
+    {
+        const string Tag1 = "Tag One";
+        const string Tag2 = "Tag Two";
+        const string Tag2_Lowercase = "tag two";
 
-            Assert.False(ev.Idx.ContainsKey("first-name-s"));
-            Assert.True(ev.Idx.ContainsKey("isverified-b"));
-            Assert.True(ev.Idx.ContainsKey("isverified1-b"));
-            Assert.True(ev.Idx.ContainsKey("age-n"));
-            Assert.True(ev.Idx.ContainsKey("age1-n"));
-            Assert.True(ev.Idx.ContainsKey("agedec-n"));
-            Assert.True(ev.Idx.ContainsKey("agedec1-n"));
-            Assert.True(ev.Idx.ContainsKey("agedbl-n"));
-            Assert.True(ev.Idx.ContainsKey("agedbl1-n"));
-            Assert.True(ev.Idx.ContainsKey("birthday-d"));
-            Assert.True(ev.Idx.ContainsKey("birthdaywithoffset-d"));
-            Assert.True(ev.Idx.ContainsKey("session-r"));
-            Assert.Equal(11, ev.Idx.Count);
-        }
+        var ev = GenerateEvent(DateTime.UtcNow);
+        ev.Tags ??= [];
+        ev.Tags.Add(Tag1);
 
-        [Fact]
-        public async Task SyncStackTagsAsync() {
-            const string Tag1 = "Tag One";
-            const string Tag2 = "Tag Two";
-            const string Tag2_Lowercase = "tag two";
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
 
-            var ev = GenerateEvent(SystemClock.UtcNow);
-            ev.Tags.Add(Tag1);
+        ev = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(ev);
+        Assert.NotNull(ev.StackId);
 
-            var context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
+        var stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
+        Assert.NotNull(stack);
+        Assert.Equal(new[] { Tag1 }, stack.Tags.ToArray());
 
-            ev = await _eventRepository.GetByIdAsync(ev.Id);
-            Assert.NotNull(ev);
-            Assert.NotNull(ev.StackId);
+        ev = _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, occurrenceDate: DateTime.UtcNow);
+        ev.Tags ??= [];
+        ev.Tags.Add(Tag2);
 
-            var stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
-            Assert.Equal(new [] { Tag1 }, stack.Tags.ToArray());
+        await RefreshDataAsync();
+        context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+        stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
+        Assert.NotNull(stack);
+        Assert.Equal(new[] { Tag1, Tag2 }, stack.Tags.ToArray());
 
-            ev = EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, occurrenceDate: SystemClock.UtcNow);
-            ev.Tags.Add(Tag2);
+        ev = _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, occurrenceDate: DateTime.UtcNow);
+        ev.Tags ??= [];
+        ev.Tags.Add(Tag2_Lowercase);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
-            stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
-            Assert.Equal(new [] { Tag1, Tag2 }, stack.Tags.ToArray());
+        await RefreshDataAsync();
+        context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+        stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
+        Assert.NotNull(stack);
+        Assert.Equal(new[] { Tag1, Tag2 }, stack.Tags.ToArray());
+    }
 
-            ev = EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, occurrenceDate: SystemClock.UtcNow);
-            ev.Tags.Add(Tag2_Lowercase);
+    [Fact]
+    public async Task RemoveTagsExceedingLimitsWhileKeepingKnownTags()
+    {
+        string LargeRemovedTags = new('x', 150);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
-            stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
-            Assert.Equal(new [] { Tag1, Tag2}, stack.Tags.ToArray());
-        }
+        var ev = GenerateEvent(DateTime.UtcNow);
+        ev.Tags ??= [];
+        ev.Tags.Add(LargeRemovedTags);
 
-        [Fact]
-        public async Task RemoveTagsExceedingLimitsWhileKeepingKnownTags() {
-            string LargeRemovedTags = new string('x', 150);
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
 
-            var ev = GenerateEvent(SystemClock.UtcNow);
-            ev.Tags.Add(LargeRemovedTags);
+        ev = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(ev);
+        Assert.NotNull(ev.StackId);
+        Assert.NotNull(ev.Tags);
+        Assert.Empty(ev.Tags);
 
-            var context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
+        var stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
+        Assert.NotNull(stack);
+        Assert.Empty(stack.Tags);
 
-            ev = await _eventRepository.GetByIdAsync(ev.Id);
-            Assert.NotNull(ev);
-            Assert.NotNull(ev.StackId);
-            Assert.Empty(ev.Tags);
+        ev = _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, occurrenceDate: DateTime.UtcNow);
+        ev.Tags ??= [];
+        ev.Tags.AddRange(Enumerable.Range(0, 100).Select(i => i.ToString()));
 
-            var stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
-            Assert.Empty(stack.Tags);
+        await RefreshDataAsync();
+        context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
 
-            ev = EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, occurrenceDate: SystemClock.UtcNow);
-            ev.Tags.AddRange(Enumerable.Range(0, 100).Select(i => i.ToString()));
+        ev = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(ev);
+        Assert.NotNull(ev.StackId);
+        Assert.NotNull(ev.Tags);
+        Assert.Equal(50, ev.Tags.Count);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
+        stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
+        Assert.NotNull(stack);
+        Assert.Equal(50, stack.Tags.Count);
 
-            ev = await _eventRepository.GetByIdAsync(ev.Id);
-            Assert.NotNull(ev);
-            Assert.NotNull(ev.StackId);
-            Assert.Equal(50, ev.Tags.Count);
+        ev = _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, occurrenceDate: DateTime.UtcNow);
+        ev.Tags ??= [];
+        ev.Tags.Add(new string('x', 150));
+        ev.Tags.AddRange(Enumerable.Range(100, 200).Select(i => i.ToString()));
+        ev.Tags.Add(Event.KnownTags.Critical);
 
-            stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
-            Assert.Equal(50, stack.Tags.Count);
+        await RefreshDataAsync();
+        context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
 
-            ev = EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, occurrenceDate: SystemClock.UtcNow);
-            ev.Tags.Add(new string('x', 150));
-            ev.Tags.AddRange(Enumerable.Range(100, 200).Select(i => i.ToString()));
-            ev.Tags.Add(Event.KnownTags.Critical);
+        ev = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(ev);
+        Assert.NotNull(ev.StackId);
+        Assert.NotNull(ev.Tags);
+        Assert.Equal(50, ev.Tags.Count);
+        Assert.DoesNotContain(new string('x', 150), ev.Tags);
+        Assert.Contains(Event.KnownTags.Critical, ev.Tags);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            context = await _pipeline.RunAsync(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            Assert.False(context.HasError, context.ErrorMessage);
+        stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
+        Assert.NotNull(stack);
+        Assert.Equal(50, stack.Tags.Count);
+        Assert.DoesNotContain(new string('x', 150), stack.Tags);
+        Assert.Contains(Event.KnownTags.Critical, stack.Tags);
+    }
 
-            ev = await _eventRepository.GetByIdAsync(ev.Id);
-            Assert.NotNull(ev);
-            Assert.NotNull(ev.StackId);
-            Assert.Equal(50, ev.Tags.Count);
-            Assert.DoesNotContain(new string('x', 150), ev.Tags);
-            Assert.Contains(Event.KnownTags.Critical, ev.Tags);
-
-            stack = await _stackRepository.GetByIdAsync(ev.StackId, o => o.Cache());
-            Assert.Equal(50, stack.Tags.Count);
-            Assert.DoesNotContain(new string('x', 150), stack.Tags);
-            Assert.Contains(Event.KnownTags.Critical, stack.Tags);
-        }
-
-        [Fact]
-        public async Task EnsureSingleNewStackAsync() {
-            string source = Guid.NewGuid().ToString();
-            var contexts = new List<EventContext> {
-                new EventContext(new PersistentEvent { ProjectId = TestConstants.ProjectId, OrganizationId = TestConstants.OrganizationId, Message = "Test Sample", Source = source, Date = SystemClock.UtcNow, Type = Event.KnownTypes.Log }, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject()),
-                new EventContext(new PersistentEvent { ProjectId = TestConstants.ProjectId, OrganizationId = TestConstants.OrganizationId, Message = "Test Sample", Source = source, Date = SystemClock.UtcNow, Type = Event.KnownTypes.Log }, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject()),
+    [Fact]
+    public async Task EnsureSingleNewStackAsync()
+    {
+        string source = Guid.NewGuid().ToString();
+        var contexts = new List<EventContext> {
+                new(new PersistentEvent { ProjectId = TestConstants.ProjectId, OrganizationId = TestConstants.OrganizationId, Message = "Test Sample", Source = source, Date = DateTime.UtcNow, Type = Event.KnownTypes.Log }, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject()),
+                new(new PersistentEvent { ProjectId = TestConstants.ProjectId, OrganizationId = TestConstants.OrganizationId, Message = "Test Sample", Source = source, Date = DateTime.UtcNow, Type = Event.KnownTypes.Log }, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject()),
             };
 
-            await _pipeline.RunAsync(contexts);
-            Assert.True(contexts.All(c => !c.HasError));
-            Assert.True(contexts.All(c => c.Stack.Id == contexts.First().Stack.Id));
-            Assert.Equal(1, contexts.Count(c => c.IsNew));
-            Assert.Equal(1, contexts.Count(c => !c.IsNew));
-            Assert.Equal(2, contexts.Count(c => !c.IsRegression));
-        }
+        await _pipeline.RunAsync(contexts);
+        Assert.True(contexts.All(c => !c.HasError));
+        Assert.True(contexts.All(c => c.Stack?.Id == contexts.First().Stack?.Id));
+        Assert.Equal(1, contexts.Count(c => c.IsNew));
+        Assert.Equal(1, contexts.Count(c => !c.IsNew));
+        Assert.Equal(2, contexts.Count(c => !c.IsRegression));
+    }
 
-        [Fact]
-        public async Task EnsureSingleGlobalErrorStackAsync() {
-            var contexts = new List<EventContext> {
-                new EventContext(new PersistentEvent {
+    [Fact]
+    public async Task EnsureSingleGlobalErrorStackAsync()
+    {
+        var contexts = new List<EventContext> {
+                new(new PersistentEvent {
                     ProjectId = TestConstants.ProjectId,
                     OrganizationId = TestConstants.OrganizationId,
                     Message = "Test Exception",
-                    Date = SystemClock.UtcNow,
+                    Date = DateTime.UtcNow,
                     Type = Event.KnownTypes.Error,
                     Data = new DataDictionary { { "@error", new Error { Message = "Test Exception", Type = "Error" } } }
-                }, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject()),
-                new EventContext(new PersistentEvent {
+                }, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject()),
+                new(new PersistentEvent {
                     ProjectId = TestConstants.ProjectId,
                     OrganizationId = TestConstants.OrganizationId,
                     Message = "Test Exception",
-                    Date = SystemClock.UtcNow,
+                    Date = DateTime.UtcNow,
                     Type = Event.KnownTypes.Error,
                     Data = new DataDictionary { { "@error", new Error { Message = "Test Exception 2", Type = "Error" } } }
-                }, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject()),
+                }, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject()),
             };
 
-            await _pipeline.RunAsync(contexts);
-            Assert.True(contexts.All(c => !c.HasError));
-            Assert.True(contexts.All(c => c.Stack.Id == contexts.First().Stack.Id));
-            Assert.Equal(1, contexts.Count(c => c.IsNew));
-            Assert.Equal(1, contexts.Count(c => !c.IsNew));
-            Assert.Equal(2, contexts.Count(c => !c.IsRegression));
-        }
+        await _pipeline.RunAsync(contexts);
+        Assert.True(contexts.All(c => !c.HasError));
+        Assert.True(contexts.All(c => c.Stack?.Id == contexts.First().Stack?.Id));
+        Assert.Equal(1, contexts.Count(c => c.IsNew));
+        Assert.Equal(1, contexts.Count(c => !c.IsNew));
+        Assert.Equal(2, contexts.Count(c => !c.IsRegression));
+    }
 
-        [Fact]
-        public async Task EnsureSingleRegressionAsync() {
-            var utcNow = SystemClock.UtcNow;
-            var ev = EventData.GenerateEvent(projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow);
-            var context = new EventContext(ev, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-            await _pipeline.RunAsync(context);
+    [Fact]
+    public async Task EnsureSingleRegressionAsync()
+    {
+        var utcNow = DateTime.UtcNow;
+        var ev = _eventData.GenerateEvent(projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow);
+        var context = new EventContext(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        await _pipeline.RunAsync(context);
 
-            Assert.False(context.HasError, context.ErrorMessage);
-            Assert.True(context.IsProcessed);
-            Assert.False(context.IsRegression);
-            Assert.False(context.Event.IsFixed);
+        Assert.False(context.HasError, context.ErrorMessage);
+        Assert.True(context.IsProcessed);
+        Assert.False(context.IsRegression);
 
-            ev = await _eventRepository.GetByIdAsync(ev.Id);
-            Assert.NotNull(ev);
+        ev = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(ev);
 
-            var stack = await _stackRepository.GetByIdAsync(ev.StackId);
-            stack.MarkFixed();
-            await _stackRepository.SaveAsync(stack, o => o.Cache());
+        var stack = await _stackRepository.GetByIdAsync(ev.StackId);
+        Assert.NotNull(stack);
+        stack.MarkFixed(null, TimeProvider);
+        await _stackRepository.SaveAsync(stack, o => o.Cache());
 
-            var contexts = new List<EventContext> {
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(-1)), OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject()),
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(-1)), OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject())
+        var contexts = new List<EventContext> {
+                new(_eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(-1)), _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject()),
+                new(_eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(-1)), _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject())
             };
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            await _pipeline.RunAsync(contexts);
-            Assert.True(contexts.All(c => !c.HasError));
-            Assert.Equal(0, contexts.Count(c => c.IsRegression));
-            Assert.Equal(2, contexts.Count(c => !c.IsRegression));
-            Assert.True(contexts.All(c => c.Event.IsFixed));
+        await RefreshDataAsync();
+        await _pipeline.RunAsync(contexts);
+        Assert.True(contexts.All(c => !c.HasError));
+        Assert.Equal(0, contexts.Count(c => c.IsRegression));
+        Assert.Equal(2, contexts.Count(c => !c.IsRegression));
 
-            contexts = new List<EventContext> {
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)), OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject()),
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)), OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject())
+        contexts =
+        [
+            new(
+                _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId,
+                    organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)),
+                _organizationData.GenerateSampleOrganization(_billingManager, _plans),
+                _projectData.GenerateSampleProject()),
+            new(
+                _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId,
+                    organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)),
+                _organizationData.GenerateSampleOrganization(_billingManager, _plans),
+                _projectData.GenerateSampleProject())
+        ];
+
+        await RefreshDataAsync();
+        await _pipeline.RunAsync(contexts);
+        Assert.True(contexts.All(c => !c.HasError));
+        Assert.Equal(1, contexts.Count(c => c.IsRegression));
+        Assert.Equal(1, contexts.Count(c => !c.IsRegression));
+
+        contexts =
+        [
+            new(
+                _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId,
+                    organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)),
+                _organizationData.GenerateSampleOrganization(_billingManager, _plans),
+                _projectData.GenerateSampleProject()),
+            new(
+                _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId,
+                    organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)),
+                _organizationData.GenerateSampleOrganization(_billingManager, _plans),
+                _projectData.GenerateSampleProject())
+        ];
+
+        await RefreshDataAsync();
+        await _pipeline.RunAsync(contexts);
+        Assert.True(contexts.All(c => !c.HasError));
+        Assert.Equal(2, contexts.Count(c => !c.IsRegression));
+    }
+
+    [Fact]
+    public async Task ProcessBatchAsync_StackWithoutRegression_ContinuesProcessingRemainingStacks()
+    {
+        // Arrange
+        var fixedAtUtc = new DateTimeOffset(2026, 8, 27, 12, 0, 0, TimeSpan.Zero);
+        TimeProvider.SetUtcNow(fixedAtUtc);
+
+        var organization = _organizationData.GenerateSampleOrganization(_billingManager, _plans);
+        var project = _projectData.GenerateSampleProject();
+        var firstContext = await _pipeline.RunAsync(
+            _eventData.GenerateEvent(projectId: project.Id, organizationId: organization.Id, source: "first-stack", type: Event.KnownTypes.Log, occurrenceDate: fixedAtUtc.AddMinutes(-2)),
+            organization,
+            project);
+        var secondContext = await _pipeline.RunAsync(
+            _eventData.GenerateEvent(projectId: project.Id, organizationId: organization.Id, source: "second-stack", type: Event.KnownTypes.Log, occurrenceDate: fixedAtUtc.AddMinutes(-2)),
+            organization,
+            project);
+
+        Assert.NotNull(firstContext.Stack);
+        Assert.NotNull(secondContext.Stack);
+        Assert.NotEqual(firstContext.Stack.Id, secondContext.Stack.Id);
+        firstContext.Stack.MarkFixed(null, TimeProvider);
+        secondContext.Stack.MarkFixed(null, TimeProvider);
+        Assert.Equal(fixedAtUtc.UtcDateTime, firstContext.Stack.DateFixed);
+        Assert.Equal(fixedAtUtc.UtcDateTime, secondContext.Stack.DateFixed);
+
+        await _stackRepository.SaveAsync(firstContext.Stack, o => o.ImmediateConsistency().Cache());
+        await _stackRepository.SaveAsync(secondContext.Stack, o => o.ImmediateConsistency().Cache());
+        await RefreshDataAsync();
+        TimeProvider.Advance(TimeSpan.FromMinutes(2));
+
+        var contexts = new List<EventContext>
+        {
+            new(_eventData.GenerateEvent(stackId: firstContext.Stack.Id, projectId: project.Id, organizationId: organization.Id, source: "first-stack", type: Event.KnownTypes.Log, occurrenceDate: fixedAtUtc.AddMinutes(-1)), organization, project),
+            new(_eventData.GenerateEvent(stackId: secondContext.Stack.Id, projectId: project.Id, organizationId: organization.Id, source: "second-stack", type: Event.KnownTypes.Log, occurrenceDate: fixedAtUtc.AddMinutes(1)), organization, project)
+        };
+
+        // Act
+        await _pipeline.RunAsync(contexts);
+
+        // Assert
+        Assert.False(contexts[0].IsRegression);
+        Assert.Equal(StackStatus.Fixed, contexts[0].Stack?.Status);
+        Assert.True(contexts[1].IsRegression);
+        Assert.Equal(StackStatus.Regressed, contexts[1].Stack?.Status);
+    }
+
+    [Fact]
+    public async Task EnsureVersionedRegressionAsync()
+    {
+        var utcNow = DateTime.UtcNow;
+        var organization = _organizationData.GenerateSampleOrganization(_billingManager, _plans);
+        var project = _projectData.GenerateSampleProject();
+        var ev = _eventData.GenerateEvent(projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow);
+        var context = new EventContext(ev, organization, project);
+        await _pipeline.RunAsync(context);
+        await RefreshDataAsync();
+
+        Assert.False(context.HasError, context.ErrorMessage);
+        Assert.True(context.IsProcessed);
+        Assert.False(context.IsRegression);
+
+        ev = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(ev);
+
+        var stack = await _stackRepository.GetByIdAsync(ev.StackId);
+        Assert.NotNull(stack);
+        stack.MarkFixed(new SemanticVersion(1, 0, 1, ["rc2"]), TimeProvider);
+        await _stackRepository.SaveAsync(stack, o => o.Cache());
+
+        var contexts = new List<EventContext> {
+                new(_eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)), organization, project),
+                new(_eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1), semver: "1.0.0"), organization, project),
+                new(_eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1), semver: "1.0.0-beta2"), organization, project)
             };
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            await _pipeline.RunAsync(contexts);
-            Assert.True(contexts.All(c => !c.HasError));
-            Assert.Equal(1, contexts.Count(c => c.IsRegression));
-            Assert.Equal(1, contexts.Count(c => !c.IsRegression));
-            Assert.True(contexts.All(c => !c.Event.IsFixed));
+        await RefreshDataAsync();
+        await _pipeline.RunAsync(contexts);
+        Assert.True(contexts.All(c => !c.HasError));
+        Assert.Equal(0, contexts.Count(c => c.IsRegression));
+        Assert.Equal(3, contexts.Count(c => !c.IsRegression));
 
-            contexts = new List<EventContext> {
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)), OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject()),
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)), OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject())
-            };
+        contexts =
+        [
+            new(
+                _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId,
+                    organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1),
+                    semver: "1.0.0"), organization, project),
+            new(
+                _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId,
+                    organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1),
+                    semver: "1.0.1-rc1"), organization, project),
+            new(
+                _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId,
+                    organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1),
+                    semver: "1.0.1-rc3"), organization, project),
+            new(
+                _eventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId,
+                    organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(-1),
+                    semver: "1.0.1-rc3"), organization, project)
+        ];
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            await _pipeline.RunAsync(contexts);
-            Assert.True(contexts.All(c => !c.HasError));
-            Assert.Equal(2, contexts.Count(c => !c.IsRegression));
-            Assert.True(contexts.All(c => !c.Event.IsFixed));
-        }
+        await RefreshDataAsync();
+        await _pipeline.RunAsync(contexts);
+        Assert.True(contexts.All(c => !c.HasError));
+        Assert.Equal(1, contexts.Count(c => c.IsRegression));
+        Assert.Equal(3, contexts.Count(c => !c.IsRegression));
 
-        [Fact]
-        public async Task EnsureVersionedRegressionAsync() {
-            var utcNow = SystemClock.UtcNow;
-            var organization = OrganizationData.GenerateSampleOrganization();
-            var project = ProjectData.GenerateSampleProject();
-            var ev = EventData.GenerateEvent(projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow);
-            var context = new EventContext(ev, organization, project);
-            await _pipeline.RunAsync(context);
-            await _configuration.Client.RefreshAsync(Indices.All);
+        var regressedEvent = contexts.First(c => c.IsRegression).Event;
+        Assert.Equal(utcNow.AddMinutes(-1), regressedEvent.Date);
+        Assert.Equal("1.0.1-rc3", regressedEvent.GetVersion());
+    }
 
-            Assert.False(context.HasError, context.ErrorMessage);
-            Assert.False(context.Event.IsFixed);
-            Assert.True(context.IsProcessed);
-            Assert.False(context.IsRegression);
+    [Theory]
+    [InlineData(-3, "1.0.1")]
+    [InlineData(-1, "1.0.2")]
+    public async Task RunAsync_MixedVersionsForFixedStack_DiscardsOnlyOlderVersionEvents(int olderEventMinutes, string regressedVersion)
+    {
+        // Arrange
+        var utcNow = TimeProvider.GetUtcNow();
+        var organization = _organizationData.GenerateSampleOrganization(_billingManager, _plans);
+        organization.HasPremiumFeatures = true;
+        var project = _projectData.GenerateSampleProject();
+        var ev = _eventData.GenerateEvent(projectId: project.Id, organizationId: organization.Id, occurrenceDate: utcNow.AddMinutes(-5));
+        var context = new EventContext(ev, organization, project);
+        await _pipeline.RunAsync(context);
+        await RefreshDataAsync();
 
-            ev = await _eventRepository.GetByIdAsync(ev.Id);
-            Assert.NotNull(ev);
+        Assert.False(context.HasError, context.ErrorMessage);
+        ev = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(ev);
 
-            var stack = await _stackRepository.GetByIdAsync(ev.StackId);
-            stack.MarkFixed(new SemanticVersion(1, 0, 1, new []{ "rc2" }));
-            await _stackRepository.SaveAsync(stack, o => o.Cache());
+        var stack = await _stackRepository.GetByIdAsync(ev.StackId);
+        Assert.NotNull(stack);
+        stack.MarkFixed(new SemanticVersion(1, 0, 1), TimeProvider);
+        await _stackRepository.SaveAsync(stack, o => o.Cache());
 
-            var contexts = new List<EventContext> {
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1)), organization, project),
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1), semver: "1.0.0"), organization, project),
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1), semver: "1.0.0-beta2"), organization, project)
-            };
+        project.NotificationSettings[TestConstants.UserId] = new NotificationSettings { ReportEventRegressions = true };
+        var notificationQueue = GetService<IQueue<EventNotification>>();
+        var olderContext = new EventContext(_eventData.GenerateEvent(stackId: ev.StackId, projectId: project.Id, organizationId: organization.Id, occurrenceDate: utcNow.AddMinutes(olderEventMinutes), semver: "1.0.0"), organization, project);
+        var newerContext = new EventContext(_eventData.GenerateEvent(stackId: ev.StackId, projectId: project.Id, organizationId: organization.Id, occurrenceDate: utcNow.AddMinutes(-2), semver: regressedVersion), organization, project);
+        var latestContext = new EventContext(_eventData.GenerateEvent(stackId: ev.StackId, projectId: project.Id, organizationId: organization.Id, occurrenceDate: utcNow, semver: "1.0.3"), organization, project);
+        await RefreshDataAsync();
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            await _pipeline.RunAsync(contexts);
-            Assert.True(contexts.All(c => !c.HasError));
-            Assert.Equal(3, contexts.Count(c => c.Event.IsFixed));
-            Assert.Equal(0, contexts.Count(c => c.IsRegression));
-            Assert.Equal(3, contexts.Count(c => !c.IsRegression));
+        // Act
+        await _pipeline.RunAsync([latestContext, olderContext, newerContext]);
 
-            contexts = new List<EventContext> {
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1), semver: "1.0.0"), organization, project),
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1), semver: "1.0.1-rc1"), organization, project),
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(1), semver: "1.0.1-rc3"), organization, project),
-                new EventContext(EventData.GenerateEvent(stackId: ev.StackId, projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, occurrenceDate: utcNow.AddMinutes(-1), semver: "1.0.1-rc3"), organization, project)
-            };
+        // Assert
+        Assert.False(olderContext.HasError, olderContext.ErrorMessage);
+        Assert.False(newerContext.HasError, newerContext.ErrorMessage);
+        Assert.False(latestContext.HasError, latestContext.ErrorMessage);
+        Assert.True(olderContext.IsDiscarded);
+        Assert.True(olderContext.IsCancelled);
+        Assert.False(olderContext.IsProcessed);
+        Assert.False(olderContext.IsRegression);
+        Assert.False(newerContext.IsDiscarded);
+        Assert.True(newerContext.IsRegression);
+        Assert.True(newerContext.IsProcessed);
+        Assert.False(latestContext.IsDiscarded);
+        Assert.False(latestContext.IsRegression);
+        Assert.True(latestContext.IsProcessed);
+        Assert.Equal(StackStatus.Regressed, newerContext.Stack?.Status);
+        Assert.Equal(StackStatus.Regressed, latestContext.Stack?.Status);
 
-            await _configuration.Client.RefreshAsync(Indices.All);
-            await _pipeline.RunAsync(contexts);
-            Assert.True(contexts.All(c => !c.HasError));
-            Assert.Equal(0, contexts.Count(c => c.Event.IsFixed));
-            Assert.Equal(1, contexts.Count(c => c.IsRegression));
-            Assert.Equal(3, contexts.Count(c => !c.IsRegression));
+        var savedEvent = await _eventRepository.GetByIdAsync(newerContext.Event.Id);
+        Assert.NotNull(savedEvent);
+        Assert.Equal(regressedVersion, savedEvent.GetVersion());
+        var savedStack = await _stackRepository.GetByIdAsync(stack.Id);
+        Assert.Equal(StackStatus.Regressed, savedStack?.Status);
 
-            var regressedEvent = contexts.First(c => c.IsRegression).Event;
-            Assert.Equal(utcNow.AddMinutes(-1), regressedEvent.Date);
-            Assert.Equal("1.0.1-rc3", regressedEvent.GetVersion());
-        }
+        var queueStats = await notificationQueue.GetQueueStatsAsync();
+        Assert.Equal(1, queueStats.Queued);
+        var notification = await notificationQueue.DequeueAsync(TestCancellationToken);
+        Assert.NotNull(notification);
+        Assert.Equal(newerContext.Event.Id, notification.Value.EventId);
+        Assert.True(notification.Value.IsRegression);
+        await notification.CompleteAsync();
+    }
 
-        [Theory]
-        [InlineData(true)]
-        [InlineData(false)]
-        public async Task EnsureIncludePrivateInformationIsRespectedAsync(bool includePrivateInformation) {
-            var project = ProjectData.GenerateSampleProject();
-            project.Configuration.Settings.Add(SettingsDictionary.KnownKeys.IncludePrivateInformation, includePrivateInformation.ToString());
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task EnsureIncludePrivateInformationIsRespectedAsync(bool includePrivateInformation)
+    {
+        var project = _projectData.GenerateSampleProject();
+        project.Configuration.Settings.Add(SettingsDictionary.KnownKeys.IncludePrivateInformation, includePrivateInformation.ToString());
 
-            var contexts = new List<EventContext> {
-                new EventContext(new PersistentEvent {
+        var contexts = new List<EventContext> {
+                new(new PersistentEvent {
                     ProjectId = TestConstants.ProjectId,
                     OrganizationId = TestConstants.OrganizationId,
                     Message = "Test Exception",
-                    Date = SystemClock.UtcNow,
+                    Date = DateTime.UtcNow,
                     Type = Event.KnownTypes.Error,
                     Data = new DataDictionary {
                         { "@error", new Error { Message = "Test Exception", Type = "Error" } },
@@ -812,247 +1049,492 @@ namespace Exceptionless.Tests.Pipeline {
                         { "@user", new UserInfo { Identity = "test@exceptionless.com" } },
                         { "@user_description", new UserDescription { EmailAddress = "test@exceptionless.com", Description = "test" } }
                     }
-                }, OrganizationData.GenerateSampleOrganization(), project)
+                }, _organizationData.GenerateSampleOrganization(_billingManager, _plans), project)
             };
 
-            await _pipeline.RunAsync(contexts);
-            var context = contexts.Single();
-            Assert.False(context.HasError);
+        await _pipeline.RunAsync(contexts);
+        var context = contexts.Single();
+        Assert.False(context.HasError);
 
-            var requestInfo = context.Event.GetRequestInfo();
-            var environmentInfo = context.Event.GetEnvironmentInfo();
-            var userInfo = context.Event.GetUserIdentity();
-            var userDescription = context.Event.GetUserDescription();
+        var requestInfo = context.Event.GetRequestInfo(_serializer, _logger);
+        var environmentInfo = context.Event.GetEnvironmentInfo(_serializer, _logger);
+        var userInfo = context.Event.GetUserIdentity(_serializer, _logger);
+        var userDescription = context.Event.GetUserDescription(_serializer, _logger);
 
-            Assert.Equal("/test", requestInfo?.Path);
-            Assert.Equal("Windows", environmentInfo?.OSName);
-            Assert.Equal("test", userDescription?.Description);
-            if (includePrivateInformation) {
-                Assert.NotNull(requestInfo?.ClientIpAddress);
-                Assert.Single(requestInfo.Cookies);
-                Assert.NotNull(requestInfo.PostData);
-                Assert.Single(requestInfo.QueryString);
+        Assert.Equal("/test", requestInfo?.Path);
+        Assert.Equal("Windows", environmentInfo?.OSName);
+        Assert.Equal("test", userDescription?.Description);
+        if (includePrivateInformation)
+        {
+            Assert.NotNull(requestInfo?.ClientIpAddress);
+            Assert.NotNull(requestInfo.Cookies);
+            Assert.Single(requestInfo.Cookies);
+            Assert.NotNull(requestInfo.PostData);
+            Assert.NotNull(requestInfo.QueryString);
+            Assert.Single(requestInfo.QueryString);
 
-                Assert.NotNull(environmentInfo?.IpAddress);
-                Assert.NotNull(environmentInfo.MachineName);
+            Assert.NotNull(environmentInfo?.IpAddress);
+            Assert.NotNull(environmentInfo.MachineName);
 
-                Assert.NotNull(userInfo?.Identity);
-                Assert.NotNull(userDescription?.EmailAddress);
-            } else {
-                Assert.Null(requestInfo?.ClientIpAddress);
-                Assert.Empty(requestInfo?.Cookies);
-                Assert.Null(requestInfo?.PostData);
-                Assert.Empty(requestInfo?.QueryString);
+            Assert.NotNull(userInfo?.Identity);
+            Assert.NotNull(userDescription?.EmailAddress);
+        }
+        else
+        {
+            Assert.Null(requestInfo?.ClientIpAddress);
+            Assert.NotNull(requestInfo?.Cookies);
+            Assert.Empty(requestInfo.Cookies);
+            Assert.Null(requestInfo.PostData);
+            Assert.NotNull(requestInfo?.QueryString);
+            Assert.Empty(requestInfo.QueryString);
 
-                Assert.Null(environmentInfo?.IpAddress);
-                Assert.Null(environmentInfo?.MachineName);
+            Assert.Null(environmentInfo?.IpAddress);
+            Assert.Null(environmentInfo?.MachineName);
 
-                Assert.Null(userInfo);
-                Assert.Null(userDescription?.EmailAddress);
-            }
+            Assert.Null(userInfo);
+            Assert.Null(userDescription?.EmailAddress);
+        }
+    }
+
+    [Fact]
+    public async Task WillHandleDiscardedStack()
+    {
+        var organization = _organizationData.GenerateSampleOrganization(_billingManager, _plans);
+        var project = _projectData.GenerateSampleProject();
+
+        var ev = _eventData.GenerateEvent(organizationId: organization.Id, projectId: project.Id, type: Event.KnownTypes.Log, source: "test", occurrenceDate: DateTimeOffset.Now);
+        var context = await _pipeline.RunAsync(ev, organization, project);
+        Assert.True(context.IsProcessed);
+        Assert.False(context.HasError);
+        Assert.False(context.IsCancelled);
+        Assert.False(context.IsDiscarded);
+        await RefreshDataAsync();
+
+        var stack = context.Stack;
+        Assert.NotNull(stack);
+        Assert.Equal(StackStatus.Open, stack.Status);
+
+        stack.Status = StackStatus.Discarded;
+        stack = await _stackRepository.SaveAsync(stack, o => o.ImmediateConsistency());
+
+        ev = _eventData.GenerateEvent(organizationId: organization.Id, projectId: project.Id, type: Event.KnownTypes.Log, source: "test", occurrenceDate: DateTimeOffset.Now);
+        context = await _pipeline.RunAsync(ev, organization, project);
+        Assert.False(context.IsProcessed);
+        Assert.False(context.HasError);
+        Assert.True(context.IsCancelled);
+        Assert.True(context.IsDiscarded);
+        await RefreshDataAsync();
+
+        ev = _eventData.GenerateEvent(organizationId: organization.Id, projectId: project.Id, type: Event.KnownTypes.Log, source: "test", occurrenceDate: DateTimeOffset.Now);
+        context = await _pipeline.RunAsync(ev, organization, project);
+        Assert.False(context.IsProcessed);
+        Assert.False(context.HasError);
+        Assert.True(context.IsCancelled);
+        Assert.True(context.IsDiscarded);
+    }
+
+    [Theory]
+    [InlineData(StackStatus.Regressed, false, null, null)]
+    [InlineData(StackStatus.Fixed, true, "1.0.0", null)] // A fixed stack should not be marked as regressed if the event has no version.
+    [InlineData(StackStatus.Regressed, false, null, "1.0.0")]
+    [InlineData(StackStatus.Regressed, false, "1.0.0", "1.0.0")] // A fixed stack should not be marked as regressed if the event has the same version.
+    [InlineData(StackStatus.Fixed, true, "2.0.0", "1.0.0")]
+    [InlineData(StackStatus.Regressed, false, null, "1.0.1")]
+    [InlineData(StackStatus.Regressed, false, "1.0.0", "1.0.1")]
+    public async Task CanDiscardStackEventsBasedOnEventVersion(StackStatus expectedStatus, bool expectedDiscard, string? stackFixedInVersion, string? eventSemanticVersion)
+    {
+        var organization = await _organizationRepository.GetByIdAsync(TestConstants.OrganizationId, o => o.Cache());
+        Assert.NotNull(organization);
+        var project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId, o => o.Cache());
+        Assert.NotNull(project);
+
+        var ev = _eventData.GenerateEvent(organizationId: organization.Id, projectId: project.Id, type: Event.KnownTypes.Log, source: "test", occurrenceDate: DateTimeOffset.Now);
+        ev.Environment = "staging";
+        var context = await _pipeline.RunAsync(ev, organization, project);
+
+        var stack = context.Stack;
+        Assert.NotNull(stack);
+        Assert.Equal(StackStatus.Open, stack.Status);
+
+        Assert.True(context.IsProcessed);
+        Assert.False(context.HasError);
+        Assert.False(context.IsCancelled);
+        Assert.False(context.IsDiscarded);
+
+        var semanticVersionParser = GetService<SemanticVersionParser>();
+        var fixedInVersion = semanticVersionParser.Parse(stackFixedInVersion);
+        stack.MarkFixed(fixedInVersion, TimeProvider);
+        await _stackRepository.SaveAsync(stack, o => o.ImmediateConsistency());
+
+        await RefreshDataAsync();
+        ev = _eventData.GenerateEvent(organizationId: organization.Id, projectId: project.Id, type: Event.KnownTypes.Log, source: "test", occurrenceDate: DateTimeOffset.Now, semver: eventSemanticVersion);
+        ev.Environment = "production";
+        context = await _pipeline.RunAsync(ev, organization, project);
+
+        stack = context.Stack;
+        Assert.NotNull(stack);
+        Assert.Equal(expectedStatus, stack.Status);
+        Assert.Equal(expectedDiscard, context.IsCancelled);
+        Assert.Equal(expectedDiscard, context.IsDiscarded);
+    }
+
+    [Theory]
+    [InlineData("1.0.0", null)] // A fixed stack should not be marked as regressed if the event has no version.
+    [InlineData("2.0.0", "1.0.0")]
+    public async Task WillNotDiscardStackEventsBasedOnEventVersionWithFreePlan(string stackFixedInVersion, string? eventSemanticVersion)
+    {
+        var organization = await _organizationRepository.GetByIdAsync(TestConstants.OrganizationId3, o => o.Cache());
+        Assert.NotNull(organization);
+
+        var plans = GetService<BillingPlans>();
+        Assert.Equal(plans.FreePlan.Id, organization.PlanId);
+
+        var project = await _projectRepository.AddAsync(_projectData.GenerateProject(organizationId: organization.Id), o => o.ImmediateConsistency().Cache());
+
+        var ev = _eventData.GenerateEvent(organizationId: organization.Id, projectId: project.Id, type: Event.KnownTypes.Log, source: "test", occurrenceDate: DateTimeOffset.Now);
+        var context = await _pipeline.RunAsync(ev, organization, project);
+
+        var stack = context.Stack;
+        Assert.NotNull(stack);
+        Assert.Equal(StackStatus.Open, stack.Status);
+
+        Assert.True(context.IsProcessed);
+        Assert.False(context.HasError);
+        Assert.False(context.IsCancelled);
+        Assert.False(context.IsDiscarded);
+
+        var semanticVersionParser = GetService<SemanticVersionParser>();
+        var fixedInVersion = semanticVersionParser.Parse(stackFixedInVersion);
+        stack.MarkFixed(fixedInVersion, TimeProvider);
+        await _stackRepository.SaveAsync(stack, o => o.ImmediateConsistency());
+
+        await RefreshDataAsync();
+        ev = _eventData.GenerateEvent(organizationId: organization.Id, projectId: project.Id, type: Event.KnownTypes.Log, source: "test", occurrenceDate: DateTimeOffset.Now, semver: eventSemanticVersion);
+        context = await _pipeline.RunAsync(ev, organization, project);
+
+        stack = context.Stack;
+        Assert.NotNull(stack);
+        Assert.Equal(StackStatus.Fixed, stack.Status);
+        Assert.False(context.IsCancelled);
+        Assert.False(context.IsDiscarded);
+    }
+
+    [Theory]
+    [MemberData(nameof(Events))]
+    public async Task ProcessEventsAsync(string errorFilePath)
+    {
+        var pipeline = GetService<EventPipeline>();
+        var parserPluginManager = GetService<EventParserPluginManager>();
+        var events = parserPluginManager.ParseEvents(await File.ReadAllTextAsync(errorFilePath, TestCancellationToken), 2, "exceptionless/2.0.0.0");
+        Assert.NotNull(events);
+        Assert.True(events.Count > 0);
+
+        foreach (var ev in events)
+        {
+            ev.Date = DateTime.UtcNow;
+            ev.ProjectId = TestConstants.ProjectId;
+            ev.OrganizationId = TestConstants.OrganizationId;
         }
 
-        [Theory]
-        [MemberData(nameof(Events))]
-        public async Task ProcessEventsAsync(string errorFilePath) {
-            var pipeline = GetService<EventPipeline>();
-            var parserPluginManager = GetService<EventParserPluginManager>();
-            var events = parserPluginManager.ParseEvents(File.ReadAllText(errorFilePath), 2, "exceptionless/2.0.0.0");
+        var contexts = await pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.True(contexts.All(c => c.IsProcessed));
+        Assert.True(contexts.All(c => !c.IsCancelled));
+        Assert.True(contexts.All(c => !c.HasError));
+    }
+
+    [Fact]
+    public async Task PipelinePerformanceAsync()
+    {
+        var parserPluginManager = GetService<EventParserPluginManager>();
+        var pipeline = GetService<EventPipeline>();
+        var startDate = DateTimeOffset.Now.SubtractHours(1);
+        int totalBatches = 0;
+        int totalEvents = 0;
+
+        var sw = new Stopwatch();
+
+        string path = Path.Combine("..", "..", "..", "Pipeline", "Data");
+        foreach (string file in Directory.GetFiles(path, "*.json", SearchOption.AllDirectories))
+        {
+            var events = parserPluginManager.ParseEvents(await File.ReadAllTextAsync(file, TestCancellationToken), 2, "exceptionless/2.0.0.0");
             Assert.NotNull(events);
             Assert.True(events.Count > 0);
 
-            foreach (var ev in events) {
-                ev.Date = SystemClock.UtcNow;
+            foreach (var ev in events)
+            {
+                ev.Date = startDate;
                 ev.ProjectId = TestConstants.ProjectId;
                 ev.OrganizationId = TestConstants.OrganizationId;
             }
 
-            var contexts = await pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
+            sw.Start();
+            var contexts = await pipeline.RunAsync(events, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+            sw.Stop();
+
             Assert.True(contexts.All(c => c.IsProcessed));
             Assert.True(contexts.All(c => !c.IsCancelled));
             Assert.True(contexts.All(c => !c.HasError));
+
+            startDate = startDate.AddSeconds(5);
+            totalBatches++;
+            totalEvents += events.Count;
         }
 
-        [Fact]
-        public async Task PipelinePerformanceAsync() {
-            var parserPluginManager = GetService<EventParserPluginManager>();
-            var pipeline = GetService<EventPipeline>();
-            var startDate = SystemClock.OffsetNow.SubtractHours(1);
-            int totalBatches = 0;
-            int totalEvents = 0;
+        _logger.LogInformation("Took {Duration:g} to process {EventCount} with an average post size of {AveragePostSize}", sw.Elapsed, totalEvents, Math.Round(totalEvents * 1.0 / totalBatches, 4));
+    }
 
-            var sw = new Stopwatch();
-            
-            string path = Path.Combine("..", "..", "..", "Pipeline", "Data");
-            foreach (string file in Directory.GetFiles(path, "*.json", SearchOption.AllDirectories)) {
-                var events = parserPluginManager.ParseEvents(File.ReadAllText(file), 2, "exceptionless/2.0.0.0");
-                Assert.NotNull(events);
-                Assert.True(events.Count > 0);
+    [Fact(Skip = "Used to create performance data from the queue directory")]
+    public async Task GeneratePerformanceDataAsync()
+    {
+        int currentBatchCount = 0;
+        var parserPluginManager = GetService<EventParserPluginManager>();
+        string dataDirectory = Path.GetFullPath(Path.Combine("..", "..", "..", "Pipeline", "Data"));
 
-                foreach (var ev in events) {
-                    ev.Date = startDate;
-                    ev.ProjectId = TestConstants.ProjectId;
-                    ev.OrganizationId = TestConstants.OrganizationId;
+        foreach (string file in Directory.GetFiles(dataDirectory))
+            File.Delete(file);
+
+        var mappedUsers = new Dictionary<string, UserInfo>();
+        var mappedIPs = new Dictionary<string, string>();
+        var storage = new FolderFileStorage(new FolderFileStorageOptions
+        {
+            Folder = Path.GetFullPath(Path.Combine("..", "..", "..", "src")),
+            LoggerFactory = Log
+        });
+
+        foreach (var file in await storage.GetFileListAsync(Path.Combine("Exceptionless.Web", "storage", "q", "*"), cancellationToken: TestCancellationToken))
+        {
+            byte[]? data = await storage.GetFileContentsRawAsync(Path.ChangeExtension(file.Path, ".payload"));
+            Assert.NotNull(data);
+            var eventPostInfo = await storage.GetObjectAsync<EventPostInfo>(file.Path, TestCancellationToken);
+            if (!String.IsNullOrEmpty(eventPostInfo.ContentEncoding))
+                data = data.Decompress(eventPostInfo.ContentEncoding);
+
+            var encoding = Encoding.UTF8;
+            if (!String.IsNullOrEmpty(eventPostInfo.CharSet))
+                encoding = Encoding.GetEncoding(eventPostInfo.CharSet);
+
+            string input = encoding.GetString(data);
+            var events = parserPluginManager.ParseEvents(input, eventPostInfo.ApiVersion, eventPostInfo.UserAgent);
+
+            foreach (var ev in events)
+            {
+                ev.Date = new DateTimeOffset(new DateTime(2020, 1, 1));
+                ev.ProjectId = null!;
+                ev.OrganizationId = null!;
+                ev.StackId = null!;
+
+                if (ev.Message is not null)
+                    ev.Message = RandomData.GetSentence();
+
+                ev.Data ??= new DataDictionary();
+                var keysToRemove = ev.Data.Keys.Where(k => !k.StartsWith('@') && k != "MachineName" && k != "job" && k != "host" && k != "process").ToList();
+                foreach (string key in keysToRemove)
+                    ev.Data.Remove(key);
+
+                ev.Data.Remove(Event.KnownDataKeys.UserDescription);
+                var identity = ev.GetUserIdentity(_serializer, _logger);
+                if (identity?.Identity is not null)
+                {
+                    if (!mappedUsers.ContainsKey(identity.Identity))
+                        mappedUsers.Add(identity.Identity, new UserInfo(Guid.NewGuid().ToString(), currentBatchCount.ToString()));
+
+                    ev.SetUserIdentity(mappedUsers[identity.Identity]);
                 }
 
-                sw.Start();
-                var contexts = await pipeline.RunAsync(events, OrganizationData.GenerateSampleOrganization(), ProjectData.GenerateSampleProject());
-                sw.Stop();
+                var request = ev.GetRequestInfo(_serializer, _logger);
+                if (request is not null)
+                {
+                    request.Cookies?.Clear();
+                    request.PostData = null;
+                    request.QueryString?.Clear();
+                    request.Referrer = null;
+                    request.Host = RandomData.GetIp4Address();
+                    request.Path = $"/{RandomData.GetWord(false)}/{RandomData.GetWord(false)}";
+                    request.Data?.Clear();
 
-                Assert.True(contexts.All(c => c.IsProcessed));
-                Assert.True(contexts.All(c => !c.IsCancelled));
-                Assert.True(contexts.All(c => !c.HasError));
+                    if (request.ClientIpAddress is not null)
+                    {
+                        if (!mappedIPs.ContainsKey(request.ClientIpAddress))
+                            mappedIPs.Add(request.ClientIpAddress, RandomData.GetIp4Address());
 
-                startDate = startDate.AddSeconds(5);
-                totalBatches++;
-                totalEvents += events.Count;
-            }
-
-            _logger.LogInformation("Took {Duration:g} to process {EventCount} with an average post size of {AveragePostSize}", sw.Elapsed, totalEvents, Math.Round(totalEvents * 1.0 / totalBatches, 4));
-        }
-
-        [Fact(Skip = "Used to create performance data from the queue directory")]
-        public async Task GeneratePerformanceDataAsync() {
-            int currentBatchCount = 0;
-            var parserPluginManager = GetService<EventParserPluginManager>();
-            string dataDirectory = Path.GetFullPath(Path.Combine("..", "..", "..", "Pipeline", "Data"));
-
-            foreach (string file in Directory.GetFiles(dataDirectory))
-                File.Delete(file);
-
-            var mappedUsers = new Dictionary<string, UserInfo>();
-            var mappedIPs = new Dictionary<string, string>();
-            var storage = new FolderFileStorage(new FolderFileStorageOptions {
-                Folder = Path.GetFullPath(Path.Combine("..", "..", "..", "src")),
-                LoggerFactory = Log
-            });
-
-            foreach (var file in await storage.GetFileListAsync(Path.Combine("Exceptionless.Web", "storage", "q", "*"))) {
-                byte[] data = await storage.GetFileContentsRawAsync(Path.ChangeExtension(file.Path, ".payload"));
-                var eventPostInfo = await storage.GetObjectAsync<EventPostInfo>(file.Path);
-                if (!String.IsNullOrEmpty(eventPostInfo.ContentEncoding))
-                    data = data.Decompress(eventPostInfo.ContentEncoding);
-
-                var encoding = Encoding.UTF8;
-                if (!String.IsNullOrEmpty(eventPostInfo.CharSet))
-                    encoding = Encoding.GetEncoding(eventPostInfo.CharSet);
-
-                string input = encoding.GetString(data);
-                var events = parserPluginManager.ParseEvents(input, eventPostInfo.ApiVersion, eventPostInfo.UserAgent);
-
-                foreach (var ev in events) {
-                    ev.Date = new DateTimeOffset(new DateTime(2020, 1, 1));
-                    ev.ProjectId = null;
-                    ev.OrganizationId = null;
-                    ev.StackId = null;
-
-                    if (ev.Message != null)
-                        ev.Message = RandomData.GetSentence();
-
-                    var keysToRemove = ev.Data.Keys.Where(k => !k.StartsWith("@") && k != "MachineName" && k != "job" && k != "host" && k != "process").ToList();
-                    foreach (string key in keysToRemove)
-                        ev.Data.Remove(key);
-
-                    ev.Data.Remove(Event.KnownDataKeys.UserDescription);
-                    var identity = ev.GetUserIdentity();
-                    if (identity != null) {
-                        if (!mappedUsers.ContainsKey(identity.Identity))
-                            mappedUsers.Add(identity.Identity, new UserInfo(Guid.NewGuid().ToString(), currentBatchCount.ToString()));
-
-                        ev.SetUserIdentity(mappedUsers[identity.Identity]);
+                        request.ClientIpAddress = mappedIPs[request.ClientIpAddress];
                     }
-
-                    var request = ev.GetRequestInfo();
-                    if (request != null) {
-                        request.Cookies?.Clear();
-                        request.PostData = null;
-                        request.QueryString?.Clear();
-                        request.Referrer = null;
-                        request.Host = RandomData.GetIp4Address();
-                        request.Path = $"/{RandomData.GetWord(false)}/{RandomData.GetWord(false)}";
-                        request.Data.Clear();
-
-                        if (request.ClientIpAddress != null) {
-                            if (!mappedIPs.ContainsKey(request.ClientIpAddress))
-                                mappedIPs.Add(request.ClientIpAddress, RandomData.GetIp4Address());
-
-                            request.ClientIpAddress = mappedIPs[request.ClientIpAddress];
-                        }
-                    }
-
-                    InnerError error = ev.GetError();
-                    while (error != null) {
-                        error.Message = RandomData.GetSentence();
-                        error.Data.Clear();
-                        (error as Error)?.Modules.Clear();
-
-                        error = error.Inner;
-                    }
-
-                    var environment = ev.GetEnvironmentInfo();
-                    environment?.Data.Clear();
                 }
 
-                // inject random session start events.
-                if (currentBatchCount % 10 == 0)
-                    events.Insert(0, events[0].ToSessionStartEvent());
+                InnerError? error = ev.GetError(_serializer, _logger);
+                while (error is not null)
+                {
+                    error.Message = RandomData.GetSentence();
+                    error.Data?.Clear();
+                    (error as Error)?.Modules.Clear();
 
-                await storage.SaveObjectAsync(Path.Combine(dataDirectory, $"{currentBatchCount++}.json"), events);
+                    error = error.Inner;
+                }
+
+                var environment = ev.GetEnvironmentInfo(_serializer, _logger);
+                environment?.Data?.Clear();
             }
+
+            // inject random session start events.
+            if (currentBatchCount % 10 == 0)
+                events.Insert(0, events[0].ToSessionStartEvent(_serializer, _logger));
+
+            await storage.SaveObjectAsync(Path.Combine(dataDirectory, $"{currentBatchCount++}.json"), events, TestCancellationToken);
         }
+    }
 
-        public static IEnumerable<object[]> Events {
-            get {
-                var result = new List<object[]>();
-                foreach (string file in Directory.GetFiles(Path.Combine("..", "..", "..", "ErrorData"), "*.expected.json", SearchOption.AllDirectories))
-                    result.Add(new object[] { file });
+    public static TheoryData<string> Events
+    {
+        get
+        {
+            var result = new List<string>();
+            foreach (string file in Directory.GetFiles(Path.Combine("..", "..", "..", "ErrorData"), "*.expected.json", SearchOption.AllDirectories))
+                result.Add(file);
 
-                return result.ToArray();
-            }
+            return new TheoryData<string>(result);
         }
+    }
 
-        private async Task CreateProjectDataAsync() {
-            foreach (var organization in OrganizationData.GenerateSampleOrganizations()) {
-                if (organization.Id == TestConstants.OrganizationId3)
-                    BillingManager.ApplyBillingPlan(organization, BillingManager.FreePlan, UserData.GenerateSampleUser());
-                else
-                    BillingManager.ApplyBillingPlan(organization, BillingManager.SmallPlan, UserData.GenerateSampleUser());
+    private async Task CreateProjectDataAsync(BillingPlan? plan = null)
+    {
+        foreach (var organization in _organizationData.GenerateSampleOrganizations(_billingManager, _plans))
+        {
+            if (plan is not null)
+                _billingManager.ApplyBillingPlan(organization, plan, _userData.GenerateSampleUser());
+            else if (organization.Id == TestConstants.OrganizationId3)
+                _billingManager.ApplyBillingPlan(organization, _plans.FreePlan, _userData.GenerateSampleUser());
+            else
+                _billingManager.ApplyBillingPlan(organization, _plans.SmallPlan, _userData.GenerateSampleUser());
 
-                organization.StripeCustomerId = Guid.NewGuid().ToString("N");
+            if (organization.BillingPrice > 0)
+            {
+                organization.StripeCustomerId = "stripe_customer_id";
                 organization.CardLast4 = "1234";
-                organization.SubscribeDate = SystemClock.UtcNow;
-
-                if (organization.IsSuspended) {
-                    organization.SuspendedByUserId = TestConstants.UserId;
-                    organization.SuspensionCode = SuspensionCode.Billing;
-                    organization.SuspensionDate = SystemClock.UtcNow;
-                }
-
-                await _organizationRepository.AddAsync(organization, o => o.Cache());
+                organization.SubscribeDate = DateTime.UtcNow;
+                organization.BillingChangeDate = DateTime.UtcNow;
+                organization.BillingChangedByUserId = TestConstants.UserId;
             }
 
-            await _projectRepository.AddAsync(ProjectData.GenerateSampleProjects(), o => o.Cache());
-
-            foreach (var user in UserData.GenerateSampleUsers()) {
-                if (user.Id == TestConstants.UserId) {
-                    user.OrganizationIds.Add(TestConstants.OrganizationId2);
-                    user.OrganizationIds.Add(TestConstants.OrganizationId3);
-                }
-
-                if (!user.IsEmailAddressVerified)
-                    user.CreateVerifyEmailAddressToken();
-
-                await _userRepository.AddAsync(user, o => o.Cache());
+            if (organization.IsSuspended)
+            {
+                organization.SuspendedByUserId = TestConstants.UserId;
+                organization.SuspensionCode = SuspensionCode.Billing;
+                organization.SuspensionDate = DateTime.UtcNow;
             }
 
-            await _configuration.Client.RefreshAsync(Indices.All);
+            await _organizationRepository.AddAsync(organization, o => o.ImmediateConsistency().Cache());
         }
 
-        private PersistentEvent GenerateEvent(DateTimeOffset? occurrenceDate = null, string userIdentity = null, string type = null, string sessionId = null) {
-            if (!occurrenceDate.HasValue)
-                occurrenceDate = SystemClock.OffsetNow;
+        await _projectRepository.AddAsync(_projectData.GenerateSampleProjects(), o => o.ImmediateConsistency().Cache());
 
-            return EventData.GenerateEvent(projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, generateData: false, occurrenceDate: occurrenceDate, userIdentity: userIdentity, type: type, sessionId: sessionId);
+        foreach (var user in _userData.GenerateSampleUsers())
+        {
+            if (user.Id == TestConstants.UserId)
+            {
+                user.OrganizationIds.Add(TestConstants.OrganizationId2);
+                user.OrganizationIds.Add(TestConstants.OrganizationId3);
+            }
+
+            if (!user.IsEmailAddressVerified)
+                user.ResetVerifyEmailAddressTokenAndExpiration(TimeProvider);
+
+            await _userRepository.AddAsync(user, o => o.ImmediateConsistency().Cache());
         }
+    }
+
+    [Fact]
+    public async Task ErrorPlugin_SetsTargetInfo_AfterPipelineProcessing()
+    {
+        // Arrange - Create an error event with multiple stack frames
+        var ev = GenerateEvent(type: Event.KnownTypes.Error);
+        ev.Data = new DataDictionary
+        {
+            [Event.KnownDataKeys.Error] = new Error
+            {
+                Type = "System.InvalidOperationException",
+                Message = "Test error for target info",
+                StackTrace =
+                [
+                    new Exceptionless.Core.Models.Data.StackFrame
+                    {
+                        DeclaringNamespace = "TestApp.Services",
+                        DeclaringType = "TestService",
+                        Name = "DoWork"
+                    },
+                    new Exceptionless.Core.Models.Data.StackFrame
+                    {
+                        DeclaringNamespace = "TestApp.Controllers",
+                        DeclaringType = "HomeController",
+                        Name = "Index"
+                    }
+                ]
+            }
+        };
+
+        // Act - Run through the pipeline
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+
+        // Fetch from ES to verify serialized form
+        await RefreshDataAsync();
+        var stored = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(stored);
+
+        // Assert - @target should have computed strings, not raw Method object
+        var error = stored.GetError(_serializer, _logger);
+        Assert.NotNull(error);
+
+        var targetInfo = error.Data?.GetValue<SettingsDictionary>(Error.KnownDataKeys.TargetInfo, _serializer);
+        Assert.NotNull(targetInfo);
+        Assert.True(targetInfo.TryGetValue("ExceptionType", out string? exceptionType), "@target should contain ExceptionType");
+        Assert.Equal("System.InvalidOperationException", exceptionType);
+        Assert.True(targetInfo.TryGetValue("Method", out string? method), "@target should contain Method");
+        Assert.Contains("TestService.DoWork", method);
+
+        // Assert - is_signature_target should be set on stack frames (FINDING-3b)
+        Assert.NotNull(error.StackTrace);
+        Assert.Equal(2, error.StackTrace.Count);
+        Assert.True(error.StackTrace[0].IsSignatureTarget, "First frame should be signature target");
+        Assert.False(error.StackTrace[1].IsSignatureTarget, "Second frame should not be signature target");
+    }
+
+    [Fact]
+    public async Task SimpleErrorPlugin_SetsTargetInfo_AfterPipelineProcessing()
+    {
+        // Arrange - Create a simple error event with type and stack trace string
+        var ev = GenerateEvent(type: Event.KnownTypes.Error);
+        ev.Data = new DataDictionary
+        {
+            [Event.KnownDataKeys.SimpleError] = new SimpleError
+            {
+                Type = "System.ArgumentNullException",
+                Message = "Value cannot be null",
+                StackTrace = "at TestApp.Services.UserService.GetUser(String userId)"
+            }
+        };
+
+        // Act - Run through the pipeline
+        var context = await _pipeline.RunAsync(ev, _organizationData.GenerateSampleOrganization(_billingManager, _plans), _projectData.GenerateSampleProject());
+        Assert.False(context.HasError, context.ErrorMessage);
+
+        // Fetch from ES to verify serialized form
+        await RefreshDataAsync();
+        var stored = await _eventRepository.GetByIdAsync(ev.Id);
+        Assert.NotNull(stored);
+
+        // Assert - @target should exist with ExceptionType from SimpleErrorPlugin
+        var error = stored.GetSimpleError(_serializer, _logger);
+        Assert.NotNull(error);
+
+        var targetInfo = error.Data?.GetValue<SettingsDictionary>(Error.KnownDataKeys.TargetInfo, _serializer);
+        Assert.NotNull(targetInfo);
+        Assert.True(targetInfo.TryGetValue("ExceptionType", out string? exceptionType), "@target should contain ExceptionType");
+        Assert.Equal("System.ArgumentNullException", exceptionType);
+    }
+
+    private PersistentEvent GenerateEvent(DateTimeOffset? occurrenceDate = null, string? userIdentity = null, string? type = null, string? sessionId = null)
+    {
+        occurrenceDate ??= DateTimeOffset.Now;
+        return _eventData.GenerateEvent(projectId: TestConstants.ProjectId, organizationId: TestConstants.OrganizationId, generateTags: false, generateData: false, occurrenceDate: occurrenceDate, userIdentity: userIdentity, type: type, sessionId: sessionId);
     }
 }

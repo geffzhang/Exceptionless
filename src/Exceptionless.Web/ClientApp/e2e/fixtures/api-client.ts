@@ -1,0 +1,587 @@
+import type { APIRequestContext, APIResponse } from '@playwright/test';
+
+import type { E2EEnvironment } from './environment';
+
+export interface E2ECurrentUser {
+    email_address?: string;
+    id: string;
+    is_email_address_verified?: boolean;
+    product_tours?: Record<string, unknown>;
+}
+
+export interface E2EEvent {
+    id: string;
+    message?: string;
+    reference_id?: string;
+    stack_id?: string;
+    type?: string;
+}
+
+export interface E2EOrganization {
+    id: string;
+    name: string;
+}
+
+export interface E2EProject {
+    id: string;
+    is_configured?: boolean;
+    name: string;
+    organization_id?: string;
+}
+
+export interface E2EToken {
+    id: string;
+    notes?: string;
+}
+
+type MailLinkPath = 'reset-password' | 'signup' | 'verify-email';
+
+interface TokenResult {
+    token: string;
+}
+
+export class E2EApiClient {
+    constructor(
+        private readonly request: APIRequestContext,
+        public readonly environment: E2EEnvironment
+    ) {}
+
+    public async createOrganization(token: string, name: string): Promise<E2EOrganization> {
+        const response = await this.request.post(this.url('organizations'), {
+            data: { name },
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [201], 'create organization');
+        return toOrganization(await readJson(response));
+    }
+
+    public async createProject(token: string, organizationId: string, name: string): Promise<E2EProject> {
+        const response = await this.request.post(this.url('projects'), {
+            data: {
+                delete_bot_data_enabled: true,
+                name,
+                organization_id: organizationId
+            },
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [201], 'create project');
+        const project = toProject(await readJson(response));
+        await waitForCondition(
+            async () => {
+                const listed = await this.request.get(this.url(`organizations/${organizationId}/projects`), {
+                    headers: this.authHeaders(token)
+                });
+                await expectStatus(listed, [200], 'list projects');
+                const projects = await readJson(listed);
+                return Array.isArray(projects) && projects.some((item) => toProject(item).id === project.id);
+            },
+            30_000,
+            `Timed out waiting for E2E project ${project.id} to appear in the projects list`
+        );
+        return project;
+    }
+
+    public async deleteCurrentUser(token: string): Promise<number> {
+        const response = await this.request.delete(this.url('users/me'), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [202, 404], 'delete current user');
+        return response.status();
+    }
+
+    public async deleteOrganization(token: string, organizationId: string): Promise<number> {
+        const response = await this.request.delete(this.url(`organizations/${organizationId}`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [202, 404], 'delete organization');
+        return response.status();
+    }
+
+    public async deleteOrganizationUser(token: string, organizationId: string, email: string): Promise<number> {
+        const response = await this.request.delete(this.url(`organizations/${organizationId}/users/${encodeURIComponent(email)}`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200, 404], 'delete organization user');
+        return response.status();
+    }
+
+    public async deleteProject(token: string, projectId: string): Promise<number> {
+        const response = await this.request.delete(this.url(`projects/${projectId}`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [202, 404], 'delete project');
+        return response.status();
+    }
+
+    public async getAbout(): Promise<Record<string, unknown>> {
+        const response = await this.request.get(this.url('about'));
+
+        await expectStatus(response, [200], 'get about');
+        return toRecord(await readJson(response), 'about response');
+    }
+
+    public async getCurrentUser(token: string): Promise<E2ECurrentUser | undefined> {
+        const response = await this.request.get(this.url('users/me'), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200, 401, 404], 'get current user');
+
+        if (response.status() !== 200) {
+            return undefined;
+        }
+
+        return toCurrentUser(await readJson(response));
+    }
+
+    public async getEvent(token: string, eventId: string): Promise<E2EEvent> {
+        const response = await this.request.get(this.url(`events/${eventId}`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200], 'get event');
+        return toEvent(await readJson(response));
+    }
+
+    public async getEventsByReference(token: string, projectId: string, referenceId: string): Promise<E2EEvent[]> {
+        const response = await this.request.get(this.url(`projects/${projectId}/events/by-ref/${encodeURIComponent(referenceId)}`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200, 404], 'get events by reference');
+
+        if (response.status() === 404) {
+            return [];
+        }
+
+        return toEventArray(await readJson(response));
+    }
+
+    public async getOrganization(token: string, organizationId: string): Promise<E2EOrganization | undefined> {
+        const response = await this.request.get(this.url(`organizations/${organizationId}`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200, 404], 'get organization');
+
+        if (response.status() === 404) {
+            return undefined;
+        }
+
+        return toOrganization(await readJson(response));
+    }
+
+    public async getOrganizations(token: string): Promise<E2EOrganization[]> {
+        const response = await this.request.get(this.url('organizations'), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200], 'get organizations');
+        return toOrganizationArray(await readJson(response));
+    }
+
+    public async getProject(token: string, projectId: string): Promise<E2EProject | undefined> {
+        const response = await this.request.get(this.url(`projects/${projectId}`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200, 404], 'get project');
+
+        if (response.status() === 404) {
+            return undefined;
+        }
+
+        return toProject(await readJson(response));
+    }
+
+    public async getProjectDefaultToken(token: string, projectId: string): Promise<E2EToken> {
+        const response = await this.request.get(this.url(`projects/${projectId}/tokens/default`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200, 201], 'get default project token');
+        return toToken(await readJson(response));
+    }
+
+    public async inviteOrganizationUser(token: string, organizationId: string, email: string): Promise<void> {
+        const response = await this.request.post(this.url(`organizations/${organizationId}/users/${encodeURIComponent(email)}`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200], 'invite organization user');
+    }
+
+    public async login(email = this.environment.email, password = this.environment.password): Promise<string> {
+        const token = await this.loginIfExists(email, password);
+        if (!token) {
+            throw new Error('login failed with status 401');
+        }
+
+        return token;
+    }
+
+    public async loginIfExists(email: string, password: string): Promise<string | undefined> {
+        if (!email || !password) {
+            throw new Error('Email and password are required when using API login.');
+        }
+
+        const response = await this.request.post(this.url('auth/login'), {
+            data: {
+                email,
+                password
+            }
+        });
+
+        await expectStatus(response, [200, 401], 'login');
+        if (response.status() === 401) {
+            return undefined;
+        }
+
+        const result = toTokenResult(await readJson(response));
+
+        return result.token;
+    }
+
+    public async pollForEventByReference(token: string, projectId: string, referenceId: string, timeoutMs = 90_000): Promise<E2EEvent> {
+        const deadline = Date.now() + timeoutMs;
+
+        while (Date.now() < deadline) {
+            const events = await this.getEventsByReference(token, projectId, referenceId);
+            const event = events.find((item) => item.reference_id === referenceId) ?? events[0];
+
+            if (event?.id) {
+                return event;
+            }
+
+            await delay(2_000);
+        }
+
+        throw new Error(`Timed out waiting for E2E event with reference id ${referenceId}`);
+    }
+
+    public async pollForMailLink(email: string, path: MailLinkPath, timeoutMs = 30_000): Promise<string> {
+        const deadline = Date.now() + timeoutMs;
+        const normalizedEmail = email.toLowerCase();
+
+        while (Date.now() < deadline) {
+            const messagesResponse = await this.request.get(`${this.environment.mailUrl}/api/v1/messages`);
+            await expectStatus(messagesResponse, [200], 'list local mail');
+            const messagesResult = toRecord(await readJson(messagesResponse), 'mail messages response');
+            const messages = messagesResult.messages;
+
+            if (!Array.isArray(messages)) {
+                throw new Error('mail messages response did not contain a messages array');
+            }
+
+            for (const value of messages) {
+                const message = toRecord(value, 'mail message summary');
+                const subject = getRequiredString(message, 'Subject', 'mail message summary');
+                if (!subject.toLowerCase().includes(normalizedEmail)) {
+                    continue;
+                }
+
+                const id = getRequiredString(message, 'ID', 'mail message summary');
+                const messageResponse = await this.request.get(`${this.environment.mailUrl}/api/v1/message/${encodeURIComponent(id)}`);
+                await expectStatus(messageResponse, [200], 'read local mail');
+                const messageResult = toRecord(await readJson(messageResponse), 'mail message response');
+                const content = `${getOptionalString(messageResult, 'HTML') ?? ''}\n${getOptionalString(messageResult, 'Text') ?? ''}`;
+                const link = extractMailLink(content, path);
+                if (link) {
+                    // Keep the delivered path, query, and fragment; only adapt the local Aspire origin.
+                    const delivered = new URL(link);
+                    const local = new URL(this.environment.appUrl);
+                    if (!delivered.hostname.endsWith('.localhost') && delivered.hostname !== 'localhost' && delivered.hostname !== '127.0.0.1') {
+                        throw new Error('Expected a local application link in test mail.');
+                    }
+                    return new URL(delivered.pathname + delivered.search + delivered.hash, local.origin).href;
+                }
+            }
+
+            await delay(1_000);
+        }
+
+        throw new Error(`Timed out waiting for ${path} email sent to ${email}`);
+    }
+
+    public async pollForMailToken(email: string, path: 'reset-password' | 'signup', timeoutMs = 30_000): Promise<string> {
+        const link = new URL(await this.pollForMailLink(email, path, timeoutMs));
+        return path === 'signup' ? link.searchParams.get('token')! : decodeURIComponent(link.pathname.split('/').at(-1)!);
+    }
+
+    public async recordProductTour(token: string, tourName: string): Promise<void> {
+        const response = await this.request.put(this.url(`users/me/product-tours/${tourName}/record`), {
+            headers: this.authHeaders(token)
+        });
+
+        await expectStatus(response, [200], 'record product tour');
+    }
+
+    public async signup(name: string, email: string, password: string, inviteToken?: string): Promise<string> {
+        const response = await this.request.post(this.url('auth/signup'), {
+            data: {
+                email,
+                invite_token: inviteToken,
+                name,
+                password
+            }
+        });
+
+        await expectStatus(response, [200], 'signup');
+        const result = toTokenResult(await readJson(response));
+
+        return result.token;
+    }
+
+    public async submitEvent(projectId: string, projectToken: string, event: Record<string, unknown>): Promise<void> {
+        const response = await this.request.post(this.url(`projects/${projectId}/events`), {
+            data: event,
+            headers: this.authHeaders(projectToken)
+        });
+
+        await expectStatus(response, [202], 'submit event');
+    }
+
+    public async waitForCurrentUserDeleted(token: string, timeoutMs = 30_000): Promise<void> {
+        await waitForCondition(
+            async () => !(await this.getCurrentUser(token)),
+            timeoutMs,
+            'Timed out waiting for generated E2E user to be inaccessible after deletion'
+        );
+    }
+
+    public async waitForInvitationListed(token: string, organizationId: string, inviteToken: string): Promise<void> {
+        await waitForCondition(
+            async () => {
+                const response = await this.request.get(this.url('organizations'), {
+                    headers: this.authHeaders(token),
+                    params: { filter: `id:${organizationId}` }
+                });
+                await expectStatus(response, [200], 'find indexed invitation');
+                const organizations = await readJson(response);
+                return (
+                    Array.isArray(organizations) &&
+                    organizations.some((value) => {
+                        const organization = toRecord(value, 'organization');
+                        return (
+                            organization.id === organizationId &&
+                            Array.isArray(organization.invites) &&
+                            organization.invites.some((invite) => toRecord(invite, 'invitation').token === inviteToken)
+                        );
+                    })
+                );
+            },
+            30_000,
+            'Timed out waiting for the test invitation to be indexed'
+        );
+    }
+
+    public async waitForOrganizationDeleted(token: string, organizationId: string, timeoutMs = 30_000): Promise<void> {
+        await waitForCondition(
+            async () => !(await this.getOrganization(token, organizationId)),
+            timeoutMs,
+            `Timed out waiting for E2E organization ${organizationId} to be inaccessible after deletion`
+        );
+    }
+
+    public async waitForOrganizationListed(token: string, organizationId: string, timeoutMs = 30_000): Promise<void> {
+        await waitForCondition(
+            async () => (await this.getOrganizations(token)).some((organization) => organization.id === organizationId),
+            timeoutMs,
+            `Timed out waiting for E2E organization ${organizationId} to appear in the organizations list`
+        );
+    }
+
+    public async waitForOrganizationNotListed(token: string, organizationId: string, timeoutMs = 30_000): Promise<void> {
+        await waitForCondition(
+            async () => !(await this.getOrganizations(token)).some((organization) => organization.id === organizationId),
+            timeoutMs,
+            `Timed out waiting for E2E organization ${organizationId} to disappear from the organizations list`
+        );
+    }
+
+    public async waitForProjectDeleted(token: string, projectId: string, timeoutMs = 30_000): Promise<void> {
+        await waitForCondition(
+            async () => !(await this.getProject(token, projectId)),
+            timeoutMs,
+            `Timed out waiting for E2E project ${projectId} to be inaccessible after deletion`
+        );
+    }
+
+    private authHeaders(token: string): Record<string, string> {
+        return {
+            Authorization: `Bearer ${token}`
+        };
+    }
+
+    private url(path: string): string {
+        const normalizedPath = path.replace(/^\/+/, '');
+        return `${this.environment.apiUrl}/${normalizedPath}`;
+    }
+}
+
+async function delay(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function expectStatus(response: APIResponse, expectedStatuses: number[], operation: string): Promise<void> {
+    if (expectedStatuses.includes(response.status())) {
+        return;
+    }
+
+    const body = await response.text();
+    throw new Error(`${operation} failed with status ${response.status()} ${response.statusText()}${body ? `: ${body}` : ''}`);
+}
+
+function extractMailLink(content: string, path: MailLinkPath): string | undefined {
+    const links = content.replaceAll('&amp;', '&').match(/https?:\/\/[^"'<\\\s]+/g) ?? [];
+    return links.find((link) => {
+        const url = new URL(link);
+        if (path === 'signup') {
+            return url.pathname === '/signup' && url.searchParams.has('token');
+        }
+
+        if (path === 'verify-email') {
+            return url.pathname === '/account/verify' && url.searchParams.has('token');
+        }
+
+        return url.pathname.startsWith('/reset-password/') && !url.searchParams.has('cancel');
+    });
+}
+
+function getOptionalString(value: Record<string, unknown>, key: string): string | undefined {
+    const property = value[key];
+    return typeof property === 'string' ? property : undefined;
+}
+
+function getRequiredString(value: Record<string, unknown>, key: string, context: string): string {
+    const property = getOptionalString(value, key);
+
+    if (!property) {
+        throw new Error(`${context} did not contain a string ${key} value`);
+    }
+
+    return property;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+async function readJson(response: APIResponse): Promise<unknown> {
+    const text = await response.text();
+
+    if (!text) {
+        return undefined;
+    }
+
+    return JSON.parse(text) as unknown;
+}
+
+function toCurrentUser(value: unknown): E2ECurrentUser {
+    const record = toRecord(value, 'current user response');
+
+    return {
+        email_address: getOptionalString(record, 'email_address'),
+        id: getRequiredString(record, 'id', 'current user response'),
+        is_email_address_verified: typeof record.is_email_address_verified === 'boolean' ? record.is_email_address_verified : undefined,
+        product_tours: record.product_tours == null ? undefined : toRecord(record.product_tours, 'current user product tours')
+    };
+}
+
+function toEvent(value: unknown): E2EEvent {
+    const record = toRecord(value, 'event response');
+
+    return {
+        id: getRequiredString(record, 'id', 'event response'),
+        message: getOptionalString(record, 'message'),
+        reference_id: getOptionalString(record, 'reference_id'),
+        stack_id: getOptionalString(record, 'stack_id'),
+        type: getOptionalString(record, 'type')
+    };
+}
+
+function toEventArray(value: unknown): E2EEvent[] {
+    if (!Array.isArray(value)) {
+        throw new Error('events by reference response was not an array');
+    }
+
+    return value.map(toEvent);
+}
+
+function toOrganization(value: unknown): E2EOrganization {
+    const record = toRecord(value, 'organization response');
+
+    return {
+        id: getRequiredString(record, 'id', 'organization response'),
+        name: getRequiredString(record, 'name', 'organization response')
+    };
+}
+
+function toOrganizationArray(value: unknown): E2EOrganization[] {
+    if (!Array.isArray(value)) {
+        throw new Error('organizations response was not an array');
+    }
+
+    return value.map(toOrganization);
+}
+
+function toProject(value: unknown): E2EProject {
+    const record = toRecord(value, 'project response');
+
+    return {
+        id: getRequiredString(record, 'id', 'project response'),
+        is_configured: typeof record.is_configured === 'boolean' ? record.is_configured : undefined,
+        name: getRequiredString(record, 'name', 'project response'),
+        organization_id: getOptionalString(record, 'organization_id')
+    };
+}
+
+function toRecord(value: unknown, context: string): Record<string, unknown> {
+    if (!isRecord(value)) {
+        throw new Error(`${context} was not an object`);
+    }
+
+    return value;
+}
+
+function toToken(value: unknown): E2EToken {
+    const record = toRecord(value, 'token response');
+
+    return {
+        id: getRequiredString(record, 'id', 'token response'),
+        notes: getOptionalString(record, 'notes')
+    };
+}
+
+function toTokenResult(value: unknown): TokenResult {
+    const record = toRecord(value, 'token result');
+
+    return {
+        token: getRequiredString(record, 'token', 'token result')
+    };
+}
+
+async function waitForCondition(condition: () => Promise<boolean>, timeoutMs: number, timeoutMessage: string): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let lastError: Error | undefined;
+
+    while (Date.now() < deadline) {
+        try {
+            if (await condition()) {
+                return;
+            }
+        } catch (error) {
+            lastError = error instanceof Error ? error : new Error(String(error));
+        }
+
+        await delay(1_000);
+    }
+
+    throw new Error(`${timeoutMessage}${lastError ? `: ${lastError.message}` : ''}`);
+}

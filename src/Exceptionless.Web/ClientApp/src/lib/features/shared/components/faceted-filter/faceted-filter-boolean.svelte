@@ -1,0 +1,119 @@
+<script lang="ts">
+    import * as FacetedFilter from '#comp/faceted-filter/index.ts';
+    import Boolean from '#comp/formatters/boolean.svelte';
+    import { Button } from '#comp/ui/button/index.ts';
+    import { Label } from '#comp/ui/label/index.ts';
+    import * as Popover from '#comp/ui/popover/index.ts';
+    import * as RadioGroup from '#comp/ui/radio-group/index.ts';
+    import Separator from '#comp/ui/separator/separator.svelte';
+
+    interface Props {
+        changed: (value?: boolean) => void;
+        hidden?: boolean;
+        open: boolean;
+        remove: () => void;
+        title: string;
+        toggleHidden?: () => void;
+        value?: boolean;
+    }
+
+    let { changed, hidden = false, open = $bindable(), remove, title, toggleHidden, value }: Props = $props();
+
+    // eslint-disable-next-line svelte/prefer-writable-derived
+    let updatedValue = $state<boolean | undefined>();
+
+    let radioValue = $derived(updatedValue === undefined ? 'no-value' : updatedValue === true ? 'yes' : 'no');
+
+    $effect.pre(() => {
+        updatedValue = value;
+    });
+
+    export function onClearFilter() {
+        updatedValue = undefined;
+    }
+
+    function applyAndClose() {
+        open = false;
+    }
+
+    function cancelAndClose() {
+        updatedValue = value;
+        changed(updatedValue);
+        open = false;
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            applyAndClose();
+        } else if (event.key === 'Escape') {
+            event.preventDefault();
+            cancelAndClose();
+        }
+    }
+
+    function handleRadioChange(selectedValue: string) {
+        if (selectedValue === 'yes') {
+            updatedValue = true;
+        } else if (selectedValue === 'no') {
+            updatedValue = false;
+        } else if (selectedValue === 'no-value') {
+            updatedValue = undefined;
+        }
+
+        changed(updatedValue);
+    }
+
+    function onEscapeKeydown(e: KeyboardEvent) {
+        e.preventDefault();
+        cancelAndClose();
+    }
+
+    function onOpenChange(isOpen: boolean) {
+        if (!isOpen) {
+            open = false;
+        }
+    }
+</script>
+
+<Popover.Root bind:open {onOpenChange}>
+    <Popover.Trigger>
+        {#snippet child({ props })}
+            <Button {...props} class="gap-x-1 px-3" size="lg" variant="outline" aria-describedby={`${title}-help`}>
+                {title}
+                <Separator class="mx-2" orientation="vertical" />
+                {#if value !== undefined}
+                    <FacetedFilter.BadgeValue><Boolean {value} /></FacetedFilter.BadgeValue>
+                {:else}
+                    <FacetedFilter.BadgeValue>No Value</FacetedFilter.BadgeValue>
+                {/if}
+            </Button>
+        {/snippet}
+    </Popover.Trigger>
+    <Popover.Content align="start" class="p-0" side="bottom" trapFocus={false} {onEscapeKeydown} onFocusOutside={(e) => e.preventDefault()}>
+        <div class="border-b p-4">
+            <RadioGroup.Root
+                value={radioValue}
+                onValueChange={handleRadioChange}
+                onkeydown={handleKeyDown}
+                aria-describedby={`${title}-help`}
+                aria-label={title}
+            >
+                <div class="flex items-center space-x-2">
+                    <RadioGroup.Item value="yes" id="boolean-yes" />
+                    <Label for="boolean-yes">Yes</Label>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <RadioGroup.Item value="no" id="boolean-no" />
+                    <Label for="boolean-no">No</Label>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <RadioGroup.Item value="no-value" id="boolean-no-value" />
+                    <Label for="boolean-no-value">No Value</Label>
+                </div>
+            </RadioGroup.Root>
+        </div>
+        <div id={`${title}-help`} class="sr-only">Arrow keys select. Enter applies, Escape cancels.</div>
+        <FacetedFilter.Actions clear={onClearFilter} {hidden} {remove} showClear={updatedValue !== undefined} {toggleHidden} />
+    </Popover.Content>
+</Popover.Root>

@@ -1,88 +1,94 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using Exceptionless.Tests.Utility;
-using Exceptionless.Core.Extensions;
+using System.Text.Json;
 using Exceptionless.Core.Models;
 using Exceptionless.Core.Plugins.Formatting;
-using Newtonsoft.Json;
+using Exceptionless.Tests.Utility;
+using Foundatio.Serializer;
 using Xunit;
-using Xunit.Abstractions;
 
-namespace Exceptionless.Tests.Plugins {
-    public class SummaryDataTests : TestWithServices {
-        public SummaryDataTests(ServicesFixture fixture, ITestOutputHelper output) : base(fixture, output) {}
+namespace Exceptionless.Tests.Plugins;
 
-#if DEBUG
-        [Theory]
-        [MemberData(nameof(Events))]
-#endif
-        public void EventSummaryData(string path) {
-            var settings = GetService<JsonSerializerSettings>();
-            settings.Formatting = Formatting.Indented;
+public class SummaryDataTests : TestWithServices
+{
+    private readonly ITextSerializer _serializer;
+    private readonly JsonSerializerOptions _jsonOptions;
 
-            string json = File.ReadAllText(path);
+    public SummaryDataTests(ITestOutputHelper output) : base(output)
+    {
+        _serializer = GetService<ITextSerializer>();
+        _jsonOptions = GetService<JsonSerializerOptions>();
+    }
 
-            var ev = json.FromJson<PersistentEvent>(settings);
-            Assert.NotNull(ev);
+    [Theory]
+    [MemberData(nameof(Events))]
+    public async Task EventSummaryData(string path)
+    {
+        string json = await File.ReadAllTextAsync(path, TestCancellationToken);
+        Assert.NotNull(json);
 
-            var data = GetService<FormattingPluginManager>().GetEventSummaryData(ev);
-            var summary = new EventSummaryModel {
-                TemplateKey = data.TemplateKey,
-                Id = ev.Id,
-                Date = ev.Date,
-                Data = data.Data
-            };
+        var ev = _serializer.Deserialize<PersistentEvent>(json);
+        Assert.NotNull(ev);
 
-            string expectedContent = File.ReadAllText(Path.ChangeExtension(path, "summary.json"));
-            Assert.Equal(expectedContent, JsonConvert.SerializeObject(summary, settings));
+        var data = GetService<FormattingPluginManager>().GetEventSummaryData(ev);
+        var summary = new EventSummaryModel
+        {
+            Date = ev.Date,
+            Id = ev.Id,
+            TemplateKey = data.TemplateKey,
+            Data = data.Data
+        };
+
+        string expectedContent = await File.ReadAllTextAsync(Path.ChangeExtension(path, "summary.json"), TestCancellationToken);
+        JsonAssert.AssertJsonEquivalent(expectedContent, JsonSerializer.Serialize(summary, _jsonOptions));
+    }
+
+    [Theory]
+    [MemberData(nameof(Stacks))]
+    public async Task StackSummaryData(string path)
+    {
+        string json = await File.ReadAllTextAsync(path, TestCancellationToken);
+        Assert.NotNull(json);
+
+        var stack = _serializer.Deserialize<Stack>(json);
+        Assert.NotNull(stack);
+
+        var data = GetService<FormattingPluginManager>().GetStackSummaryData(stack);
+        var summary = new StackSummaryModel
+        {
+            Title = stack.Title,
+            Status = stack.Status,
+            Total = 1,
+            Id = data.Id,
+            TemplateKey = data.TemplateKey,
+            Data = data.Data
+        };
+
+        string expectedContent = await File.ReadAllTextAsync(Path.ChangeExtension(path, "summary.json"), TestCancellationToken);
+        JsonAssert.AssertJsonEquivalent(expectedContent, JsonSerializer.Serialize(summary, _jsonOptions));
+    }
+
+    public static IEnumerable<object[]> Events
+    {
+        get
+        {
+            var result = new List<object[]>();
+            foreach (string file in Directory.GetFiles(Path.Combine("..", "..", "..", "Search", "Data"), "event*.json", SearchOption.AllDirectories))
+                if (!file.EndsWith("summary.json"))
+                    result.Add([Path.GetFullPath(file)]);
+
+            return result.ToArray();
         }
+    }
 
-#if DEBUG
-        [Theory]
-        [MemberData(nameof(Stacks))]
-#endif
-        public void StackSummaryData(string path) {
-            var settings = GetService<JsonSerializerSettings>();
-            settings.Formatting = Formatting.Indented;
+    public static IEnumerable<object[]> Stacks
+    {
+        get
+        {
+            var result = new List<object[]>();
+            foreach (string file in Directory.GetFiles(Path.Combine("..", "..", "..", "Search", "Data"), "stack*.json", SearchOption.AllDirectories))
+                if (!file.EndsWith("summary.json"))
+                    result.Add([Path.GetFullPath(file)]);
 
-            string json = File.ReadAllText(path);
-            var stack = json.FromJson<Stack>(settings);
-            Assert.NotNull(stack);
-
-            var data = GetService<FormattingPluginManager>().GetStackSummaryData(stack);
-            var summary = new StackSummaryModel {
-                TemplateKey = data.TemplateKey,
-                Data = data.Data,
-                Id = stack.Id,
-                Title = stack.Title,
-                Total = 1,
-            };
-
-            string expectedContent = File.ReadAllText(Path.ChangeExtension(path, "summary.json"));
-            Assert.Equal(expectedContent, JsonConvert.SerializeObject(summary, settings));
-        }
-
-        public static IEnumerable<object[]> Events {
-            get {
-                var result = new List<object[]>();
-                foreach (string file in Directory.GetFiles(Path.Combine("..", "..", "..", "Search", "Data"), "event*.json", SearchOption.AllDirectories))
-                    if (!file.EndsWith("summary.json"))
-                        result.Add(new object[] { Path.GetFullPath(file) });
-
-                return result.ToArray();
-            }
-        }
-
-        public static IEnumerable<object[]> Stacks {
-            get {
-                var result = new List<object[]>();
-                foreach (string file in Directory.GetFiles(Path.Combine("..", "..", "..", "Search", "Data"), "stack*.json", SearchOption.AllDirectories))
-                    if (!file.EndsWith("summary.json"))
-                        result.Add(new object[] { Path.GetFullPath(file) });
-
-                return result.ToArray();
-            }
+            return result.ToArray();
         }
     }
 }

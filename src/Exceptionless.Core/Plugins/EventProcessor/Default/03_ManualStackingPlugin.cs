@@ -1,22 +1,29 @@
-﻿using System;
-using System.Threading.Tasks;
+﻿using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Pipeline;
-using Exceptionless.Core.Extensions;
+using Foundatio.Serializer;
 using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Plugins.EventProcessor {
-    [Priority(3)]
-    public sealed class ManualStackingPlugin : EventProcessorPluginBase {
-        public ManualStackingPlugin(ILoggerFactory loggerFactory = null) : base(loggerFactory) {}
+namespace Exceptionless.Core.Plugins.EventProcessor;
 
-        public override Task EventProcessingAsync(EventContext context) {
-            var msi = context.Event.GetManualStackingInfo();
-            if (msi?.SignatureData != null) {
-                foreach (var kvp in msi.SignatureData)
-                    context.StackSignatureData.AddItemIfNotEmpty(kvp.Key, kvp.Value);
-            }
+[Priority(3)]
+public sealed class ManualStackingPlugin : EventProcessorPluginBase
+{
+    private readonly ITextSerializer _serializer;
 
-            return Task.CompletedTask;
+    public ManualStackingPlugin(ITextSerializer serializer, AppOptions options, ILoggerFactory loggerFactory) : base(options, loggerFactory)
+    {
+        _serializer = serializer;
+    }
+
+    public override Task EventProcessingAsync(EventContext context)
+    {
+        var msi = context.Event.GetManualStackingInfo(_serializer, _logger);
+        if (msi?.SignatureData is not null)
+        {
+            foreach (var kvp in msi.SignatureData)
+                context.StackSignatureData.AddItemIfNotEmpty(kvp.Key, kvp.Value);
         }
+
+        return Task.CompletedTask;
     }
 }

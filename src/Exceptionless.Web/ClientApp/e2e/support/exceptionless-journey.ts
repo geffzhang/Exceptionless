@@ -1,0 +1,270 @@
+import { expect, type Page, type TestInfo } from '@playwright/test';
+
+import type { E2EApiClient } from '../fixtures/api-client';
+import type { E2EScenario } from '../fixtures/e2e-test';
+
+import { createReferenceId, createRunName, E2E_ORGANIZATION_NAME_PREFIX, E2E_TEST_PASSWORD } from '../fixtures/e2e-test';
+import { runCleanupStep, throwIfCleanupFailed } from './cleanup';
+import { seedRepresentativeEvent } from './event-data';
+import {
+    escapeRegExp,
+    getIdFromUrl,
+    getProjectTokenFromConfigurePage,
+    getUserToken,
+    getVisibleRow,
+    getVisibleText,
+    selectProjectType,
+    waitForEmailValidation
+} from './page-helpers';
+
+const FIXED_VERSION = '1.0.0';
+
+export class ExceptionlessE2EJourney {
+    public email: string;
+    public eventId?: string;
+    public message: string;
+    public organizationId?: string;
+    public organizationName: string;
+    public projectId?: string;
+    public projectName: string;
+    public projectToken?: string;
+    public referenceId: string;
+    public run: string;
+    public stackId?: string;
+    public userName: string;
+    public userToken?: string;
+
+    constructor(
+        private readonly page: Page,
+        private readonly e2eApi: E2EApiClient,
+        testInfoOrScenario: E2EScenario | TestInfo
+    ) {
+        if (isE2EScenario(testInfoOrScenario)) {
+            this.email = testInfoOrScenario.email;
+            this.message = testInfoOrScenario.message;
+            this.organizationId = testInfoOrScenario.organizationId;
+            this.organizationName = testInfoOrScenario.organizationName;
+            this.projectId = testInfoOrScenario.projectId;
+            this.projectName = testInfoOrScenario.projectName;
+            this.projectToken = testInfoOrScenario.projectToken;
+            this.referenceId = testInfoOrScenario.referenceId;
+            this.run = testInfoOrScenario.run;
+            this.userName = testInfoOrScenario.userName;
+            this.userToken = testInfoOrScenario.userToken;
+
+            return;
+        }
+
+        const testInfo = testInfoOrScenario;
+        this.run = createRunName(e2eApi.environment.runId, testInfo);
+        this.userName = `Playwright User ${this.run}`;
+        this.email = `playwright-${this.run}@exceptionless.test`.toLowerCase();
+        this.organizationName = `${E2E_ORGANIZATION_NAME_PREFIX} ${this.run}`;
+        this.projectName = `Playwright Project ${this.run}`;
+        this.referenceId = createReferenceId(this.run);
+        this.message = `Playwright onboarding event ${this.run}`;
+    }
+
+    public static fromScenario(page: Page, e2eApi: E2EApiClient, scenario: E2EScenario): ExceptionlessE2EJourney {
+        return new ExceptionlessE2EJourney(page, e2eApi, scenario);
+    }
+
+    public async cleanup(): Promise<void> {
+        if (!this.userToken) {
+            return;
+        }
+
+        const errors: Error[] = [];
+
+        if (!this.organizationId) {
+            await runCleanupStep(errors, `find organization ${this.organizationName}`, async () => {
+                this.organizationId = await this.getOrganizationIdByName();
+            });
+        }
+
+        if (this.projectId) {
+            await runCleanupStep(errors, `delete project ${this.projectId}`, async () => {
+                await this.e2eApi.deleteProject(this.userToken!, this.projectId!);
+                await this.e2eApi.waitForProjectDeleted(this.userToken!, this.projectId!);
+            });
+        }
+
+        if (this.organizationId) {
+            await runCleanupStep(errors, `delete organization ${this.organizationId}`, async () => {
+                await this.e2eApi.deleteOrganization(this.userToken!, this.organizationId!);
+                await this.e2eApi.waitForOrganizationDeleted(this.userToken!, this.organizationId!);
+            });
+        }
+
+        await runCleanupStep(errors, 'delete generated user', async () => {
+            await this.e2eApi.deleteCurrentUser(this.userToken!);
+            await this.e2eApi.waitForCurrentUserDeleted(this.userToken!);
+        });
+
+        throwIfCleanupFailed(errors);
+    }
+
+    public async createFirstProjectAndVerifyConfigureToken(): Promise<void> {
+        if (this.projectId) {
+            await this.page.goto(`/project/${this.projectId}/configure`);
+        } else {
+            await this.page.getByRole('link', { name: 'add a new project' }).click();
+            await expect(this.page.getByRole('heading', { name: 'Add Project' })).toBeVisible();
+
+            await this.page.getByLabel('Project Name', { exact: true }).fill(this.projectName);
+            await this.page.getByRole('button', { name: 'Continue to Client Setup' }).click();
+
+            await this.page.waitForURL(/\/project\/[^/]+\/configure/, { timeout: 30_000 });
+            this.projectId = getIdFromUrl(this.page, /\/project\/([^/]+)\/configure/);
+        }
+
+        await expect(this.page.getByRole('combobox', { exact: true, name: 'Project type' })).toHaveText('Please select a project type');
+
+        await selectProjectType(this.page, 'Bash Shell');
+        await expect(this.page.getByText('Execute the following in your shell.')).toBeVisible();
+        await expect(this.page.getByText(/Authorization: Bearer (?!YOUR_API_KEY)[A-Za-z0-9_-]+/)).toBeVisible();
+
+        this.projectToken = await getProjectTokenFromConfigurePage(this.page);
+    }
+
+    public async expectEventDetails(): Promise<void> {
+        expect(this.eventId).toBeTruthy();
+
+        await this.page.goto(`/event/${this.eventId}`);
+        await expect(getVisibleText(this.page, this.message)).toBeVisible({ timeout: 30_000 });
+        await expect(this.page.getByRole('tab', { name: 'Overview' })).toBeVisible();
+        await expect(this.page.getByRole('tab', { name: 'Exception' })).toBeVisible();
+        await expect(this.page.getByRole('tab', { name: 'Request' })).toBeVisible();
+        await expect(this.page.getByRole('tab', { name: 'Machine & runtime' })).toBeVisible();
+        await expect(this.page.getByRole('tab', { name: 'Extended Data' })).toBeVisible();
+
+        await expect(getVisibleRow(this.page, new RegExp(`^Reference\\s+${escapeRegExp(this.referenceId)}$`))).toBeVisible();
+        await expect(getVisibleRow(this.page, 'Source', 'playwright-e2e')).toBeVisible();
+        await expect(getVisibleRow(this.page, 'Error Type', 'PlaywrightOnboardingException')).toBeVisible();
+
+        await this.page.getByRole('tab', { name: 'Exception' }).click();
+        const exceptionPanel = this.page.getByLabel('Exception', { exact: true });
+        await expect(getVisibleRow(this.page, 'Message', this.message)).toBeVisible();
+        await expect(exceptionPanel.getByText('exceptionless-journey.ts:42:13')).toBeVisible();
+
+        await this.page.getByRole('tab', { name: 'Request' }).click();
+        await expect(getVisibleRow(this.page, 'HTTP Method', 'GET')).toBeVisible();
+        await expect(getVisibleRow(this.page, 'URL', '/e2e/onboarding')).toBeVisible();
+        await expect(getVisibleRow(this.page, 'User Agent', 'Exceptionless Playwright E2E')).toBeVisible();
+
+        await this.page.getByRole('tab', { name: 'Machine & runtime' }).click();
+        await expect(getVisibleRow(this.page, 'Machine Name', 'playwright-runner')).toBeVisible();
+        await expect(getVisibleRow(this.page, 'Process Name', 'e2e-tests')).toBeVisible();
+
+        await this.page.getByRole('tab', { name: 'Extended Data' }).click();
+        await expect(getVisibleText(this.page, 'e2e_reference')).toBeVisible();
+        await expect(getVisibleText(this.page, this.referenceId)).toBeVisible();
+        await expect(getVisibleText(this.page, 'run_id')).toBeVisible();
+        await expect(getVisibleText(this.page, this.e2eApi.environment.runId)).toBeVisible();
+    }
+
+    public async expectEventInPrimaryViews(): Promise<void> {
+        await this.page.goto('/event');
+        await expect(this.page.getByRole('heading', { name: 'Events' })).toBeVisible();
+        await expect(getVisibleText(this.page, this.message)).toBeVisible({ timeout: 30_000 });
+
+        await this.page.goto('/stack');
+        await expect(this.page.getByRole('heading', { name: 'Stacks' })).toBeVisible();
+        await expect(getVisibleText(this.page, this.message)).toBeVisible({ timeout: 30_000 });
+
+        await this.page.goto('/stream');
+        await expect(this.page.getByRole('heading', { name: 'Event Stream' })).toBeVisible();
+        await expect(getVisibleText(this.page, this.message)).toBeVisible({ timeout: 30_000 });
+    }
+
+    public async markStackFixed(version = FIXED_VERSION): Promise<void> {
+        expect(this.stackId).toBeTruthy();
+
+        await this.expectEventDetails();
+        await this.page.getByRole('button', { exact: true, name: 'Open' }).click();
+        await this.page.getByRole('menuitem', { name: 'Fixed' }).click();
+        await expect(this.page.getByRole('heading', { name: 'Mark Stack As Fixed' })).toBeVisible();
+        await this.page.getByLabel('Version', { exact: true }).fill(version);
+
+        await this.page.getByRole('button', { name: 'Mark Stack Fixed' }).click();
+        await expect(this.page.getByRole('button', { exact: true, name: 'Fixed' })).toBeVisible({ timeout: 30_000 });
+
+        await expect(async () => {
+            await this.page.reload();
+            await expect(this.page.getByRole('button', { exact: true, name: 'Fixed' })).toBeVisible({ timeout: 5_000 });
+            await expect(getVisibleText(this.page, `Fixed in ${version}`)).toBeVisible({ timeout: 5_000 });
+        }).toPass({ intervals: [1_000, 2_000, 5_000], timeout: 30_000 });
+    }
+
+    public async onboardProject(): Promise<void> {
+        await this.signUpAndCreateOrganization();
+        await this.createFirstProjectAndVerifyConfigureToken();
+    }
+
+    public async signUpAndCreateOrganization(): Promise<void> {
+        await this.page.goto('/signup');
+
+        await this.page.getByLabel('Name', { exact: true }).fill(this.userName);
+        await this.page.getByLabel('Email', { exact: true }).fill(this.email);
+        await waitForEmailValidation(this.page);
+        await this.page.getByLabel('Password', { exact: true }).fill(E2E_TEST_PASSWORD);
+        await this.page.getByRole('button', { name: 'Create My Account' }).click();
+
+        this.userToken = await getUserToken(this.page);
+        const setupHeading = this.page.getByText('Set Up Exceptionless');
+
+        if (!(await setupHeading.isVisible())) {
+            await this.page.goto('/organization/add');
+        }
+
+        await expect(setupHeading).toBeVisible({ timeout: 30_000 });
+
+        await this.page.getByLabel('Organization Name', { exact: true }).fill(this.organizationName);
+        await this.page.getByLabel('Project Name', { exact: true }).fill(this.projectName);
+        await this.page.getByRole('button', { name: 'Continue' }).click();
+
+        await this.page.waitForURL(/\/project\/[^/]+\/configure/, { timeout: 30_000 });
+        this.projectId = getIdFromUrl(this.page, /\/project\/([^/]+)\/configure/);
+        this.organizationId = await this.getOrganizationIdByName();
+        await expect(this.page.getByRole('combobox', { exact: true, name: 'Project type' })).toHaveText('Please select a project type');
+    }
+
+    public async submitRepresentativeEvent(): Promise<void> {
+        expect(this.projectId).toBeTruthy();
+        expect(this.projectToken).toBeTruthy();
+        expect(this.userToken).toBeTruthy();
+
+        const event = await seedRepresentativeEvent(this.e2eApi, this.userToken!, {
+            message: this.message,
+            projectId: this.projectId!,
+            projectToken: this.projectToken!,
+            referenceId: this.referenceId
+        });
+        expect(event.reference_id).toBe(this.referenceId);
+        expect(event.stack_id).toBeTruthy();
+
+        this.eventId = event.id;
+        this.stackId = event.stack_id;
+    }
+
+    private async getOrganizationIdByName(): Promise<string> {
+        expect(this.userToken).toBeTruthy();
+
+        await expect
+            .poll(async () => (await this.e2eApi.getOrganizations(this.userToken!)).find((item) => item.name === this.organizationName)?.id, {
+                timeout: 30_000
+            })
+            .toBeTruthy();
+
+        const organization = (await this.e2eApi.getOrganizations(this.userToken!)).find((item) => item.name === this.organizationName);
+        if (!organization?.id) {
+            throw new Error(`Could not find organization ${this.organizationName}`);
+        }
+
+        return organization.id;
+    }
+}
+
+function isE2EScenario(value: E2EScenario | TestInfo): value is E2EScenario {
+    return 'projectToken' in value;
+}

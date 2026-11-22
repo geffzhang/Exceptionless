@@ -1,0 +1,102 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 100000
+preemptionPolicy: PreemptLowerPriority
+globalDefault: false
+description: "For critical workloads that may preempt normal pods."
+
+---
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: ex-prod
+  namespace: ex-prod
+spec:
+  version: 8.19.22
+  image: exceptionless/elasticsearch:8.19.22 # https://github.com/exceptionless/Exceptionless/tree/main/build/docker/elasticsearch
+  monitoring:
+    metrics:
+      elasticsearchRefs:
+        - name: elastic-monitor
+          namespace: elastic-system
+    logs:
+      elasticsearchRefs:
+        - name: elastic-monitor
+          namespace: elastic-system
+  secureSettings:
+    - secretName: ex-prod-snapshots
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
+  nodeSets:
+    - name: main-v2
+      count: 4
+      config:
+        node.roles: [data, ingest, master]
+        action.destructive_requires_name: true
+        # if not setting max_map_count in an init container, then use this setting
+        #node.store.allow_mmap: false
+      podTemplate:
+        spec:
+          priorityClassName: high-priority
+          containers:
+            - name: elasticsearch
+              env:
+                - name: ES_JAVA_OPTS
+                  value: -Xms9g -Xmx9g
+              resources:
+                requests:
+                  memory: 18Gi
+                  cpu: 4
+                limits:
+                  memory: 18Gi
+                  cpu: 4
+          # related to "node.store.allow_mmap: false" setting above
+          initContainers:
+            - name: sysctl
+              securityContext:
+                privileged: true
+                runAsUser: 0
+              command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 600Gi
+            storageClassName: managed-csi-premium
+
+---
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: ex-prod
+  namespace: ex-prod
+spec:
+  version: 8.19.22
+  count: 1
+  elasticsearchRef:
+    name: ex-prod
+  config:
+    xpack.monitoring.enabled: true
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
+  podTemplate:
+    spec:
+      containers:
+        - name: kibana
+          resources:
+            requests:
+              memory: 500Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+              cpu: 800m

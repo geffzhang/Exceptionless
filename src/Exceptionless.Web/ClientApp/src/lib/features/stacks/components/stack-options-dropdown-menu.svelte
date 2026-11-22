@@ -1,0 +1,175 @@
+<script lang="ts">
+    import { goto } from '$app/navigation';
+    import { resolve } from '$app/paths';
+    import Reference from '@lucide/svelte/icons/link-2';
+    import ListTree from '@lucide/svelte/icons/list-tree';
+    import Settings from '@lucide/svelte/icons/settings';
+    import Delete from '@lucide/svelte/icons/trash';
+    import PromoteToExternal from '@lucide/svelte/icons/trending-up';
+    import { toast } from 'svelte-sonner';
+
+    import Button from '#comp/ui/button/button.svelte';
+    import * as DropdownMenu from '#comp/ui/dropdown-menu/index.ts';
+    import { showBillingDialogOnUpgradeProblem } from '#features/billing/index.ts';
+
+    import type { Stack } from '../models';
+
+    import { deleteMarkCritical, deleteStack, postAddLink, postMarkCritical, postPromote } from '../api.svelte';
+    import AddStackReferenceDialog from './dialogs/add-stack-reference-dialog.svelte';
+    import RemoveStackDialog from './dialogs/remove-stack-dialog.svelte';
+    import RequiresPromotedWebHookDialog from './dialogs/requires-promoted-web-hook-dialog.svelte';
+    import StackingInformationDialog from './dialogs/stacking-information-dialog.svelte';
+
+    interface Props {
+        onDeleted?: () => void;
+        stack: Stack;
+    }
+
+    let { onDeleted, stack }: Props = $props();
+    let openAddStackReferenceDialog = $state<boolean>(false);
+    let openRemoveStackDialog = $state<boolean>(false);
+    let openRequiresPromotedWebHookDialog = $state<boolean>(false);
+    let openStackingInformationDialog = $state<boolean>(false);
+
+    const addLink = postAddLink({
+        route: {
+            get id() {
+                return stack?.id;
+            }
+        }
+    });
+
+    const removeStacks = deleteStack({
+        route: {
+            get ids() {
+                return [stack?.id].filter(Boolean);
+            }
+        }
+    });
+
+    const markCritical = postMarkCritical({
+        route: {
+            get ids() {
+                return [stack?.id].filter(Boolean);
+            }
+        }
+    });
+
+    const markNotCritical = deleteMarkCritical({
+        route: {
+            get ids() {
+                return [stack?.id].filter(Boolean);
+            }
+        }
+    });
+
+    const promote = postPromote({
+        route: {
+            get ids() {
+                return [stack?.id].filter(Boolean);
+            }
+        }
+    });
+
+    async function addReference(url: string) {
+        if (!stack.references?.includes(url)) {
+            await addLink.mutateAsync(url);
+        }
+    }
+
+    async function navigateToProjectIntegrations() {
+        await goto(
+            resolve('/(app)/project/[projectId]/manage', {
+                projectId: stack.project_id
+            })
+        );
+    }
+
+    async function promoteToExternal() {
+        const response = await promote.mutateAsync();
+        if (response.status === 200) {
+            toast.success('Successfully promoted stack!');
+            return;
+        }
+
+        if (response.status === 426) {
+            showBillingDialogOnUpgradeProblem(response.problem, stack.organization_id, () => promoteToExternal());
+            return;
+        }
+
+        if (response.status === 501) {
+            openRequiresPromotedWebHookDialog = true;
+            return;
+        }
+
+        toast.error(response.problem?.detail ?? 'An error occurred while promoting the stack.');
+    }
+
+    async function remove() {
+        await removeStacks.mutateAsync();
+        toast.success('Successfully queued the stack for deletion.');
+        onDeleted?.();
+    }
+
+    async function updateCritical() {
+        if (stack.occurrences_are_critical) {
+            await markNotCritical.mutateAsync();
+        } else {
+            await markCritical.mutateAsync();
+        }
+    }
+</script>
+
+<DropdownMenu.Root>
+    <DropdownMenu.Trigger>
+        {#snippet child({ props })}
+            <Button {...props} aria-label="Stack options" title="Stack options" variant="outline" size="icon">
+                <Settings />
+            </Button>
+        {/snippet}
+    </DropdownMenu.Trigger>
+    <DropdownMenu.Content align="end">
+        <DropdownMenu.Group>
+            <DropdownMenu.GroupHeading>Stack Options</DropdownMenu.GroupHeading>
+            <DropdownMenu.Separator />
+            <DropdownMenu.CheckboxItem
+                checked={stack.occurrences_are_critical}
+                onclick={() => updateCritical()}
+                title="All future occurrences will be marked as critical"
+            >
+                Future Occurrences Are Critical
+            </DropdownMenu.CheckboxItem>
+            <DropdownMenu.Separator />
+            <DropdownMenu.Item onclick={() => promoteToExternal()} title="Used to promote stacks to external systems">
+                <PromoteToExternal class="mr-2 size-4" />
+                Promote To External
+            </DropdownMenu.Item>
+            <DropdownMenu.Item onclick={() => (openAddStackReferenceDialog = true)} title="Add a reference link to an external resource">
+                <Reference class="mr-2 size-4" />
+                Add Reference Link
+            </DropdownMenu.Item>
+            <DropdownMenu.Item onclick={() => (openStackingInformationDialog = true)} title="View the values used to group events into this stack">
+                <ListTree class="mr-2 size-4" />
+                View Stacking Information
+            </DropdownMenu.Item>
+            <DropdownMenu.Separator />
+            <DropdownMenu.Item onclick={() => (openRemoveStackDialog = true)} class="text-destructive" title="Delete this stack">
+                <Delete class="mr-2 size-4" />
+                Delete
+            </DropdownMenu.Item>
+        </DropdownMenu.Group>
+    </DropdownMenu.Content>
+</DropdownMenu.Root>
+
+{#if openStackingInformationDialog}
+    <StackingInformationDialog bind:open={openStackingInformationDialog} {stack} />
+{/if}
+{#if openAddStackReferenceDialog}
+    <AddStackReferenceDialog bind:open={openAddStackReferenceDialog} save={addReference} />
+{/if}
+{#if openRemoveStackDialog}
+    <RemoveStackDialog bind:open={openRemoveStackDialog} {remove} />
+{/if}
+{#if openRequiresPromotedWebHookDialog}
+    <RequiresPromotedWebHookDialog bind:open={openRequiresPromotedWebHookDialog} navigate={navigateToProjectIntegrations} />
+{/if}

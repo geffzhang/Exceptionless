@@ -1,21 +1,21 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Threading.Tasks;
-using Exceptionless.Core.Plugins.EventProcessor;
+﻿using Exceptionless.Core.Plugins.EventProcessor;
 using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Pipeline {
-    [Priority(5)]
-    public class RunEventProcessingPluginsAction : EventPipelineActionBase {
-        private readonly EventPluginManager _pluginManager;
+namespace Exceptionless.Core.Pipeline;
 
-        public RunEventProcessingPluginsAction(EventPluginManager pluginManager, ILoggerFactory loggerFactory = null) : base(loggerFactory) {
-            _pluginManager = pluginManager;
-            ContinueOnError = true;
-        }
+[Priority(5)]
+public class RunEventProcessingPluginsAction : EventPipelineActionBase
+{
+    private readonly EventPluginManager _pluginManager;
 
-        public override Task ProcessBatchAsync(ICollection<EventContext> contexts) {
-            return _pluginManager.EventBatchProcessingAsync(contexts);
-        }
+    public RunEventProcessingPluginsAction(EventPluginManager pluginManager, AppOptions options, ILoggerFactory loggerFactory) : base(options, loggerFactory)
+    {
+        _pluginManager = pluginManager;
+        ContinueOnError = true;
+    }
+
+    public override Task ProcessBatchAsync(ICollection<EventContext> contexts)
+    {
+        return _pluginManager.EventBatchProcessingAsync(contexts);
     }
 }

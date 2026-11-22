@@ -1,0 +1,76 @@
+<script lang="ts">
+    import type { DateRangePicker as DateRangePickerType } from '#comp/date-range-picker/index.ts';
+    import type { FacetedFilterProps } from '#comp/faceted-filter/index.ts';
+
+    import { DateRangePicker } from '#comp/date-range-picker/index.ts';
+    import * as FacetedFilter from '#comp/faceted-filter/index.ts';
+    import DateMath from '#comp/formatters/date-math.svelte';
+    import { Button } from '#comp/ui/button/index.ts';
+    import * as Popover from '#comp/ui/popover/index.ts';
+    import Separator from '#comp/ui/separator/separator.svelte';
+
+    import { DateFilter } from './models.svelte';
+
+    let { filter, filterChanged, filterRemoved, open = $bindable(false), title = 'Date Range' }: FacetedFilterProps<DateFilter> = $props();
+
+    let dateRangePickerRef: DateRangePickerType | undefined = $state();
+    let shouldApply = $state(true);
+
+    function handleKeyDown(event: KeyboardEvent) {
+        if (event.key === 'Escape') {
+            shouldApply = false;
+        }
+    }
+
+    function handleSelect(value: string) {
+        filter.value = value;
+        filterChanged(filter);
+        open = false;
+    }
+
+    function onClearFilter() {
+        shouldApply = false;
+        filter.value = undefined;
+        filterChanged(filter);
+        open = false;
+    }
+
+    function onOpenChange(isOpen: boolean) {
+        if (!isOpen && shouldApply) {
+            dateRangePickerRef?.apply();
+        }
+
+        shouldApply = true;
+    }
+
+    function onRemoveFilter() {
+        shouldApply = false;
+        filterRemoved(filter);
+        open = false;
+    }
+
+    function toggleHidden() {
+        shouldApply = false;
+        filter.hidden = !filter.hidden;
+        filterChanged(filter);
+    }
+</script>
+
+<Popover.Root bind:open {onOpenChange}>
+    <Popover.Trigger>
+        {#snippet child({ props })}
+            <Button {...props} class="gap-x-1 px-3" size="lg" variant="outline" aria-describedby={`${title}-help`}>
+                {title}
+                <Separator class="mx-2" orientation="vertical" />
+                <FacetedFilter.BadgeValue>
+                    <DateMath value={filter.value} />
+                </FacetedFilter.BadgeValue>
+            </Button>
+        {/snippet}
+    </Popover.Trigger>
+    <Popover.Content align="start" class="max-h-(--bits-popover-content-available-height) w-auto overflow-y-auto p-0" side="bottom" onkeydown={handleKeyDown}>
+        <div id={`${title}-help`} class="sr-only">Press Enter to apply filter, Escape to cancel</div>
+        <DateRangePicker bind:this={dateRangePickerRef} value={filter.value} onselect={handleSelect} />
+        <FacetedFilter.Actions clear={onClearFilter} hidden={filter.hidden} remove={onRemoveFilter} showClear={filter.value !== undefined} {toggleHidden} />
+    </Popover.Content>
+</Popover.Root>

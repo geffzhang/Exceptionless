@@ -1,0 +1,43 @@
+@url = http://localhost:7110
+@apiUrl = {{url}}/api/v2
+@email = admin@exceptionless.test
+@password = tester
+
+### login to test account
+# @name login
+POST {{apiUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "{{email}}",
+    "password": "{{password}}"
+}
+
+###
+
+@token = {{login.response.body.$.token}}
+
+### Health
+GET {{url}}/health
+
+### Readiness
+GET {{url}}/ready
+
+### About
+GET {{apiUrl}}/about
+Authorization: Bearer {{token}}
+
+### Read the current system banner
+GET {{apiUrl}}/notifications/system
+Authorization: Bearer {{token}}
+
+### Show a system banner
+POST {{apiUrl}}/notifications/system
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Scheduled maintenance is in progress." }
+
+### Clear the system banner
+DELETE {{apiUrl}}/notifications/system
+Authorization: Bearer {{token}}

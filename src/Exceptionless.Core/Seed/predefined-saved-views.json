@@ -1,0 +1,264 @@
+[
+    {
+        "key": "events:all",
+        "name": "All",
+        "slug": "all",
+        "viewType": "events",
+        "time": "[now-7d TO now]",
+        "sort": "-date",
+        "filterDefinitions": [
+            {
+                "type": "date",
+                "term": "date",
+                "value": "[now-7d TO now]"
+            },
+            {
+                "type": "project"
+            }
+        ],
+        "columns": {
+            "level": { "visible": false },
+            "message": { "visible": false },
+            "name": { "visible": false },
+            "source": { "visible": false },
+            "summary": { "autoFill": true },
+            "type": { "visible": false }
+        },
+        "showStats": true,
+        "showChart": true
+    },
+    {
+        "key": "events:errors",
+        "name": "Errors",
+        "slug": "errors",
+        "viewType": "events",
+        "filter": "type:error (status:open OR status:regressed)",
+        "time": "[now-7d TO now]",
+        "sort": "-date",
+        "filterDefinitions": [
+            {
+                "type": "project",
+                "value": []
+            },
+            {
+                "type": "type",
+                "value": ["error"],
+                "hidden": true
+            },
+            {
+                "type": "status",
+                "value": ["open", "regressed"],
+                "hidden": true
+            },
+            {
+                "type": "date",
+                "term": "date",
+                "value": "[now-7d TO now]"
+            }
+        ],
+        "columns": {
+            "exception_type": { "visible": false },
+            "level": { "visible": false },
+            "message": { "visible": false },
+            "name": { "visible": false },
+            "source": { "visible": false },
+            "summary": { "autoFill": true },
+            "type": { "visible": false }
+        },
+        "showStats": true,
+        "showChart": true
+    },
+    {
+        "key": "events:logs",
+        "name": "Logs",
+        "slug": "logs",
+        "viewType": "events",
+        "filter": "type:log (status:open OR status:regressed)",
+        "time": "[now-7d TO now]",
+        "sort": "-date",
+        "filterDefinitions": [
+            {
+                "type": "project",
+                "value": []
+            },
+            {
+                "type": "type",
+                "value": ["log"],
+                "hidden": true
+            },
+            {
+                "type": "date",
+                "term": "date",
+                "value": "[now-7d TO now]"
+            },
+            {
+                "type": "status",
+                "value": ["open", "regressed"],
+                "hidden": true
+            }
+        ],
+        "columns": {
+            "exception_type": { "visible": false },
+            "level": { "visible": false },
+            "message": { "visible": false },
+            "name": { "visible": false },
+            "source": { "visible": false },
+            "summary": { "autoFill": true },
+            "type": { "visible": false }
+        },
+        "showStats": true,
+        "showChart": true
+    },
+    {
+        "key": "sessions:all",
+        "name": "All",
+        "slug": "all",
+        "viewType": "sessions",
+        "time": "[now-7d TO now]",
+        "sort": "-date",
+        "filterDefinitions": [
+            {
+                "type": "date",
+                "term": "date",
+                "value": "[now-7d TO now]"
+            },
+            {
+                "type": "project",
+                "value": []
+            }
+        ],
+        "columns": {
+            "summary": { "autoFill": true }
+        },
+        "showStats": true,
+        "showChart": true
+    },
+    {
+        "key": "stacks:all",
+        "name": "All",
+        "slug": "all",
+        "viewType": "stacks",
+        "filter": "(status:open OR status:regressed)",
+        "time": "[now-7d TO now]",
+        "filterDefinitions": [
+            {
+                "type": "status",
+                "value": ["open", "regressed"],
+                "hidden": true
+            },
+            {
+                "type": "date",
+                "term": "date",
+                "value": "[now-7d TO now]"
+            }
+        ],
+        "columns": {
+            "summary": { "autoFill": true }
+        },
+        "showStats": true,
+        "showChart": true
+    },
+    {
+        "key": "stacks:most-frequent-404s",
+        "name": "Most Frequent 404s",
+        "slug": "most-frequent-404s",
+        "viewType": "stacks",
+        "filter": "(status:open OR status:regressed) type:404",
+        "time": "[now-7d TO now]",
+        "sort": "-events",
+        "filterDefinitions": [
+            {
+                "type": "date",
+                "term": "date",
+                "value": "[now-7d TO now]"
+            },
+            {
+                "type": "project"
+            },
+            {
+                "type": "status",
+                "value": ["open", "regressed"],
+                "hidden": true
+            },
+            {
+                "type": "type",
+                "value": ["404"],
+                "hidden": true
+            }
+        ],
+        "columns": {
+            "summary": { "autoFill": true }
+        },
+        "showStats": true,
+        "showChart": true
+    },
+    {
+        "key": "stacks:most-frequent-errors",
+        "name": "Most Frequent Errors",
+        "slug": "most-frequent-errors",
+        "viewType": "stacks",
+        "filter": "type:error (status:open OR status:regressed)",
+        "time": "[now-7d TO now]",
+        "sort": "-events",
+        "filterDefinitions": [
+            {
+                "type": "date",
+                "term": "date",
+                "value": "[now-7d TO now]"
+            },
+            {
+                "type": "project"
+            },
+            {
+                "type": "type",
+                "value": ["error"],
+                "hidden": true
+            },
+            {
+                "type": "status",
+                "value": ["open", "regressed"],
+                "hidden": true
+            }
+        ],
+        "columns": {
+            "summary": { "autoFill": true }
+        },
+        "showStats": true,
+        "showChart": true
+    },
+    {
+        "key": "stacks:most-used-features",
+        "name": "Most Used Features",
+        "slug": "most-used-features",
+        "viewType": "stacks",
+        "filter": "type:usage (status:open OR status:regressed)",
+        "time": "[now-7d TO now]",
+        "sort": "-events",
+        "filterDefinitions": [
+            {
+                "type": "project",
+                "value": []
+            },
+            {
+                "type": "type",
+                "value": ["usage"],
+                "hidden": true
+            },
+            {
+                "type": "date",
+                "term": "date",
+                "value": "[now-7d TO now]"
+            },
+            {
+                "type": "status",
+                "value": ["open", "regressed"],
+                "hidden": true
+            }
+        ],
+        "columns": {
+            "summary": { "autoFill": true }
+        },
+        "showStats": true,
+        "showChart": true
+    }
+]

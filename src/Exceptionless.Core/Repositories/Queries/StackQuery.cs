@@ -1,50 +1,77 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
+﻿using Elastic.Clients.Elasticsearch;
+using Elastic.Clients.Elasticsearch.QueryDsl;
 using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Models;
 using Exceptionless.Core.Repositories.Options;
 using Foundatio.Repositories;
 using Foundatio.Repositories.Elasticsearch.Queries.Builders;
+using Foundatio.Repositories.Elasticsearch.Utility;
 using Foundatio.Repositories.Options;
-using Nest;
 
-namespace Exceptionless.Core.Repositories {
-    public static class StackQueryExtensions {
+namespace Exceptionless.Core.Repositories
+{
+    public static class StackQueryExtensions
+    {
         internal const string StacksKey = "@Stacks";
+        internal const string ExcludedStacksKey = "@ExcludedStacks";
 
-        public static T Stack<T>(this T query, string stackId) where T : IRepositoryQuery {
+        public static T Stack<T>(this T query, string stackId) where T : IRepositoryQuery
+        {
             return query.AddCollectionOptionValue(StacksKey, stackId);
         }
+
+        public static T Stack<T>(this T query, IEnumerable<string> stackIds) where T : IRepositoryQuery
+        {
+            return query.AddCollectionOptionValue(StacksKey, stackIds.Distinct());
+        }
+
+        public static T ExcludeStack<T>(this T query, string stackId) where T : IRepositoryQuery
+        {
+            return query.AddCollectionOptionValue(ExcludedStacksKey, stackId);
+        }
+
+        public static T ExcludeStack<T>(this T query, IEnumerable<string> stackIds) where T : IRepositoryQuery
+        {
+            return query.AddCollectionOptionValue(ExcludedStacksKey, stackIds);
+        }
     }
 }
 
-namespace Exceptionless.Core.Repositories.Options {
-    public static class ReadStackQueryExtensions {
-        public static ICollection<string> GetStacks(this IRepositoryQuery query) {
+namespace Exceptionless.Core.Repositories.Options
+{
+    public static class ReadStackQueryExtensions
+    {
+        public static ICollection<string> GetStacks(this IRepositoryQuery query)
+        {
             return query.SafeGetCollection<string>(StackQueryExtensions.StacksKey);
         }
+
+        public static ICollection<string> GetExcludedStacks(this IRepositoryQuery query)
+        {
+            return query.SafeGetCollection<string>(StackQueryExtensions.ExcludedStacksKey);
+        }
     }
 }
 
-namespace Exceptionless.Core.Repositories.Queries {
-    public class StackQueryBuilder : IElasticQueryBuilder {
-        private readonly string _stackIdFieldName;
+namespace Exceptionless.Core.Repositories.Queries
+{
+    public class StackQueryBuilder : IElasticQueryBuilder
+    {
+        private static readonly Field StackIdField = nameof(IOwnedByStack.StackId).ToLowerUnderscoredWords();
 
-        public StackQueryBuilder() {
-            _stackIdFieldName = nameof(IOwnedByStack.StackId).ToLowerUnderscoredWords();
-        }
-
-        public Task BuildAsync<T>(QueryBuilderContext<T> ctx) where T : class, new() {
+        public Task BuildAsync<T>(QueryBuilderContext<T> ctx) where T : class, new()
+        {
             var stackIds = ctx.Source.GetStacks();
-            if (stackIds.Count <= 0)
-                return Task.CompletedTask;
-
             if (stackIds.Count == 1)
-                ctx.Filter &= Query<T>.Term(_stackIdFieldName, stackIds.Single());
-            else
-                ctx.Filter &= Query<T>.Terms(d => d.Field(_stackIdFieldName).Terms(stackIds));
+                ctx.Filter &= new TermQuery { Field = StackIdField, Value = stackIds.Single() };
+            else if (stackIds.Count > 1)
+                ctx.Filter &= new TermsQuery { Field = StackIdField, Terms = new TermsQueryField(stackIds.Select(FieldValueHelper.ToFieldValue).ToList()) };
+
+            var excludedStackIds = ctx.Source.GetExcludedStacks();
+            if (excludedStackIds.Count == 1)
+                ctx.Filter &= new BoolQuery { MustNot = [new TermQuery { Field = StackIdField, Value = excludedStackIds.Single() }] };
+            else if (excludedStackIds.Count > 1)
+                ctx.Filter &= new BoolQuery { MustNot = [new TermsQuery { Field = StackIdField, Terms = new TermsQueryField(excludedStackIds.Select(FieldValueHelper.ToFieldValue).ToList()) }] };
 
             return Task.CompletedTask;
         }

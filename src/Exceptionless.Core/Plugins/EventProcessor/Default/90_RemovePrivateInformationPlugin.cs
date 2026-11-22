@@ -1,30 +1,33 @@
-﻿using System;
-using System.Threading.Tasks;
-using Exceptionless.Core.Models;
-using Exceptionless.Core.Pipeline;
+﻿using Exceptionless.Core.Pipeline;
+using Foundatio.Serializer;
 using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Plugins.EventProcessor.Default {
-    [Priority(90)]
-    public sealed class RemovePrivateInformationPlugin : EventProcessorPluginBase {
-        public RemovePrivateInformationPlugin(ILoggerFactory loggerFactory = null) : base(loggerFactory) { }
+namespace Exceptionless.Core.Plugins.EventProcessor.Default;
 
-        public override Task EventProcessingAsync(EventContext context) {
-            if (context.IncludePrivateInformation)
-                return Task.CompletedTask;
+[Priority(90)]
+public sealed class RemovePrivateInformationPlugin : EventProcessorPluginBase
+{
+    private readonly ITextSerializer _serializer;
 
-            context.Event.Data.Remove(Event.KnownDataKeys.UserInfo);
-            var description = context.Event.GetUserDescription();
+    public RemovePrivateInformationPlugin(ITextSerializer serializer, AppOptions options, ILoggerFactory loggerFactory) : base(options, loggerFactory)
+    {
+        _serializer = serializer;
+    }
 
-            if (description != null) {
-                description.EmailAddress = null;
-                if (!String.IsNullOrEmpty(description.Description))
-                    context.Event.SetUserDescription(description);
-                else
-                    context.Event.Data.Remove(Event.KnownDataKeys.UserDescription);
-            }
-
+    public override Task EventProcessingAsync(EventContext context)
+    {
+        if (context.IncludePrivateInformation)
             return Task.CompletedTask;
+
+        context.Event.RemoveUserIdentity();
+
+        var description = context.Event.GetUserDescription(_serializer, _logger);
+        if (description is not null)
+        {
+            description.EmailAddress = null;
+            context.Event.SetUserDescription(description);
         }
+
+        return Task.CompletedTask;
     }
 }

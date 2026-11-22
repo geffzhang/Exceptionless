@@ -1,107 +1,153 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Elasticsearch.Net;
+using Elastic.Clients.Elasticsearch;
+using Elastic.Clients.Elasticsearch.Serialization;
+using Elastic.Transport;
+using Exceptionless.Core.Configuration;
 using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Repositories.Queries;
-using Exceptionless.Serializer;
+using Exceptionless.Core.Serialization;
 using Foundatio.Caching;
+using Foundatio.Extensions.Hosting.Startup;
 using Foundatio.Jobs;
 using Foundatio.Messaging;
 using Foundatio.Queues;
+using Foundatio.Repositories.Elasticsearch;
 using Foundatio.Repositories.Elasticsearch.Configuration;
 using Foundatio.Repositories.Elasticsearch.Queries.Builders;
-using Foundatio.Utility;
+using Foundatio.Repositories.Serialization;
+using Foundatio.Resilience;
+using Foundatio.Serializer;
 using Microsoft.Extensions.Logging;
-using Nest;
-using Newtonsoft.Json;
-using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
-namespace Exceptionless.Core.Repositories.Configuration {
-    public sealed class ExceptionlessElasticConfiguration : ElasticConfiguration, IStartupAction {
-        private CancellationToken _shutdownToken;
+namespace Exceptionless.Core.Repositories.Configuration;
 
-        public ExceptionlessElasticConfiguration(Settings settings, IQueue<WorkItemData> workItemQueue, ICacheClient cacheClient, IMessageBus messageBus, ILoggerFactory loggerFactory) : base(workItemQueue, cacheClient, messageBus, loggerFactory) {
-            Settings = settings;
-            _logger.LogInformation("All new indexes will be created with {ElasticsearchNumberOfShards} Shards and {ElasticsearchNumberOfReplicas} Replicas", Settings.ElasticsearchNumberOfShards, Settings.ElasticsearchNumberOfReplicas);
-            AddIndex(Stacks = new StackIndex(this));
-            AddIndex(Events = new EventIndex(this));
-            AddIndex(Organizations = new OrganizationIndex(this));
-        }
+public sealed class ExceptionlessElasticConfiguration : ElasticConfiguration, IStartupAction
+{
+    private readonly AppOptions _appOptions;
 
-        public Task RunAsync(CancellationToken shutdownToken = default) {
-            _shutdownToken = shutdownToken;
-            return ConfigureIndexesAsync();
-        }
+    public ExceptionlessElasticConfiguration(
+        AppOptions appOptions,
+        IQueue<WorkItemData> workItemQueue,
+        ICacheClient cacheClient,
+        IMessageBus messageBus,
+        IServiceProvider serviceProvider,
+        ITextSerializer serializer,
+        TimeProvider timeProvider,
+        IResiliencePolicyProvider resiliencePolicyProvider,
+        ILoggerFactory loggerFactory
+    ) : base(workItemQueue, cacheClient, messageBus, serializer, timeProvider, resiliencePolicyProvider, loggerFactory)
+    {
+        _appOptions = appOptions;
 
-        public override void ConfigureGlobalQueryBuilders(ElasticQueryBuilder builder) {
-            builder.Register(new ExceptionlessSystemFilterQueryBuilder());
-            builder.Register(new OrganizationQueryBuilder());
-            builder.Register(new ProjectQueryBuilder());
-            builder.Register(new StackQueryBuilder());
-        }
-
-        public Settings Settings { get; }
-        public StackIndex Stacks { get; }
-        public EventIndex Events { get; }
-        public OrganizationIndex Organizations { get; }
-
-        private static Lazy<DateTime> _maxWaitTime = new Lazy<DateTime>(() => SystemClock.UtcNow.AddMinutes(1));
-        private static bool _isFirstAttempt = true;
-        protected override IElasticClient CreateElasticClient() {
-            var connectionPool = CreateConnectionPool();
-            var settings = new ConnectionSettings(connectionPool, s => new ElasticsearchJsonNetSerializer(s, _logger));
-            ConfigureSettings(settings);
-            foreach (var index in Indexes)
-                index.ConfigureSettings(settings);
-
-            var client = new ElasticClient(settings);
-            var nodes = connectionPool.Nodes.Select(n => n.Uri.ToString());
-            var startTime = SystemClock.UtcNow;
-            if (SystemClock.UtcNow > _maxWaitTime.Value || !_isFirstAttempt)
-                return client;
-            
-            while (!_shutdownToken.IsCancellationRequested && !client.Ping().IsValid) {
-                if (_logger.IsEnabled(LogLevel.Information))
-                    _logger.LogInformation("Waiting for Elasticsearch {Server} after {Duration:g}...", nodes, SystemClock.UtcNow.Subtract(startTime));
-
-                if (SystemClock.UtcNow > _maxWaitTime.Value) {
-                    if (_logger.IsEnabled(LogLevel.Error))
-                        _logger.LogError("Unable to connect to Elasticsearch {Server} after attempting for {Duration:g}", nodes, SystemClock.UtcNow.Subtract(startTime));
-                    
-                    break;
-                }
-
-                Thread.Sleep(1000);
-            }
-            _isFirstAttempt = true;
-
-            return client;
-        }
-
-        protected override IConnectionPool CreateConnectionPool() {
-            var serverUris = Settings.ElasticsearchConnectionString.Split(',').Select(url => new Uri(url));
-            return new StaticConnectionPool(serverUris);
-        }
-
-        protected override void ConfigureSettings(ConnectionSettings settings) {
-            settings.DisableDirectStreaming()
-                .EnableTcpKeepAlive(TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(2))
-                .DefaultTypeNameInferrer(p => p.Name.ToLowerUnderscoredWords())
-                .DefaultFieldNameInferrer(p => p.ToLowerUnderscoredWords())
-                .MaximumRetries(5);
-        }
+        _logger.LogInformation("All new indexes will be created with {ElasticsearchNumberOfShards} Shards and {ElasticsearchNumberOfReplicas} Replicas", _appOptions.ElasticsearchOptions.NumberOfShards, _appOptions.ElasticsearchOptions.NumberOfReplicas);
+        AddIndex(Stacks = new StackIndex(this));
+        AddIndex(Events = new EventIndex(this, serviceProvider, appOptions));
+        AddIndex(Migrations = new MigrationIndex(this, _appOptions.ElasticsearchOptions.ScopePrefix + "migrations", appOptions.ElasticsearchOptions.NumberOfReplicas));
+        AddIndex(Organizations = new OrganizationIndex(this));
+        AddIndex(OAuthApplications = new OAuthApplicationIndex(this));
+        AddIndex(OAuthTokens = new OAuthTokenIndex(this));
+        AddIndex(Projects = new ProjectIndex(this));
+        AddIndex(SavedViews = new SavedViewIndex(this));
+        AddIndex(SystemSettings = new SystemSettingsIndex(this));
+        AddIndex(Tokens = new TokenIndex(this));
+        AddIndex(TrialClaims = new TrialClaimIndex(this));
+        AddIndex(Users = new UserIndex(this));
+        AddIndex(WebHooks = new WebHookIndex(this));
     }
 
-    public class ElasticsearchJsonNetSerializer : JsonNetSerializer {
-        public ElasticsearchJsonNetSerializer(IConnectionSettingsValues settings, ILogger logger)
-            : base(settings, (serializerSettings, values) => {
-                var resolver = new ElasticDynamicTypeContractResolver(values, new List<Func<Type, JsonConverter>>());
-                serializerSettings.ContractResolver = resolver;
-                serializerSettings.AddModelConverters(logger);
-            }) {
-        }
+    public Task RunAsync(CancellationToken shutdownToken = default)
+    {
+        if (_appOptions.ElasticsearchOptions.DisableIndexConfiguration)
+            return Task.CompletedTask;
+
+        return ConfigureIndexesAsync();
+    }
+
+    public override void ConfigureGlobalQueryBuilders(ElasticQueryBuilder builder)
+    {
+        builder.Register(new AppFilterQueryBuilder(_appOptions, TimeProvider));
+        builder.Register(new OrganizationQueryBuilder());
+        builder.Register(new ProjectQueryBuilder());
+        builder.Register(new StackQueryBuilder());
+    }
+
+    public ElasticsearchOptions Options => _appOptions.ElasticsearchOptions;
+    public StackIndex Stacks { get; }
+    public EventIndex Events { get; }
+    public MigrationIndex Migrations { get; }
+    public OrganizationIndex Organizations { get; }
+    public OAuthApplicationIndex OAuthApplications { get; }
+    public OAuthTokenIndex OAuthTokens { get; }
+    public ProjectIndex Projects { get; }
+    public SavedViewIndex SavedViews { get; }
+    public SystemSettingsIndex SystemSettings { get; }
+    public TokenIndex Tokens { get; }
+    public TrialClaimIndex TrialClaims { get; }
+    public UserIndex Users { get; }
+    public WebHookIndex WebHooks { get; }
+
+    protected override ElasticsearchClient CreateElasticClient()
+    {
+        var connectionPool = CreateConnectionPool();
+        return new ElasticsearchClient(CreateElasticsearchClientSettings(connectionPool));
+    }
+
+    private ElasticsearchClientSettings CreateElasticsearchClientSettings(NodePool connectionPool)
+    {
+        return ConfigureElasticsearchClientSettings(new ElasticsearchClientSettings(
+            connectionPool,
+            sourceSerializer: (_, clientSettings) =>
+                new DefaultSourceSerializer(clientSettings, options =>
+                {
+                    // Base defaults from Foundatio + app-specific overrides
+                    options.ConfigureFoundatioRepositoryDefaults();
+                    options.ConfigureExceptionlessDefaults();
+
+                    // ES-specific overrides (legacy data compatibility)
+                    options.RespectNullableAnnotations = false;
+
+                    // ES needs integers as long and our custom ObjectToInferredTypesConverter.
+                    // Remove any JsonStringEnumConverter (most enums store as integers in ES;
+                    // StackStatus has a type-level [JsonConverter] that takes precedence).
+                    // Remove existing ObjectToInferredTypesConverter instances and insert ours at position 0.
+                    for (int i = options.Converters.Count - 1; i >= 0; i--)
+                    {
+                        if (options.Converters[i] is System.Text.Json.Serialization.JsonStringEnumConverter
+                            or Exceptionless.Core.Serialization.ObjectToInferredTypesConverter
+                            or Foundatio.Repositories.Serialization.ObjectToInferredTypesConverter)
+                            options.Converters.RemoveAt(i);
+                    }
+                    options.Converters.Insert(0, new Exceptionless.Core.Serialization.ObjectToInferredTypesConverter(preferInt64: true));
+                })));
+    }
+
+    private ElasticsearchClientSettings ConfigureElasticsearchClientSettings(ElasticsearchClientSettings settings)
+    {
+        ConfigureSettings(settings);
+        foreach (var index in Indexes)
+            index.ConfigureSettings(settings);
+
+        if (!String.IsNullOrEmpty(_appOptions.ElasticsearchOptions.UserName) && !String.IsNullOrEmpty(_appOptions.ElasticsearchOptions.Password))
+            settings.Authentication(new BasicAuthentication(_appOptions.ElasticsearchOptions.UserName, _appOptions.ElasticsearchOptions.Password));
+
+        return settings;
+    }
+
+    protected override NodePool CreateConnectionPool()
+    {
+        var serverUris = Options.ServerUrl?.Split(',').Select(url => new Uri(url))
+            ?? throw new InvalidOperationException("ElasticsearchOptions.ServerUrl is not configured.");
+        return new StaticNodePool(serverUris);
+    }
+
+    protected override void ConfigureSettings(ElasticsearchClientSettings settings)
+    {
+        if (_appOptions.AppMode == AppMode.Development)
+            settings.EnableDebugMode();
+
+        settings.ServerCertificateValidationCallback((_, _, _, _) => true);
+        settings.DisableDirectStreaming();
+        settings.EnableTcpKeepAlive(TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(2));
+        settings.DefaultFieldNameInferrer(p => p.ToLowerUnderscoredWords());
+        settings.MaximumRetries(5);
     }
 }

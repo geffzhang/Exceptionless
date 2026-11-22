@@ -2,13 +2,13 @@
 
 ## Before You Start
 
-Anyone wishing to contribute to the **[Exceptionless/Exceptionless](https://github.com/exceptionless/exceptionless)** project **MUST read &amp; sign the [Exceptionless Contribution License Agreement](http://cla-assistant.io/exceptionless/Exceptionless)**. The Exceptionless team is legally prevented from accepting any pull requests from users who have not signed the CLA first.
+Contributions are accepted under the project's [Apache License 2.0](LICENSE.txt). By submitting a pull request, you agree that your contribution is licensed under it, as described in section 5 of the license.
 
 ## Reporting Bugs
 
-1. Always update to the most recent master release; the bug may already be resolved.
+1. Always update to the most recent main release; the bug may already be resolved.
 
-2. Search for similar [issues](https://github.com/exceptionless/Exceptionless/issues?q=is%3Aopen+is%3Aissue+label%3Abug); it may already be an identified problem. Also, feel free to ask us questions [on Slack](https://slack.exceptionless.com).
+2. Search for similar [issues](https://github.com/exceptionless/Exceptionless/issues?q=is%3Aopen+is%3Aissue+label%3Abug); it may already be an identified problem. Also, feel free to ask us questions [on Discord](https://discord.gg/6HxgFCx).
 
 3. Open an [issue on GitHub](https://github.com/exceptionless/exceptionless/issues) with a reproduction of the bug including workflows, screenshots, or links to examples. If possible, submit a Pull Request with a failing test. If you'd rather take matters into your own hands, fix the bug yourself (jump down to the "Contributing (Step-by-step)" section).
 
@@ -21,6 +21,8 @@ Anyone wishing to contribute to the **[Exceptionless/Exceptionless](https://gith
 3. If you're a Rock Star programmer, build the feature yourself (refer to the "Contributing (Step-by-step)" section below).
 
 ## Contributing (Step-by-step)
+
+See the [README](README.md#contributing) for Aspire setup. The only application frontend is Svelte in `src/Exceptionless.Web/ClientApp`, served at `/`. Follow its [frontend guide](src/Exceptionless.Web/ClientApp/README.md) and the applicable `AGENTS.md` instructions.
 
 1. Refer to the GitHub documentation on how to fork the repository:
 

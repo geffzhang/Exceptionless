@@ -1,32 +1,37 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk.Web">
   <PropertyGroup>
-    <TargetFramework>netcoreapp2.1</TargetFramework>
+    <OutputType>Exe</OutputType>
     <IsPackable>False</IsPackable>
+    <AccelerateBuildsInVisualStudio>false</AccelerateBuildsInVisualStudio>
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+    <!-- The tests serve wwwroot from the Web project's content root. Since .NET 11 RC2, each Web SDK project
+         emits the same _framework dotnet-watch assets, so the Web and Job references collide here. -->
+    <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
+    <InterceptorsNamespaces>$(InterceptorsNamespaces);Microsoft.AspNetCore.OpenApi.Generated</InterceptorsNamespaces>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Exceptionless.RandomData" Version="1.1.47" />
-    <PackageReference Include="FluentRest" Version="5.0.0.78" />
-    <PackageReference Include="Foundatio.Logging.Xunit" Version="7.0.1738" />
-    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="2.1.1" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="15.9.0" />
-    <PackageReference Include="xunit" Version="2.4.0" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.4.0" />
+    <PackageReference Include="Exceptionless.RandomData" Version="2.0.1" />
+    <PackageReference Include="Foundatio.Xunit.v3" Version="13.0.5" />
+    <PackageReference Include="FluentRest" Version="12.0.1" />
+
+    <PackageReference Include="Aspire.Hosting.Testing" Version="13.6.5" />
+    <PackageReference Include="GitHubActionsTestLogger" Version="3.0.5" PrivateAssets="All" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="11.0.0" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="11.0.0" />
+    <PackageReference Include="Moq" Version="4.21.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />
+    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.12.0" />
+    <PackageReference Include="xunit.v3.mtp-v2" Version="4.0.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" PrivateAssets="All" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\..\src\Exceptionless.AppHost\Exceptionless.AppHost.csproj" />
+    <ProjectReference Include="..\..\src\Exceptionless.Job\Exceptionless.Job.csproj" />
     <ProjectReference Include="..\..\src\Exceptionless.Web\Exceptionless.Web.csproj" />
   </ItemGroup>
+
   <ItemGroup>
     <None Update="**\*.json" CopyToOutputDirectory="Always" />
+    <Content Include="appsettings.yml" CopyToOutputDirectory="Always" />
   </ItemGroup>
-  <ItemGroup>
-    <None Update="appsettings.yml">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
-  <Target Name="CopyAditionalFiles" AfterTargets="Build" Condition="'$(TargetFramework)'!=''">
-    <ItemGroup>
-      <DepsFilePaths Include="$([System.IO.Path]::ChangeExtension('%(_ResolvedProjectReferencePaths.FullPath)', '.deps.json'))" />
-    </ItemGroup>
-    <Copy SourceFiles="%(DepsFilePaths.FullPath)" DestinationFolder="$(OutputPath)" Condition="Exists('%(DepsFilePaths.FullPath)')" />
-  </Target>
 </Project>

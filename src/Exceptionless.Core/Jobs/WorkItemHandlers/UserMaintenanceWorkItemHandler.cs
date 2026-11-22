@@ -1,67 +1,98 @@
-using System;
-using System.Threading;
-using System.Threading.Tasks;
 using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Models;
 using Exceptionless.Core.Models.WorkItems;
 using Exceptionless.Core.Repositories;
-using Foundatio.Caching;
 using Foundatio.Jobs;
 using Foundatio.Lock;
-using Foundatio.Messaging;
 using Foundatio.Repositories;
-using Foundatio.Utility;
 using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Jobs.WorkItemHandlers {
-    public class UserMaintenanceWorkItemHandler : WorkItemHandlerBase {
-        private readonly IUserRepository _userRepository;
-        private readonly ILockProvider _lockProvider;
+namespace Exceptionless.Core.Jobs.WorkItemHandlers;
 
-        public UserMaintenanceWorkItemHandler(IUserRepository userRepository, ICacheClient cacheClient, IMessageBus messageBus, ILoggerFactory loggerFactory = null) : base(loggerFactory) {
-            _userRepository = userRepository;
-            _lockProvider = new CacheLockProvider(cacheClient, messageBus);
-        }
+public class UserMaintenanceWorkItemHandler : WorkItemHandlerBase
+{
+    private readonly IUserRepository _userRepository;
+    private readonly TimeProvider _timeProvider;
+    private readonly ILockProvider _lockProvider;
 
-        public override Task<ILock> GetWorkItemLockAsync(object workItem, CancellationToken cancellationToken = new CancellationToken()) {
-            return _lockProvider.AcquireAsync(nameof(UserMaintenanceWorkItemHandler), TimeSpan.FromMinutes(15), new CancellationToken(true));
-        }
+    public UserMaintenanceWorkItemHandler(IUserRepository userRepository, ILockProvider lockProvider, TimeProvider timeProvider, ILoggerFactory loggerFactory) : base(loggerFactory)
+    {
+        _userRepository = userRepository;
+        _timeProvider = timeProvider;
+        _lockProvider = lockProvider;
+    }
 
-        public override async Task HandleItemAsync(WorkItemContext context) {
-            const int LIMIT = 100;
+    public override Task<ILock?> GetWorkItemLockAsync(object workItem, CancellationToken cancellationToken = default)
+    {
+        return _lockProvider.TryAcquireAsync(nameof(UserMaintenanceWorkItemHandler), TimeSpan.FromMinutes(15), cancellationToken);
+    }
 
-            var workItem = context.GetData<UserMaintenanceWorkItem>();
-            Log.LogInformation("Received user maintenance work item. Normalize: {Normalize}", workItem.Normalize);
+    public override async Task HandleItemAsync(WorkItemContext context)
+    {
+        const int LIMIT = 100;
 
-            var results = await _userRepository.GetAllAsync(o => o.PageLimit(LIMIT)).AnyContext();
-            while (results.Documents.Count > 0 && !context.CancellationToken.IsCancellationRequested) {
-                foreach (var user in results.Documents) {
-                    if (workItem.Normalize)
-                        NormalizeUser(user);
-                }
+        var workItem = context.GetData<UserMaintenanceWorkItem>()!;
 
-                if (workItem.Normalize)
-                    await _userRepository.SaveAsync(results.Documents).AnyContext();
+        Log.LogInformation("Received user maintenance work item. Normalize={Normalize} ResetVerifyEmailAddressToken={ResendVerifyEmailAddressEmails}", workItem.Normalize, workItem.ResetVerifyEmailAddressToken);
 
-                // Sleep so we are not hammering the backend.
-                await SystemClock.SleepAsync(TimeSpan.FromSeconds(2.5)).AnyContext();
-
-                if (context.CancellationToken.IsCancellationRequested || !await results.NextPageAsync().AnyContext())
-                    break;
-
-                if (results.Documents.Count > 0)
-                    await context.RenewLockAsync().AnyContext();
+        var results = await _userRepository.GetAllAsync(o => o.PageLimit(LIMIT));
+        while (results.Documents.Count > 0 && !context.CancellationToken.IsCancellationRequested)
+        {
+            if (workItem.Normalize)
+            {
+                await NormalizeUsersAsync(results.Documents);
+                continue;
             }
-        }
 
-        private void NormalizeUser(User user) {
-            user.FullName = user.FullName?.Trim();
-
-            string email = user.EmailAddress?.Trim().ToLowerInvariant();
-            if (!String.Equals(user.EmailAddress, email)) {
-                Log.LogInformation("Normalizing user email address {EmailAddress} to {NewEmailAddress}", user.EmailAddress, email);
-                user.EmailAddress = email;
+            if (workItem.ResetVerifyEmailAddressToken)
+            {
+                await ResetVerifyEmailAddressTokenAndExpirationAsync(results.Documents);
+                continue;
             }
+
+            // Sleep so we are not hammering the backend.
+            await Task.Delay(TimeSpan.FromSeconds(2.5), _timeProvider);
+
+            if (context.CancellationToken.IsCancellationRequested || !await results.NextPageAsync())
+                break;
+
+            if (results.Documents.Count > 0)
+                await context.RenewLockAsync();
         }
+    }
+
+    private async Task NormalizeUsersAsync(IReadOnlyCollection<User> users)
+    {
+        var usersToSave = new List<User>(users.Count);
+        foreach (var user in users)
+        {
+            string fullName = user.FullName.Trim();
+            string email = user.EmailAddress.Trim().ToLowerInvariant();
+            if (String.Equals(user.FullName, fullName) && String.Equals(user.EmailAddress, email))
+                continue;
+
+            Log.LogInformation("Normalizing user email address {EmailAddress} to {NewEmailAddress}", user.EmailAddress, email);
+            user.FullName = fullName;
+            user.EmailAddress = email;
+            usersToSave.Add(user);
+        }
+
+        if (usersToSave.Count > 0)
+            await _userRepository.SaveAsync(usersToSave);
+    }
+
+    private async Task ResetVerifyEmailAddressTokenAndExpirationAsync(IEnumerable<User> users)
+    {
+        var unverifiedUsers = users.Where(u => !u.IsEmailAddressVerified).ToList();
+        if (unverifiedUsers.Count is 0)
+            return;
+
+        foreach (var user in unverifiedUsers)
+        {
+            user.ResetVerifyEmailAddressTokenAndExpiration(_timeProvider);
+            Log.LogInformation("Reset verify email address token and expiration for {EmailAddress}", user.EmailAddress);
+        }
+
+        await _userRepository.SaveAsync(unverifiedUsers);
     }
 }

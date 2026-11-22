@@ -1,0 +1,51 @@
+@apiUrl = http://localhost:7110/api/v2
+@email = admin@exceptionless.test
+@password = tester
+
+### login to test account
+# @name login
+POST {{apiUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "{{email}}",
+    "password": "{{password}}"
+}
+
+###
+
+@token = {{login.response.body.$.token}}
+
+### All
+GET {{apiUrl}}/organizations
+Authorization: Bearer {{token}}
+
+### Create an organization
+# @name newOrganization
+POST {{apiUrl}}/organizations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "name": "HTTP sample organization" }
+
+###
+@organizationId = {{newOrganization.response.body.$.id}}
+
+### Invite a user
+POST {{apiUrl}}/organizations/{{organizationId}}/users/new-user@exceptionless.test
+Authorization: Bearer {{token}}
+
+### Remove User
+DELETE {{apiUrl}}/organizations/{{organizationId}}/users/new-user@exceptionless.test
+Authorization: Bearer {{token}}
+
+### Change the sample organization plan
+POST {{apiUrl}}/organizations/{{organizationId}}/change-plan
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "plan_id": "EX_FREE" }
+
+### Delete the sample organization
+DELETE {{apiUrl}}/organizations/{{organizationId}}
+Authorization: Bearer {{token}}

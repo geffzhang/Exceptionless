@@ -1,50 +1,57 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
+﻿using Elastic.Clients.Elasticsearch;
+using Elastic.Clients.Elasticsearch.QueryDsl;
 using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Models;
 using Exceptionless.Core.Repositories.Options;
 using Foundatio.Repositories;
 using Foundatio.Repositories.Elasticsearch.Queries.Builders;
 using Foundatio.Repositories.Options;
-using Nest;
 
-namespace Exceptionless.Core.Repositories {
-    public static class ProjectQueryExtensions {
+namespace Exceptionless.Core.Repositories
+{
+    public static class ProjectQueryExtensions
+    {
         internal const string ProjectsKey = "@Projects";
 
-        public static T Project<T>(this T query, string projectId) where T : IRepositoryQuery {
+        public static T Project<T>(this T query, string projectId) where T : IRepositoryQuery
+        {
             return query.AddCollectionOptionValue(ProjectsKey, projectId);
+        }
+
+        public static T Project<T>(this T query, IEnumerable<string> projectIds) where T : IRepositoryQuery
+        {
+            return query.AddCollectionOptionValue(ProjectsKey, projectIds.Distinct());
         }
     }
 }
 
-namespace Exceptionless.Core.Repositories.Options {
-    public static class ReadProjectQueryExtensions {
-        public static ICollection<string> GetProjects(this IRepositoryQuery query) {
+namespace Exceptionless.Core.Repositories.Options
+{
+    public static class ReadProjectQueryExtensions
+    {
+        public static ICollection<string> GetProjects(this IRepositoryQuery query)
+        {
             return query.SafeGetCollection<string>(ProjectQueryExtensions.ProjectsKey);
         }
     }
 }
 
-namespace Exceptionless.Core.Repositories.Queries {
-    public class ProjectQueryBuilder : IElasticQueryBuilder {
-        private readonly string _projectIdFieldName;
+namespace Exceptionless.Core.Repositories.Queries
+{
+    public class ProjectQueryBuilder : IElasticQueryBuilder
+    {
+        private readonly string _projectIdFieldName = nameof(IOwnedByProject.ProjectId).ToLowerUnderscoredWords();
 
-        public ProjectQueryBuilder() {
-            _projectIdFieldName = nameof(IOwnedByProject.ProjectId).ToLowerUnderscoredWords();
-        }
-
-        public Task BuildAsync<T>(QueryBuilderContext<T> ctx) where T : class, new() {
+        public Task BuildAsync<T>(QueryBuilderContext<T> ctx) where T : class, new()
+        {
             var projectIds = ctx.Source.GetProjects();
             if (projectIds.Count <= 0)
                 return Task.CompletedTask;
 
             if (projectIds.Count == 1)
-                ctx.Filter &= Query<T>.Term(_projectIdFieldName, projectIds.Single());
+                ctx.Filter &= new TermQuery { Field = _projectIdFieldName, Value = projectIds.Single() };
             else
-                ctx.Filter &= Query<T>.Terms(d => d.Field(_projectIdFieldName).Terms(projectIds));
+                ctx.Filter &= new TermsQuery { Field = _projectIdFieldName, Terms = new TermsQueryField(projectIds.Select(id => (FieldValue)id).ToList()) };
 
             return Task.CompletedTask;
         }

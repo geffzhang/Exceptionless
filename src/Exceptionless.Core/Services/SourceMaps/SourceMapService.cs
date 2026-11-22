@@ -1,0 +1,879 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using Exceptionless.Core.Configuration;
+using Exceptionless.Core.Extensions;
+using Exceptionless.Core.Models;
+using Exceptionless.Core.Models.Data;
+using Foundatio.Caching;
+using Foundatio.Lock;
+using Foundatio.Storage;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+
+namespace Exceptionless.Core.Services.SourceMaps;
+
+public sealed class SourceMapService : IDisposable
+{
+    public const string HttpClientName = "SourceMaps";
+    internal const string GeneratedFileHttpClientName = "SourceMapGeneratedFiles";
+    private static readonly TimeSpan FailureCacheLifetime = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan DeletedProjectCacheLifetime = TimeSpan.FromDays(1);
+    private const int MaximumLocalUsageEntries = 100_000;
+    private const int MaximumFailureDetails = 5;
+    private readonly SemaphoreSlim _downloadSemaphore;
+    private readonly ConcurrentDictionary<string, Lazy<Task<SourceMapLookupResult>>> _inflightSourceMaps = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ResolvedSourceMap> _parsedSourceMapEntries = new(StringComparer.Ordinal);
+    private readonly MemoryCache _parsedSourceMaps;
+    private readonly MemoryCache _recentlyTrackedUsages;
+    private readonly SourceMapDownloader _downloader;
+    private readonly SourceMapStorage _storage;
+    private readonly SourceMapRequestThrottle _throttle;
+    private readonly ICacheClient _cache;
+    private readonly ILockProvider _lockProvider;
+    private readonly SourceMapOptions _options;
+    private readonly JsonSerializerOptions _serializerOptions;
+    private readonly TimeSpan _usageCacheLifetime;
+    private readonly TimeProvider _timeProvider;
+    private readonly ILogger<SourceMapService> _logger;
+
+    public SourceMapService(
+        IHttpClientFactory httpClientFactory,
+        IFileStorage storage,
+        ICacheClient cache,
+        ILockProvider lockProvider,
+        SourceMapRequestThrottle throttle,
+        JsonSerializerOptions serializerOptions,
+        AppOptions options,
+        TimeProvider timeProvider,
+        ILogger<SourceMapService> logger)
+    {
+        _downloader = new SourceMapDownloader(httpClientFactory, options, throttle);
+        _storage = new SourceMapStorage(storage, serializerOptions, logger);
+        _throttle = throttle;
+        _cache = cache;
+        _lockProvider = lockProvider;
+        _options = options.SourceMapOptions;
+        _serializerOptions = serializerOptions;
+        _usageCacheLifetime = TimeSpan.FromDays(Math.Max(_options.FreeArtifactRetentionDays, _options.ArtifactRetentionDays) + 1L);
+        _downloadSemaphore = new SemaphoreSlim(_options.MaximumConcurrentDownloads);
+        _parsedSourceMaps = new MemoryCache(new MemoryCacheOptions { SizeLimit = _options.MaximumParsedSourceMapCacheSize });
+        _recentlyTrackedUsages = new MemoryCache(new MemoryCacheOptions { SizeLimit = MaximumLocalUsageEntries });
+        _timeProvider = timeProvider;
+        _logger = logger;
+    }
+
+    public Task<SourceMapArtifact> SaveUploadedAsync(
+        string projectId,
+        string generatedFileUrl,
+        string? fileName,
+        Stream stream,
+        CancellationToken cancellationToken = default)
+        => SaveUploadedAsync(projectId, generatedFileUrl, fileName, stream, false, cancellationToken);
+
+    public async Task<SourceMapArtifact> SaveUploadedAsync(
+        string projectId,
+        string generatedFileUrl,
+        string? fileName,
+        Stream stream,
+        bool isFreePlan,
+        CancellationToken cancellationToken = default)
+    {
+        if (!TryNormalizeGeneratedFileUrl(generatedFileUrl, requireHttps: false, out var generatedFileUri))
+            throw new ArgumentException("The generated file URL must be an absolute HTTP or HTTPS URL without credentials or a fragment.", nameof(generatedFileUrl));
+
+        byte[] sourceMap = await SourceMapContent.ReadLimitedAsync(stream, _options.MaximumSourceMapSize, cancellationToken);
+        _ = SourceMapDocument.Parse(sourceMap, _options.MaximumMappingSegments);
+
+        string normalizedUrl = generatedFileUri.AbsoluteUri;
+        var artifact = new SourceMapArtifact
+        {
+            Id = GetArtifactId(normalizedUrl),
+            GeneratedFileUrl = normalizedUrl,
+            FileName = String.IsNullOrWhiteSpace(fileName) ? null : Path.GetFileName(fileName),
+            Size = sourceMap.LongLength,
+            IsAutoDownloaded = false,
+            CreatedUtc = _timeProvider.GetUtcNow().UtcDateTime
+        };
+
+        string cacheKey = GetMemoryCacheKey(projectId, normalizedUrl);
+        await WaitForInflightSourceMapAsync(cacheKey, cancellationToken);
+        await using var artifactLock = await _lockProvider.TryAcquireAsync(GetArtifactLockKey(projectId, artifact.Id), TimeSpan.FromSeconds(30), cancellationToken);
+        if (artifactLock is null)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new IOException("Unable to acquire the source map storage lock.");
+        }
+
+        await using var projectLock = await TryAcquireProjectStorageLockAsync(projectId, cancellationToken);
+        if (projectLock is null)
+            throw new IOException("Unable to acquire the project source map storage lock.");
+        if (await IsProjectDeletedAsync(projectId))
+            throw new InvalidOperationException("Source maps cannot be saved for a deleted project.");
+
+        await ValidateStorageLimitAsync(projectId, artifact, isFreePlan, cancellationToken);
+        await _storage.SaveAsync(projectId, artifact, sourceMap, cancellationToken);
+        await ClearCachesAsync(projectId, normalizedUrl);
+        return artifact;
+    }
+
+    public Task<IReadOnlyCollection<SourceMapArtifact>> GetArtifactsAsync(string projectId, CancellationToken cancellationToken = default)
+        => _storage.GetArtifactsAsync(projectId, cancellationToken);
+
+    public async Task<bool> DeleteArtifactAsync(string projectId, string artifactId, CancellationToken cancellationToken = default)
+    {
+        if (!IsArtifactId(artifactId))
+            return false;
+
+        await WaitForInflightArtifactAsync(projectId, artifactId, cancellationToken);
+        await using var artifactLock = await _lockProvider.TryAcquireAsync(GetArtifactLockKey(projectId, artifactId), TimeSpan.FromSeconds(30), cancellationToken);
+        if (artifactLock is null)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return false;
+        }
+
+        await using var projectLock = await TryAcquireProjectStorageLockAsync(projectId, cancellationToken);
+        if (projectLock is null)
+            return false;
+
+        var artifact = await _storage.DeleteAsync(projectId, artifactId, cancellationToken);
+        if (artifact is null)
+            return false;
+
+        await RemoveUsageTrackingAsync(projectId, artifactId);
+        await ClearCachesAsync(projectId, artifact.GeneratedFileUrl);
+        return true;
+    }
+
+    public async Task DeleteProjectArtifactsAsync(string projectId, CancellationToken cancellationToken = default)
+    {
+        await using var projectLock = await TryAcquireProjectStorageLockAsync(projectId, cancellationToken);
+        if (projectLock is null)
+            throw new IOException("Unable to acquire the project source map storage lock.");
+        if (!await _cache.SetAsync(GetDeletedProjectCacheKey(projectId), true, DeletedProjectCacheLifetime))
+            throw new IOException("Unable to prevent source map writes for the deleted project.");
+
+        var artifacts = await _storage.GetArtifactsAsync(projectId, cancellationToken);
+        await _storage.DeleteAllAsync(projectId, cancellationToken);
+        foreach (var artifact in artifacts)
+            await RemoveUsageTrackingAsync(projectId, artifact.Id);
+        await AdvanceProjectCacheVersionAsync(projectId);
+        foreach (string key in _parsedSourceMapEntries.Keys.Where(key => key.StartsWith(projectId + ':', StringComparison.Ordinal)))
+            _parsedSourceMaps.Remove(key);
+        foreach (string key in _inflightSourceMaps.Keys.Where(key => key.StartsWith(projectId + ':', StringComparison.Ordinal)))
+            _inflightSourceMaps.TryRemove(key, out _);
+    }
+
+    public async Task<bool> SymbolicateAsync(string projectId, InnerError? error, CancellationToken cancellationToken = default)
+        => (await ProcessAsync(new SourceMapRequest(projectId, projectId, null, false), error, cancellationToken)).Symbolicated;
+
+    internal async Task<bool> SymbolicateAsync(SourceMapRequest request, InnerError? error, CancellationToken cancellationToken = default)
+        => (await ProcessAsync(request, error, cancellationToken)).Symbolicated;
+
+    internal async Task<SourceMapProcessingResult> ProcessAsync(SourceMapRequest request, InnerError? error, CancellationToken cancellationToken = default)
+    {
+        if (error is null)
+            return default;
+
+        bool symbolicated = false;
+        bool hasSymbolicatedFrames = false;
+        int framesProcessed = 0;
+        bool failureDetailsTruncated = false;
+        bool processingTruncated = false;
+        bool processingDeferred = false;
+        var deferredGeneratedFileUrls = new HashSet<string>(StringComparer.Ordinal);
+        string? activeGeneratedFileUrl = null;
+        var failures = new List<SourceMapFailure>();
+        InnerError rootError = error;
+        using var processingCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        processingCancellationTokenSource.CancelAfter(_options.MaximumProcessingTime);
+        try
+        {
+            while (error is not null && !processingTruncated)
+            {
+                if (error.StackTrace is not null)
+                {
+                    foreach (var frame in error.StackTrace)
+                    {
+                        if (++framesProcessed > _options.MaximumFramesPerError)
+                        {
+                            processingTruncated = true;
+                            break;
+                        }
+
+                        if (frame.Data?.ContainsKey(StackFrame.KnownDataKeys.SourceMap) == true)
+                            hasSymbolicatedFrames = true;
+                        activeGeneratedFileUrl = frame.FileName;
+                        var result = await SymbolicateFrameAsync(request, frame, processingCancellationTokenSource.Token);
+                        if (result.Symbolicated)
+                        {
+                            symbolicated = true;
+                            hasSymbolicatedFrames = true;
+                        }
+                        if (result.Failure is not null)
+                            AddFailure(failures, result.Failure, ref failureDetailsTruncated);
+                        if (result.IsDeferred)
+                        {
+                            processingDeferred = true;
+                            if (TryNormalizeGeneratedFileUrl(activeGeneratedFileUrl, requireHttps: false, out var deferredGeneratedFileUri))
+                                deferredGeneratedFileUrls.Add(deferredGeneratedFileUri.AbsoluteUri);
+                        }
+                        activeGeneratedFileUrl = null;
+                    }
+                }
+
+                error = error.Inner;
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug("Source map processing exceeded its time budget for project {ProjectId}.", request.ProjectId);
+            if (TryNormalizeGeneratedFileUrl(activeGeneratedFileUrl, requireHttps: false, out var generatedFileUri))
+                AddFailure(failures, new SourceMapFailure(generatedFileUri.AbsoluteUri, SourceMapFailureReasons.Timeout), ref failureDetailsTruncated);
+        }
+
+        bool existingSourceMapStatusMerged = false;
+        if (processingDeferred
+            && rootError.Data is not null
+            && rootError.Data.ContainsKey(Error.KnownDataKeys.SourceMap))
+        {
+            var existingStatus = rootError.Data.GetValue<DataDictionary>(Error.KnownDataKeys.SourceMap, _serializerOptions);
+            if (existingStatus is not null)
+            {
+                MergeDeferredFailures(existingStatus, deferredGeneratedFileUrls, failures, ref failureDetailsTruncated);
+                existingSourceMapStatusMerged = true;
+            }
+        }
+
+        bool sourceMapStatusModified;
+        if (failures.Count > 0 || processingTruncated)
+        {
+            rootError.Data ??= new DataDictionary();
+            rootError.Data[Error.KnownDataKeys.SourceMap] = new DataDictionary
+            {
+                ["status"] = hasSymbolicatedFrames ? "partial" : "failed",
+                ["failures"] = failures.Select(f => new DataDictionary
+                {
+                    ["generated_file_name"] = f.GeneratedFileUrl,
+                    ["reason"] = f.Reason
+                }).ToArray(),
+                ["processing_truncated"] = processingTruncated,
+                ["truncated"] = failureDetailsTruncated
+            };
+            sourceMapStatusModified = true;
+        }
+        else
+            sourceMapStatusModified = (!processingDeferred || existingSourceMapStatusMerged)
+                && rootError.Data?.Remove(Error.KnownDataKeys.SourceMap) == true;
+
+        return new SourceMapProcessingResult(symbolicated, symbolicated || sourceMapStatusModified);
+    }
+
+    public void Dispose()
+    {
+        _parsedSourceMaps.Dispose();
+        _recentlyTrackedUsages.Dispose();
+        _downloadSemaphore.Dispose();
+    }
+
+    private async Task<SourceMapFrameResult> SymbolicateFrameAsync(SourceMapRequest request, StackFrame frame, CancellationToken cancellationToken)
+    {
+        if (frame.Data?.ContainsKey(StackFrame.KnownDataKeys.SourceMap) == true || frame.LineNumber is null || frame.LineNumber < 1 || frame.Column is null || frame.Column < 1 || String.IsNullOrWhiteSpace(frame.FileName))
+            return default;
+
+        if (!TryNormalizeGeneratedFileUrl(frame.FileName, requireHttps: false, out var generatedFileUri))
+            return default;
+
+        var lookup = await GetSourceMapAsync(request, generatedFileUri, cancellationToken);
+        if (lookup.SourceMap is null)
+        {
+            if (lookup.FailureReason is not null)
+                return new SourceMapFrameResult(false, new SourceMapFailure(generatedFileUri.AbsoluteUri, lookup.FailureReason));
+            return lookup.IsDeferred ? new SourceMapFrameResult(false, null, true) : default;
+        }
+
+        int generatedColumn = frame.Column.Value - 1;
+
+        var original = lookup.SourceMap.Document.FindOriginalLocation(frame.LineNumber.Value - 1, generatedColumn);
+        if (original is null)
+            return new SourceMapFrameResult(false, new SourceMapFailure(generatedFileUri.AbsoluteUri, SourceMapFailureReasons.NoMatchingMapping));
+        if (!await TrackUsageAsync(request.ProjectId, lookup.SourceMap.Artifact.Id, cancellationToken))
+            return new SourceMapFrameResult(false, null, true);
+
+        frame.Data ??= new DataDictionary();
+        frame.Data[StackFrame.KnownDataKeys.SourceMap] = new DataDictionary
+        {
+            ["generated_file_name"] = frame.FileName,
+            ["generated_line_number"] = frame.LineNumber,
+            ["generated_column"] = frame.Column,
+            ["generated_name"] = frame.Name,
+            ["source_map_id"] = lookup.SourceMap.Artifact.Id
+        };
+        frame.FileName = original.Source;
+        frame.LineNumber = original.Line + 1;
+        frame.Column = original.Column + 1;
+        frame.Name = String.IsNullOrWhiteSpace(original.Name) ? null : original.Name;
+
+        return new SourceMapFrameResult(true, null);
+    }
+
+    private static void AddFailure(List<SourceMapFailure> failures, SourceMapFailure failure, ref bool failureDetailsTruncated)
+    {
+        if (failures.Any(f => String.Equals(f.GeneratedFileUrl, failure.GeneratedFileUrl, StringComparison.Ordinal)))
+            return;
+
+        if (failures.Count < MaximumFailureDetails)
+            failures.Add(failure);
+        else
+            failureDetailsTruncated = true;
+    }
+
+    private void MergeDeferredFailures(
+        DataDictionary existingStatus,
+        HashSet<string> deferredGeneratedFileUrls,
+        List<SourceMapFailure> failures,
+        ref bool failureDetailsTruncated)
+    {
+        if (!existingStatus.ContainsKey("failures"))
+            return;
+
+        var existingFailures = existingStatus.GetValue<DataDictionary[]>("failures", _serializerOptions);
+        if (existingFailures is null)
+            return;
+
+        foreach (var existingFailure in existingFailures)
+        {
+            string? generatedFileUrl = existingFailure.GetString("generated_file_name");
+            string? reason = existingFailure.GetString("reason");
+            if (generatedFileUrl is null || reason is null || !deferredGeneratedFileUrls.Contains(generatedFileUrl))
+                continue;
+
+            AddFailure(failures, new SourceMapFailure(generatedFileUrl, reason), ref failureDetailsTruncated);
+        }
+
+        if (deferredGeneratedFileUrls.Count > 0
+            && existingStatus.ContainsKey("truncated")
+            && existingStatus.GetValue<bool>("truncated", _serializerOptions))
+            failureDetailsTruncated = true;
+    }
+
+    private async Task<SourceMapLookupResult> GetSourceMapAsync(SourceMapRequest request, Uri generatedFileUri, CancellationToken cancellationToken)
+    {
+        string cacheKey = GetMemoryCacheKey(request.ProjectId, generatedFileUri.AbsoluteUri);
+        if (_parsedSourceMaps.TryGetValue(cacheKey, out ResolvedSourceMap? cached) && cached is not null)
+        {
+            long cacheVersion = await GetProjectCacheVersionAsync(request.ProjectId);
+            if (cached.CacheVersion == cacheVersion && !ShouldRefresh(cached.Artifact, generatedFileUri))
+                return SourceMapLookupResult.Resolved(cached);
+            _parsedSourceMaps.Remove(cacheKey);
+        }
+
+        var lazy = _inflightSourceMaps.GetOrAdd(cacheKey, _ => new Lazy<Task<SourceMapLookupResult>>(
+            () => LoadAndCacheSourceMapAsync(request, generatedFileUri, cacheKey),
+            LazyThreadSafetyMode.ExecutionAndPublication));
+        Task<SourceMapLookupResult> loadTask = lazy.Value;
+
+        try
+        {
+            return await loadTask.WaitAsync(cancellationToken);
+        }
+        finally
+        {
+            if (loadTask.IsCompleted)
+                RemoveInflightSourceMap(cacheKey, lazy);
+            else
+                _ = RemoveInflightSourceMapWhenCompleteAsync(cacheKey, lazy, loadTask);
+        }
+    }
+
+    private async Task<SourceMapLookupResult> LoadAndCacheSourceMapAsync(SourceMapRequest request, Uri generatedFileUri, string cacheKey)
+    {
+        long cacheVersion = await GetProjectCacheVersionAsync(request.ProjectId);
+        var resolved = await LoadSourceMapAsync(request, generatedFileUri, cacheVersion);
+        long currentCacheVersion = await GetProjectCacheVersionAsync(request.ProjectId);
+        if ((resolved.SourceMap is null && cacheVersion != currentCacheVersion)
+            || (resolved.SourceMap is not null && resolved.SourceMap.CacheVersion != currentCacheVersion))
+        {
+            resolved = await LoadSourceMapAsync(request, generatedFileUri, currentCacheVersion);
+        }
+
+        if (resolved.SourceMap is not null && resolved.SourceMap.Document.EstimatedMemorySize <= _options.MaximumParsedSourceMapCacheSize)
+        {
+            _parsedSourceMapEntries[cacheKey] = resolved.SourceMap;
+            var cacheOptions = new MemoryCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = _options.ParsedSourceMapCacheLifetime,
+                Size = Math.Max(1, resolved.SourceMap.Document.EstimatedMemorySize)
+            }.RegisterPostEvictionCallback(
+                static (key, _, _, state) =>
+                {
+                    if (key is string evictedCacheKey && state is ParsedSourceMapCacheRegistration registration)
+                        registration.Service.RemoveParsedSourceMapEntry(evictedCacheKey, registration.SourceMap);
+                },
+                new ParsedSourceMapCacheRegistration(this, resolved.SourceMap));
+            _parsedSourceMaps.Set(cacheKey, resolved.SourceMap, cacheOptions);
+        }
+
+        return resolved;
+    }
+
+    private async Task RemoveInflightSourceMapWhenCompleteAsync(
+        string cacheKey,
+        Lazy<Task<SourceMapLookupResult>> lazy,
+        Task<SourceMapLookupResult> loadTask)
+    {
+        try
+        {
+            await loadTask;
+        }
+        catch
+        {
+            // The caller observes the load failure; this continuation only releases the in-flight entry.
+        }
+
+        RemoveInflightSourceMap(cacheKey, lazy);
+    }
+
+    private void RemoveInflightSourceMap(string cacheKey, Lazy<Task<SourceMapLookupResult>> lazy)
+    {
+        ICollection<KeyValuePair<string, Lazy<Task<SourceMapLookupResult>>>> entries = _inflightSourceMaps;
+        entries.Remove(new KeyValuePair<string, Lazy<Task<SourceMapLookupResult>>>(cacheKey, lazy));
+    }
+
+    private void RemoveParsedSourceMapEntry(string cacheKey, ResolvedSourceMap sourceMap)
+    {
+        ICollection<KeyValuePair<string, ResolvedSourceMap>> entries = _parsedSourceMapEntries;
+        entries.Remove(new KeyValuePair<string, ResolvedSourceMap>(cacheKey, sourceMap));
+    }
+
+    private async Task WaitForInflightSourceMapAsync(string cacheKey, CancellationToken cancellationToken)
+    {
+        if (_inflightSourceMaps.TryGetValue(cacheKey, out var sourceMap))
+            await WaitForInflightSourceMapAsync(sourceMap, cancellationToken);
+    }
+
+    private async Task WaitForInflightArtifactAsync(string projectId, string artifactId, CancellationToken cancellationToken)
+    {
+        string cacheKeyPrefix = projectId + ':';
+        var sourceMaps = _inflightSourceMaps
+            .Where(entry => entry.Key.StartsWith(cacheKeyPrefix, StringComparison.Ordinal)
+                && GetArtifactId(entry.Key[cacheKeyPrefix.Length..]) == artifactId)
+            .Select(entry => entry.Value)
+            .ToArray();
+
+        foreach (var sourceMap in sourceMaps)
+            await WaitForInflightSourceMapAsync(sourceMap, cancellationToken);
+    }
+
+    private static async Task WaitForInflightSourceMapAsync(Lazy<Task<SourceMapLookupResult>> sourceMap, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await sourceMap.Value.WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            // A failed lookup must not prevent an explicit upload or delete from repairing the artifact.
+        }
+    }
+
+    private async Task<SourceMapLookupResult> LoadSourceMapAsync(SourceMapRequest request, Uri generatedFileUri, long cacheVersion)
+    {
+        string projectId = request.ProjectId;
+        string generatedFileUrl = generatedFileUri.AbsoluteUri;
+        string artifactId = GetArtifactId(generatedFileUrl);
+        var stored = await _storage.GetAsync(projectId, artifactId, _options.MaximumSourceMapSize, CancellationToken.None);
+        bool refreshStoredMap = stored is not null && ShouldRefresh(stored.Artifact, generatedFileUri);
+        if (stored is not null && !refreshStoredMap)
+            return Resolve(stored.Artifact, stored.Content, cacheVersion);
+
+        if (!_options.EnableAutoDownload || !String.Equals(generatedFileUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            return SourceMapLookupResult.Failed(SourceMapFailureReasons.NotFound);
+
+        string failureCacheKey = GetFailureCacheKey(projectId, generatedFileUrl);
+        var cachedFailure = await _cache.GetAsync<string>(failureCacheKey);
+        if (cachedFailure.HasValue)
+            return SourceMapLookupResult.Failed(cachedFailure.Value);
+
+        try
+        {
+            using var timeoutCancellationTokenSource = new CancellationTokenSource(_options.RequestTimeout);
+            await using var artifactLock = await _lockProvider.TryAcquireAsync(
+                GetArtifactLockKey(projectId, artifactId),
+                TimeSpan.FromSeconds(30),
+                timeoutCancellationTokenSource.Token);
+            if (artifactLock is null)
+                return await CacheFailureAsync(failureCacheKey, SourceMapFailureReasons.Unavailable);
+
+            stored = await _storage.GetAsync(projectId, artifactId, _options.MaximumSourceMapSize, CancellationToken.None);
+            if (stored is not null && !ShouldRefresh(stored.Artifact, generatedFileUri))
+                return Resolve(stored.Artifact, stored.Content, await GetProjectCacheVersionAsync(projectId));
+
+            if (stored is null && !await _throttle.TryReserveDiscoveryAsync(request))
+                return SourceMapLookupResult.Deferred;
+
+            if (!await _downloadSemaphore.WaitAsync(TimeSpan.Zero, timeoutCancellationTokenSource.Token))
+                return SourceMapLookupResult.Deferred;
+            SourceMapDownloader.DownloadedSourceMap? downloaded;
+            try
+            {
+                await using var globalDownloadSlot = await TryAcquireGlobalDownloadSlotAsync(artifactId, timeoutCancellationTokenSource.Token);
+                if (globalDownloadSlot is null)
+                    return SourceMapLookupResult.Deferred;
+
+                try
+                {
+                    downloaded = await _downloader.DownloadAsync(generatedFileUri, stored is not null, timeoutCancellationTokenSource.Token);
+                }
+                catch (Exception ex) when (ex is HttpRequestException or IOException or JsonException or InvalidOperationException or FormatException)
+                {
+                    return await CacheExpectedFailureAsync(failureCacheKey, generatedFileUrl, ex, GetFailureReason(ex));
+                }
+                if (downloaded is null)
+                    return await CacheFailureAsync(failureCacheKey, SourceMapFailureReasons.NotFound);
+            }
+            finally
+            {
+                _downloadSemaphore.Release();
+            }
+
+            var artifact = new SourceMapArtifact
+            {
+                Id = artifactId,
+                GeneratedFileUrl = generatedFileUrl,
+                SourceMapUrl = downloaded.SourceMapUrl,
+                FileName = GetDownloadedFileName(downloaded.SourceMapUrl),
+                Size = downloaded.Content.LongLength,
+                IsAutoDownloaded = true,
+                CreatedUtc = _timeProvider.GetUtcNow().UtcDateTime
+            };
+            SourceMapDocument document;
+            try
+            {
+                document = downloaded.Document ?? SourceMapDocument.Parse(downloaded.Content, _options.MaximumMappingSegments);
+            }
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
+            {
+                return await CacheExpectedFailureAsync(failureCacheKey, generatedFileUrl, ex, SourceMapFailureReasons.Invalid);
+            }
+            await using var projectLock = await TryAcquireProjectStorageLockAsync(projectId, timeoutCancellationTokenSource.Token);
+            if (projectLock is null)
+                return await CacheFailureAsync(failureCacheKey, SourceMapFailureReasons.Unavailable);
+            if (await IsProjectDeletedAsync(projectId))
+                return default;
+
+            await ValidateStorageLimitAsync(projectId, artifact, request.IsFreePlan, timeoutCancellationTokenSource.Token);
+            await _storage.SaveAsync(projectId, artifact, downloaded.Content, CancellationToken.None);
+            long updatedCacheVersion = await ClearCachesAsync(projectId, generatedFileUrl);
+            return SourceMapLookupResult.Resolved(new ResolvedSourceMap(artifact, document, updatedCacheVersion));
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("Timed out downloading a source map for {GeneratedFileUrl}.", generatedFileUrl);
+            return await CacheFailureAsync(failureCacheKey, SourceMapFailureReasons.Timeout);
+        }
+        catch (SourceMapRequestThrottledException)
+        {
+            return SourceMapLookupResult.Deferred;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException or JsonException or InvalidOperationException or FormatException)
+        {
+            _logger.LogWarning(ex, "Unable to persist a source map for {GeneratedFileUrl}.", generatedFileUrl);
+            return await CacheFailureAsync(failureCacheKey, SourceMapFailureReasons.Unavailable);
+        }
+    }
+
+    private SourceMapLookupResult Resolve(SourceMapArtifact artifact, byte[] content, long cacheVersion)
+        => SourceMapLookupResult.Resolved(new ResolvedSourceMap(artifact, SourceMapDocument.Parse(content, _options.MaximumMappingSegments), cacheVersion));
+
+    private static string GetFailureReason(Exception exception)
+        => exception is JsonException or FormatException
+            ? SourceMapFailureReasons.Invalid
+            : SourceMapFailureReasons.Unavailable;
+
+    private Task<SourceMapLookupResult> CacheExpectedFailureAsync(string failureCacheKey, string generatedFileUrl, Exception exception, string reason)
+    {
+        _logger.LogDebug(
+            exception,
+            "Unable to download a source map for {GeneratedFileUrl}: {FailureType}: {Message}",
+            generatedFileUrl,
+            exception.GetType().Name,
+            exception.Message);
+        return CacheFailureAsync(failureCacheKey, reason);
+    }
+
+    private bool ShouldRefresh(SourceMapArtifact artifact, Uri generatedFileUri)
+        => artifact.IsAutoDownloaded
+            && _options.EnableAutoDownload
+            && String.Equals(generatedFileUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            && _timeProvider.GetUtcNow().UtcDateTime - artifact.CreatedUtc >= _options.AutoDownloadRefreshInterval;
+
+    private async Task<long> ClearCachesAsync(string projectId, string generatedFileUrl)
+    {
+        _parsedSourceMaps.Remove(GetMemoryCacheKey(projectId, generatedFileUrl));
+        await _cache.RemoveAsync(GetFailureCacheKey(projectId, generatedFileUrl));
+        return await AdvanceProjectCacheVersionAsync(projectId);
+    }
+
+    private Task<long> GetProjectCacheVersionAsync(string projectId)
+        => _cache.GetAsync<long>(GetProjectCacheVersionKey(projectId), 0);
+
+    private async Task<long> AdvanceProjectCacheVersionAsync(string projectId)
+    {
+        string cacheKey = GetProjectCacheVersionKey(projectId);
+        long cacheVersion = await _cache.IncrementAsync(cacheKey, 1);
+        if (!await _cache.SetAsync(cacheKey, cacheVersion))
+            throw new IOException("Unable to persist the source map cache generation.");
+        return cacheVersion;
+    }
+
+    private Task<ILock?> TryAcquireProjectStorageLockAsync(string projectId, CancellationToken cancellationToken)
+        => _lockProvider.TryAcquireAsync(GetProjectStorageLockKey(projectId), TimeSpan.FromSeconds(30), cancellationToken);
+
+    public async Task SaveUsagesAsync(CancellationToken cancellationToken = default)
+    {
+        string pendingCacheKey = GetUsagePendingCacheKey();
+        var pending = await _cache.GetListAsync<SourceMapUsageKey>(pendingCacheKey);
+        if (!pending.HasValue)
+            return;
+
+        foreach (var usage in pending.Value)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await _cache.ListRemoveAsync(pendingCacheKey, usage);
+
+            try
+            {
+                DateTime lastUsedUtc = await GetPendingLastUsedUtcAsync(usage.ProjectId, usage.ArtifactId);
+                if (lastUsedUtc == DateTime.MinValue)
+                    continue;
+
+                await using var projectLock = await TryAcquireProjectStorageLockAsync(usage.ProjectId, cancellationToken);
+                if (projectLock is null)
+                {
+                    await _cache.ListAddAsync(pendingCacheKey, usage);
+                    continue;
+                }
+
+                var result = await _storage.SetLastUsedUtcAsync(usage.ProjectId, usage.ArtifactId, lastUsedUtc, cancellationToken);
+                if (result == SourceMapStorage.SetLastUsedResult.Failed)
+                    await _cache.ListAddAsync(pendingCacheKey, usage);
+                else if (result == SourceMapStorage.SetLastUsedResult.NotFound)
+                    await _cache.RemoveAsync(GetLastUsedCacheKey(usage.ProjectId, usage.ArtifactId));
+            }
+            catch
+            {
+                await _cache.ListAddAsync(pendingCacheKey, usage);
+                throw;
+            }
+        }
+    }
+
+    public async Task<int> CleanupStaleArtifactsAsync(string projectId, bool isFreePlan, CancellationToken cancellationToken = default)
+    {
+        await using var projectLock = await TryAcquireProjectStorageLockAsync(projectId, cancellationToken);
+        if (projectLock is null)
+            throw new IOException("Unable to acquire the project source map storage lock.");
+
+        return await CleanupStaleArtifactsUnderLockAsync(projectId, isFreePlan, cancellationToken);
+    }
+
+    private async Task ValidateStorageLimitAsync(string projectId, SourceMapArtifact artifact, bool isFreePlan, CancellationToken cancellationToken)
+    {
+        await CleanupStaleArtifactsUnderLockAsync(projectId, isFreePlan, cancellationToken);
+        var usage = await _storage.GetProjectStorageUsageAsync(projectId, artifact.Id, cancellationToken);
+        var otherArtifacts = usage.Artifacts.Where(existing => !String.Equals(existing.Id, artifact.Id, StringComparison.Ordinal)).ToArray();
+        int maximumArtifacts = isFreePlan ? _options.MaximumArtifactsPerFreeProject : _options.MaximumArtifactsPerProject;
+        long maximumStorageSize = isFreePlan ? _options.MaximumStorageSizePerFreeProject : _options.MaximumStorageSizePerProject;
+        if (otherArtifacts.Length >= maximumArtifacts)
+            throw new SourceMapStorageLimitException($"The project source map artifact limit of {maximumArtifacts:N0} has been reached.");
+
+        if (usage.RetainedBytes > maximumStorageSize
+            || artifact.Size > maximumStorageSize - usage.RetainedBytes)
+            throw new SourceMapStorageLimitException("The project source map storage limit has been reached.");
+    }
+
+    private async Task<bool> TrackUsageAsync(string projectId, string artifactId, CancellationToken cancellationToken)
+    {
+        string localCacheKey = $"{projectId}:{artifactId}";
+        if (_recentlyTrackedUsages.TryGetValue(localCacheKey, out _))
+            return true;
+
+        await using var projectLock = await TryAcquireProjectStorageLockAsync(projectId, cancellationToken);
+        if (projectLock is null)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return false;
+        }
+
+        if (_recentlyTrackedUsages.TryGetValue(localCacheKey, out _))
+            return true;
+        if (await IsProjectDeletedAsync(projectId) || !await _storage.ExistsAsync(projectId, artifactId, cancellationToken))
+            return false;
+
+        var usage = new SourceMapUsageKey(projectId, artifactId);
+        DateTime lastUsedUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        try
+        {
+            await Task.WhenAll(
+                _cache.ListAddAsync(GetUsagePendingCacheKey(), usage),
+                _cache.SetIfHigherAsync(GetLastUsedCacheKey(projectId, artifactId), lastUsedUtc, _usageCacheLifetime));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unable to queue source map usage for project {ProjectId} artifact {SourceMapArtifactId}.", projectId, artifactId);
+            try
+            {
+                if (await _storage.SetLastUsedUtcAsync(projectId, artifactId, lastUsedUtc, cancellationToken) != SourceMapStorage.SetLastUsedResult.Updated)
+                    return false;
+            }
+            catch (Exception fallbackException) when (fallbackException is IOException or JsonException)
+            {
+                _logger.LogWarning(fallbackException, "Unable to persist source map usage for project {ProjectId} artifact {SourceMapArtifactId}.", projectId, artifactId);
+                return false;
+            }
+        }
+
+        _recentlyTrackedUsages.Set(localCacheKey, true, new MemoryCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = _options.UsageTrackingDebounce,
+            Size = 1
+        });
+        return true;
+    }
+
+    private async Task<int> CleanupStaleArtifactsUnderLockAsync(string projectId, bool isFreePlan, CancellationToken cancellationToken)
+    {
+        DateTime nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        DateTime cutoffUtc = nowUtc - (isFreePlan ? _options.FreeArtifactRetention : _options.ArtifactRetention);
+        var artifacts = await _storage.GetArtifactsAsync(projectId, cancellationToken);
+        int removed = 0;
+
+        foreach (var artifact in artifacts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            DateTime pendingLastUsedUtc = await GetPendingLastUsedUtcAsync(projectId, artifact.Id);
+            DateTime effectiveLastUsedUtc = artifact.LastUsedUtc ?? artifact.CreatedUtc;
+            if (pendingLastUsedUtc > effectiveLastUsedUtc)
+            {
+                effectiveLastUsedUtc = pendingLastUsedUtc;
+                if (await _storage.SetLastUsedUtcAsync(projectId, artifact.Id, effectiveLastUsedUtc, cancellationToken) != SourceMapStorage.SetLastUsedResult.Updated)
+                    throw new IOException("Unable to update source map usage metadata.");
+            }
+
+            if (effectiveLastUsedUtc > cutoffUtc)
+                continue;
+
+            var deleted = await _storage.DeleteAsync(projectId, artifact.Id, cancellationToken);
+            if (deleted is null)
+                continue;
+
+            await RemoveUsageTrackingAsync(projectId, artifact.Id);
+            await ClearCachesAsync(projectId, artifact.GeneratedFileUrl);
+            removed++;
+        }
+
+        return removed;
+    }
+
+    private Task<DateTime> GetPendingLastUsedUtcAsync(string projectId, string artifactId)
+        => _cache.GetUnixTimeMillisecondsAsync(GetLastUsedCacheKey(projectId, artifactId), DateTime.MinValue);
+
+    private async Task<bool> IsProjectDeletedAsync(string projectId)
+        => (await _cache.GetAsync<bool>(GetDeletedProjectCacheKey(projectId))).HasValue;
+
+    private Task RemoveUsageTrackingAsync(string projectId, string artifactId)
+    {
+        _recentlyTrackedUsages.Remove($"{projectId}:{artifactId}");
+        return Task.WhenAll(
+            _cache.ListRemoveAsync(GetUsagePendingCacheKey(), new SourceMapUsageKey(projectId, artifactId)),
+            _cache.RemoveAsync(GetLastUsedCacheKey(projectId, artifactId)));
+    }
+
+    private async Task<SourceMapLookupResult> CacheFailureAsync(string failureCacheKey, string reason)
+    {
+        await _cache.SetAsync(failureCacheKey, reason, FailureCacheLifetime);
+        return SourceMapLookupResult.Failed(reason);
+    }
+
+    private async Task<ILock?> TryAcquireGlobalDownloadSlotAsync(string artifactId, CancellationToken cancellationToken)
+    {
+        int start = (int)(Convert.ToUInt32(artifactId[..8], 16) % _options.MaximumConcurrentDownloadsGlobally);
+        for (int offset = 0; offset < _options.MaximumConcurrentDownloadsGlobally; offset++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int slot = (start + offset) % _options.MaximumConcurrentDownloadsGlobally;
+            var globalDownloadSlot = await _lockProvider.TryAcquireAsync(
+                $"source-maps:download-slot:{slot}",
+                _options.RequestTimeout + TimeSpan.FromSeconds(1),
+                TimeSpan.Zero);
+            if (globalDownloadSlot is not null)
+                return globalDownloadSlot;
+        }
+
+        return null;
+    }
+
+    public static bool TryNormalizeGeneratedFileUrl(string? value, bool requireHttps, out Uri uri)
+    {
+        uri = null!;
+        if (String.IsNullOrWhiteSpace(value) || !Uri.TryCreate(value.Trim(), UriKind.Absolute, out var parsedUri))
+            return false;
+
+        bool validScheme = String.Equals(parsedUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            || (!requireHttps && String.Equals(parsedUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase));
+        if (!validScheme || !String.IsNullOrEmpty(parsedUri.UserInfo) || !String.IsNullOrEmpty(parsedUri.Fragment))
+            return false;
+
+        uri = parsedUri;
+        return true;
+    }
+
+    private static bool IsArtifactId(string value) => value.Length == 64 && value.All(Uri.IsHexDigit);
+    private static string GetArtifactId(string generatedFileUrl) => generatedFileUrl.ToSHA256();
+    private static string GetArtifactLockKey(string projectId, string artifactId) => $"source-maps:artifact:{projectId}:{artifactId}";
+    private static string GetProjectStorageLockKey(string projectId) => $"source-maps:project-storage:{projectId}";
+    private static string GetProjectCacheVersionKey(string projectId) => $"source-maps:cache-version:{projectId}";
+    private static string GetDeletedProjectCacheKey(string projectId) => $"source-maps:project-deleted:{projectId}";
+    private static string GetMemoryCacheKey(string projectId, string generatedFileUrl) => $"{projectId}:{generatedFileUrl}";
+    private static string GetFailureCacheKey(string projectId, string generatedFileUrl) => $"source-maps:failure:v2:{projectId}:{generatedFileUrl.ToSHA256()}";
+    private static string GetUsagePendingCacheKey() => "source-maps:usage:pending";
+    private static string GetLastUsedCacheKey(string projectId, string artifactId) => $"source-maps:usage:last:{projectId}:{artifactId}";
+
+    private static string? GetDownloadedFileName(string? sourceMapUrl)
+    {
+        if (sourceMapUrl is null || !Uri.TryCreate(sourceMapUrl, UriKind.Absolute, out var uri))
+            return null;
+        return Path.GetFileName(uri.AbsolutePath);
+    }
+
+    private sealed record ResolvedSourceMap(SourceMapArtifact Artifact, SourceMapDocument Document, long CacheVersion);
+    private sealed record SourceMapFailure(string GeneratedFileUrl, string Reason);
+    private readonly record struct SourceMapFrameResult(bool Symbolicated, SourceMapFailure? Failure, bool IsDeferred = false);
+    private readonly record struct SourceMapLookupResult(ResolvedSourceMap? SourceMap, string? FailureReason, bool IsDeferred = false)
+    {
+        public static SourceMapLookupResult Deferred => new(null, null, true);
+        public static SourceMapLookupResult Failed(string reason) => new(null, reason);
+        public static SourceMapLookupResult Resolved(ResolvedSourceMap sourceMap) => new(sourceMap, null);
+    }
+    private sealed record ParsedSourceMapCacheRegistration(SourceMapService Service, ResolvedSourceMap SourceMap);
+}
+
+internal readonly record struct SourceMapProcessingResult(bool Symbolicated, bool Modified);
+
+internal static class SourceMapFailureReasons
+{
+    public const string Invalid = "invalid";
+    public const string NoMatchingMapping = "no_matching_mapping";
+    public const string NotFound = "not_found";
+    public const string Timeout = "timeout";
+    public const string Unavailable = "unavailable";
+}
+
+internal sealed record SourceMapUsageKey(string ProjectId, string ArtifactId);
+
+public sealed class SourceMapStorageLimitException(string message) : InvalidOperationException(message);

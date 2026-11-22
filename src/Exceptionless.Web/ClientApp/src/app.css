@@ -1,0 +1,228 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import './ai-elements.css';
+@source '../node_modules/streamdown-svelte/dist/**/*.{js,svelte,ts}';
+
+@custom-variant dark (&:is(.dark *));
+
+/* Keep the development query inspector from covering Exie's composer. */
+body:has([data-assistant-panel]) .tsqd-open-btn-container {
+    display: none;
+}
+
+:root {
+    --background: hsl(0 0% 100%);
+    --foreground: hsl(221 39% 11%);
+
+    --muted: hsl(240 4.8% 95.9%);
+    --muted-foreground: hsl(240 3.8% 46.1%);
+
+    --popover: hsl(0 0% 100%);
+    --popover-foreground: hsl(221 39% 11%);
+
+    --card: hsl(0 0% 100%);
+    --card-foreground: hsl(221 39% 11%);
+
+    --border: hsl(220 13% 91%);
+    --input: hsl(220 13% 91%);
+
+    --primary: hsl(96 64% 46%);
+    --primary-foreground: hsl(0 0% 10%);
+
+    --secondary: hsl(240 4.8% 95.9%);
+    --secondary-foreground: hsl(240 5.9% 10%);
+
+    --accent: hsl(220 14.29% 95.88%);
+    --accent-foreground: hsl(216.92 19.12% 26.67%);
+
+    --destructive: hsl(0 72.2% 50.6%);
+    --destructive-foreground: hsl(0 0% 100%);
+
+    --ring: hsl(221 39% 11%);
+
+    --radius: 0.375rem;
+
+    --sidebar: var(--background);
+    --sidebar-foreground: var(--foreground);
+    --sidebar-primary: var(--primary);
+    --sidebar-primary-foreground: var(--primary-foreground);
+    --sidebar-accent: var(--accent);
+    --sidebar-accent-foreground: var(--accent-foreground);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--ring);
+
+    /* CUSTOM: BRAND-ALIGNED DASHBOARD COLOR PALETTE FOR CHART SERIES IN LIGHT MODE. */
+    --chart-1: #72c928; /* Total / events: classic Exceptionless green */
+    --chart-2: #43a047; /* Secondary series: deeper green */
+    --chart-3: #f0ad4e; /* Discarded / regressed: warm amber */
+    --chart-4: #f7d34a; /* Ignored / too big: golden yellow */
+    --chart-5: #8a8f98; /* Organization total / snoozed: neutral gray */
+    --chart-6: #d9534f; /* Limit / destructive: classic red */
+    --chart-7: #9b2d30; /* Deleted: dark rose */
+}
+
+.dark {
+    --background: hsl(220 60% 1.96%);
+    --foreground: hsl(0 0% 100%);
+
+    --muted: hsl(210 16.13% 12.16%);
+    --muted-foreground: hsl(207.69 35.14% 92.75%);
+
+    --popover: hsl(216 27.78% 7.06%);
+    --popover-foreground: hsl(207.69 35.14% 92.75%);
+
+    --card: hsl(216 27.78% 7.06%);
+    --card-foreground: hsl(210 40% 98%);
+
+    --border: hsl(215 14.63% 16.08%);
+    --input: hsl(215 12.24% 19.22%);
+
+    --primary: hsl(96 64.1% 45.88%);
+    --primary-foreground: hsl(0 0% 10%);
+
+    --secondary: hsl(215 15.38% 15.29%);
+    --secondary-foreground: hsl(0 0% 97.25%);
+
+    --accent: hsl(210 16.13% 12.16%);
+    --accent-foreground: hsl(207.69 35.14% 92.75%);
+
+    --destructive: hsl(359.59 67.74% 42.55%);
+    --destructive-foreground: hsl(0 0% 100%);
+
+    --ring: hsl(96 64.1% 45.88%);
+
+    --sidebar: var(--background);
+    --sidebar-foreground: var(--foreground);
+    --sidebar-primary: var(--primary);
+    --sidebar-primary-foreground: var(--primary-foreground);
+    --sidebar-accent: var(--accent);
+    --sidebar-accent-foreground: var(--accent-foreground);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--ring);
+
+    /* CUSTOM: BRAND-ALIGNED DASHBOARD COLOR PALETTE FOR CHART SERIES IN DARK MODE. */
+    --chart-1: #91dc45; /* Total / events: classic Exceptionless green */
+    --chart-2: #5fc263; /* Secondary series: deeper green */
+    --chart-3: #ffbd63; /* Discarded / regressed: warm amber */
+    --chart-4: #ffe16a; /* Ignored / too big: golden yellow */
+    --chart-5: #a4abb5; /* Organization total / snoozed: neutral gray */
+    --chart-6: #ff746f; /* Limit / destructive: classic red */
+    --chart-7: #c94f53; /* Deleted: dark rose */
+}
+
+@theme inline {
+    /* Fonts */
+    --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+    --font-mono: 'Source Code Pro Variable', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+
+    /* Radius (for rounded-*) */
+    --radius-sm: calc(var(--radius) - 4px);
+    --radius-md: calc(var(--radius) - 2px);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) + 4px);
+
+    /* Colors */
+    --color-background: var(--background);
+    --color-foreground: var(--foreground);
+    --color-muted: var(--muted);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-popover: var(--popover);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-card: var(--card);
+    --color-card-foreground: var(--card-foreground);
+    --color-border: var(--border);
+    --color-input: var(--input);
+    --color-primary: var(--primary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-secondary: var(--secondary);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-accent: var(--accent);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-destructive: var(--destructive);
+    --color-destructive-foreground: var(--destructive-foreground);
+    --color-ring: var(--ring);
+    --color-radius: var(--radius);
+    --color-sidebar: var(--sidebar);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-ring: var(--sidebar-ring);
+
+    /* Animations */
+    --animate-accordion-up: accordion-up 0.2s ease-out;
+    --animate-accordion-down: accordion-down 0.2s ease-out;
+    --animate-caret-blink: caret-blink 1.25s ease-out infinite;
+}
+
+@layer base {
+    * {
+        @apply border-border;
+    }
+
+    html {
+        overflow: hidden;
+    }
+
+    body {
+        @apply bg-background text-foreground;
+    }
+}
+
+@utility no-scrollbar {
+    /* CUSTOM: HELPS KEEP CUSTOM SIDEBAR/OVERLAYS FROM CAUSING VISUAL LAYOUT JITTER. */
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+
+    &::-webkit-scrollbar {
+        display: none;
+    }
+}
+
+@keyframes accordion-down {
+    from {
+        height: 0;
+    }
+
+    to {
+        height: var(--bits-accordion-content-height);
+    }
+}
+
+@keyframes accordion-up {
+    from {
+        height: var(--bits-accordion-content-height);
+    }
+
+    to {
+        height: 0;
+    }
+}
+
+@keyframes caret-blink {
+    0%,
+    70%,
+    100% {
+        opacity: 1;
+    }
+
+    20%,
+    50% {
+        opacity: 0;
+    }
+}
+
+/* CUSTOM: PRESERVE THIS SVG FILL OPACITY OVERRIDE UNTIL CHART LIBRARY RANGE-STYLING DEFAULT IS FIXED. */
+[data-slot='chart'] .lc-area-path {
+    fill-opacity: 0.16;
+}
+
+.lc-brush-range {
+    @apply bg-primary/10 border-primary border-2;
+}
+
+.lc-brush-handle {
+    @apply bg-primary border-primary border-2;
+}

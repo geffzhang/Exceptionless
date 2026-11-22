@@ -1,0 +1,73 @@
+import type { FetchClientResponse, ProblemDetails } from '@foundatiofx/fetchclient';
+import type { CreateQueryResult } from '@tanstack/svelte-query';
+
+import { type ColumnDef, renderComponent, type StockFeatures } from '@tanstack/svelte-table';
+
+import type { Webhook } from '#features/webhooks/models.ts';
+
+import { getSharedTableOptions } from '#features/shared/table.svelte.ts';
+import WebhookActionsCell from '#features/webhooks/components/table/webhook-actions-cell.svelte';
+
+import type { GetProjectWebhooksParams } from '../../api.svelte';
+
+export function getColumns<TWebhook extends Webhook>(): ColumnDef<StockFeatures, TWebhook, unknown>[] {
+    const columns: ColumnDef<StockFeatures, TWebhook, unknown>[] = [
+        {
+            accessorKey: 'url',
+            cell: (info) => info.getValue(),
+            enableHiding: false,
+            enableSorting: false,
+            header: 'Url',
+            meta: {
+                class: 'w-50'
+            }
+        },
+        {
+            accessorKey: 'event_types',
+            cell: (info) => info.getValue(),
+            enableHiding: true,
+            enableSorting: false,
+            header: 'Event Types',
+            meta: {
+                class: 'w-50'
+            }
+        },
+        {
+            cell: (info) =>
+                renderComponent(WebhookActionsCell, {
+                    webhook: info.row.original
+                }),
+            enableHiding: false,
+            enableSorting: false,
+            header: '',
+            id: 'actions',
+            meta: {
+                class: 'w-12 min-w-12 max-w-12 text-right'
+            }
+        }
+    ];
+
+    return columns;
+}
+
+export function getTableOptions<TWebhook extends Webhook>(
+    queryParameters: GetProjectWebhooksParams,
+    queryResponse: CreateQueryResult<FetchClientResponse<TWebhook[]>, ProblemDetails>
+) {
+    return getSharedTableOptions<TWebhook>({
+        columnPersistenceKey: 'webhooks-column-visibility',
+        get columns() {
+            return getColumns<TWebhook>();
+        },
+        paginationStrategy: 'offset',
+        get queryData() {
+            return queryResponse.data?.data ?? [];
+        },
+        get queryMeta() {
+            return queryResponse.data?.meta;
+        },
+        get queryParameters() {
+            return queryParameters;
+        }
+    });
+}

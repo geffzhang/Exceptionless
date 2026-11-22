@@ -1,6 +1,5 @@
-﻿using System;
+﻿namespace Exceptionless.Core.Models;
 
-namespace Exceptionless.Core.Models {
-    public interface IOwnedByOrganizationAndProject : IOwnedByOrganization, IOwnedByProject {
-    }
+public interface IOwnedByOrganizationAndProject : IOwnedByOrganization, IOwnedByProject
+{
 }

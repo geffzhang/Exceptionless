@@ -1,0 +1,42 @@
+import type { ResolvedPathname } from '$app/types';
+import type { Component } from 'svelte';
+
+import type { ShortcutKey } from '#features/shared/keyboard-shortcuts.ts';
+import type { ViewCurrentUser } from '#features/users/models.ts';
+
+import { routes as appRoutes } from './(app)/routes.svelte';
+import { routes as authRoutes } from './(auth)/routes.svelte';
+
+export type NavigationChild = {
+    href: string;
+    savedView?: SavedViewNavigationMetadata;
+    title: string;
+};
+
+export type NavigationItem = {
+    children?: NavigationChild[];
+    group: string;
+    href: ResolvedPathname | string;
+    icon: Component;
+    keywords?: string[];
+    openInNewTab?: boolean;
+    shortcut?: readonly ShortcutKey[];
+    show?: (context: NavigationItemContext) => boolean;
+    title: string;
+    view?: string;
+};
+
+export type NavigationItemContext = {
+    authenticated: boolean;
+    impersonating?: boolean;
+    user?: ViewCurrentUser;
+};
+
+export type SavedViewNavigationMetadata = {
+    id: string;
+    isPrivate: boolean;
+};
+
+export function routes(): NavigationItem[] {
+    return [...appRoutes(), ...authRoutes()];
+}

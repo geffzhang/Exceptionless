@@ -1,0 +1,256 @@
+<script lang="ts">
+    import { PUBLIC_SLACK_APPID } from '$app/env/public';
+    import { page } from '$app/state';
+    import Plus from '@lucide/svelte/icons/plus';
+    import Zapier from '@lucide/svelte/icons/zap';
+    import { createTable } from '@tanstack/svelte-table';
+    import { toast } from 'svelte-sonner';
+
+    import type { NotificationSettings } from '#features/projects/models.ts';
+    import type { NewWebhook, Webhook } from '#features/webhooks/models.ts';
+
+    import DataTableViewOptions from '#comp/data-table/data-table-view-options.svelte';
+    import SlackIcon from '#comp/icons/SlackIcon.svelte';
+    import { H4, Muted } from '#comp/typography/index.ts';
+    import { Button } from '#comp/ui/button/index.ts';
+    import { slackOAuthLogin } from '#features/auth/index.svelte.ts';
+    import { showBillingDialogOnUpgradeProblem } from '#features/billing/index.ts';
+    import { organization } from '#features/organizations/context.svelte.ts';
+    import {
+        deleteSlack,
+        getProjectIntegrationNotificationSettings,
+        getProjectQuery,
+        postSlack,
+        putProjectIntegrationNotificationSettings
+    } from '#features/projects/api.svelte.ts';
+    import RemoveSlackDialog from '#features/projects/components/dialogs/remove-slack-dialog.svelte';
+    import IntegrationNotificationSettingsForm from '#features/projects/components/integration-notification-settings-form.svelte';
+    import { DEFAULT_LIMIT } from '#features/shared/api/api.svelte.ts';
+    import { type GetProjectWebhooksParams, postWebhook } from '#features/webhooks/api.svelte.ts';
+    import { getProjectWebhooksQuery } from '#features/webhooks/api.svelte.ts';
+    import AddWebhookDialog from '#features/webhooks/components/dialogs/add-webhook-dialog.svelte';
+    import { getTableOptions } from '#features/webhooks/components/table/options.svelte.ts';
+    import WebhooksDataTable from '#features/webhooks/components/table/webhooks-data-table.svelte';
+    import { createQueryParameters } from '#shared/query-params/index.ts';
+
+    let toastId = $state<number | string>();
+    let showAddWebhookDialog = $state(false);
+    let showRemoveSlackDialog = $state(false);
+    const projectId = $derived(page.params.projectId || '');
+    const projectQuery = getProjectQuery({
+        route: {
+            get id() {
+                return projectId;
+            }
+        }
+    });
+
+    const isSlackEnabled = !!PUBLIC_SLACK_APPID;
+    const hasSlackIntegration = $derived(projectQuery.data?.has_slack_integration ?? false);
+    const newWebhook = postWebhook();
+
+    const addSlackMutation = postSlack({
+        route: {
+            get id() {
+                return projectId;
+            }
+        }
+    });
+
+    const removeSlackMutation = deleteSlack({
+        route: {
+            get id() {
+                return projectId;
+            }
+        }
+    });
+
+    const slackNotificationSettingsQuery = getProjectIntegrationNotificationSettings({
+        route: {
+            get id() {
+                return projectId;
+            },
+            integration: 'slack'
+        }
+    });
+
+    const updateSlackNotificationSettingsResponse = putProjectIntegrationNotificationSettings({
+        route: {
+            get id() {
+                return projectId;
+            },
+            integration: 'slack'
+        }
+    });
+
+    async function addSlack() {
+        toast.dismiss(toastId);
+        const requestProjectId = projectId;
+        const requestOrganizationId = organization.current;
+
+        try {
+            const code = await slackOAuthLogin();
+            await addSlackMutation.mutateAsync(code);
+            toastId = toast.success('Successfully connected Slack integration.');
+        } catch (error) {
+            if (showUpgradeDialogForProject(error, requestProjectId, requestOrganizationId, () => addSlack())) {
+                return;
+            }
+
+            toastId = toast.error('Error connecting Slack integration. Please try again.');
+        }
+    }
+
+    async function addWebhook(webhook: NewWebhook) {
+        toast.dismiss(toastId);
+
+        try {
+            await newWebhook.mutateAsync(webhook);
+            toastId = toast.success('Webhook added successfully');
+        } catch (error) {
+            if (showBillingDialogOnUpgradeProblem(error, organization.current, () => addWebhook(webhook))) {
+                return;
+            }
+
+            toastId = toast.error('Error adding webhook. Please try again.');
+            throw error;
+        }
+    }
+
+    async function removeSlack() {
+        toast.dismiss(toastId);
+
+        try {
+            await removeSlackMutation.mutateAsync();
+            toastId = toast.success('Successfully removed Slack integration.');
+        } catch {
+            toastId = toast.error('Error removing Slack integration. Please try again.');
+        }
+    }
+
+    // Project-scoped mutations read the current route when they run, so a late upgrade
+    // retry must not run after the user has moved to another project.
+    function showUpgradeDialogForProject(
+        error: unknown,
+        requestProjectId: string,
+        requestOrganizationId: string | undefined,
+        retry: () => Promise<void>
+    ): boolean {
+        return showBillingDialogOnUpgradeProblem(error, requestOrganizationId, async () => {
+            if (projectId === requestProjectId) {
+                await retry();
+            }
+        });
+    }
+
+    async function updateSlackNotificationSettings(settings: NotificationSettings) {
+        toast.dismiss(toastId);
+        const requestProjectId = projectId;
+        const requestOrganizationId = organization.current;
+
+        try {
+            await updateSlackNotificationSettingsResponse.mutateAsync(settings);
+            toastId = toast.success('Successfully updated Slack notification settings.');
+        } catch (error) {
+            if (showUpgradeDialogForProject(error, requestProjectId, requestOrganizationId, () => updateSlackNotificationSettings(settings))) {
+                return;
+            }
+
+            toastId = toast.error('Error updating Slack notification settings. Please try again.');
+        }
+    }
+
+    const DEFAULT_PARAMS = {
+        limit: DEFAULT_LIMIT
+    };
+
+    const queryParams = createQueryParameters({
+        defaults: DEFAULT_PARAMS,
+        history: 'push',
+        schema: {
+            limit: 'number'
+        }
+    });
+
+    const webhooksQueryParameters: GetProjectWebhooksParams = $state({
+        get limit() {
+            return queryParams.limit!;
+        },
+        set limit(value) {
+            queryParams.limit = value;
+        }
+    });
+
+    const webhooksQuery = getProjectWebhooksQuery({
+        get params() {
+            return webhooksQueryParameters;
+        },
+        route: {
+            get projectId() {
+                return projectId;
+            }
+        }
+    });
+
+    const table = createTable(getTableOptions<Webhook>(webhooksQueryParameters, webhooksQuery));
+
+    $effect(() => {
+        // Handle case where pop state loses the limit
+        queryParams.limit ??= DEFAULT_LIMIT;
+    });
+</script>
+
+<div class="space-y-6">
+    <section class="space-y-2">
+        <H4>Zapier</H4>
+        <Muted
+            >Exceptionless has a native Zapier integration. You can use Zapier to connect your Exceptionless account to over 3,000 other applications all
+            without writing any code.</Muted
+        >
+
+        <Button href="https://zapier.com/apps/exceptionless/integrations" target="_blank"><Zapier class="mr-2 size-4" /> Connect Zapier</Button>
+    </section>
+
+    {#if isSlackEnabled}
+        <section class="space-y-2">
+            <H4>Slack</H4>
+            <Muted
+                >Integrate Exceptionless with Slack to receive real-time notifications about new errors, critical events, and system alerts directly in your
+                team's Slack channels. Keep your team informed and respond faster to issues without constantly checking the dashboard.</Muted
+            >
+
+            {#if hasSlackIntegration}
+                <IntegrationNotificationSettingsForm settings={slackNotificationSettingsQuery.data} save={updateSlackNotificationSettings} />
+
+                <Button onclick={() => (showRemoveSlackDialog = true)}><SlackIcon class="mr-2 size-4" /> Remove Slack</Button>
+            {:else}
+                <Button onclick={addSlack}><SlackIcon class="mr-2 size-4" /> Connect Slack</Button>
+            {/if}
+        </section>
+    {/if}
+
+    <section class="space-y-2">
+        <div>
+            <H4>Webhooks</H4>
+            <Muted>The following web hooks will be called for this project</Muted>
+        </div>
+
+        <WebhooksDataTable bind:limit={webhooksQueryParameters.limit!} isLoading={webhooksQuery.isLoading} {table}>
+            {#snippet toolbarChildren()}
+                <div class="flex-1"></div>
+                <DataTableViewOptions size="icon-lg" {table} />
+                <Button size="icon-lg" onclick={() => (showAddWebhookDialog = true)} title="Add Webhook" aria-label="Add Webhook">
+                    <Plus aria-hidden="true" />
+                </Button>
+            {/snippet}
+        </WebhooksDataTable>
+    </section>
+</div>
+
+{#if showAddWebhookDialog && organization.current}
+    <AddWebhookDialog bind:open={showAddWebhookDialog} save={addWebhook} {projectId} organizationId={organization.current} />
+{/if}
+
+{#if showRemoveSlackDialog}
+    <RemoveSlackDialog bind:open={showRemoveSlackDialog} remove={removeSlack} />
+{/if}

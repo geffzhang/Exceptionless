@@ -1,0 +1,34 @@
+using System.ComponentModel.DataAnnotations;
+using System.Text.Json.Serialization;
+
+namespace Exceptionless.Core.Models;
+
+/// <summary>
+/// Per-column display settings for a saved view. All properties are optional so new settings can
+/// be added without changing the meaning of existing saved views.
+/// </summary>
+public sealed record SavedViewColumnSettings
+{
+    public const int MaxPosition = 49;
+    public const int MaxWidth = 1200;
+    public const int MinWidth = 48;
+
+    /// <summary>Whether the column is visible. Null means use the table default.</summary>
+    public bool? Visible { get; set; }
+
+    /// <summary>Whether the column fills the table's remaining width. Null or false means use fixed-width behavior.</summary>
+    public bool? AutoFill { get; set; }
+
+    /// <summary>Whether cell content wraps onto multiple lines. Null or false means keep content on one line.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Wrap { get; set; }
+
+    /// <summary>Zero-based display position. Null means use the table default order.</summary>
+    [Range(0, MaxPosition)]
+    public int? Position { get; set; }
+
+    /// <summary>Column width in pixels. Null means use the table default width.</summary>
+    [Range(MinWidth, MaxWidth)]
+    public int? Width { get; set; }
+
+}

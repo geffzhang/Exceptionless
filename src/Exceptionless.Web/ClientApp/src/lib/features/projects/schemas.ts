@@ -1,0 +1,26 @@
+import { custom, type infer as Infer, object, string } from 'zod';
+
+import {
+    UpdateProjectSchema as GeneratedUpdateProjectSchema,
+    type NewProjectFormData,
+    NewProjectSchema,
+    type NotificationSettingsFormData,
+    NotificationSettingsSchema
+} from '#generated/schemas.ts';
+
+export { type NewProjectFormData, NewProjectSchema, type NotificationSettingsFormData, NotificationSettingsSchema };
+
+export const ClientConfigurationSettingSchema = object({
+    key: string().min(1, 'Key is required'),
+    value: string().min(1, 'Value is required')
+});
+export type ClientConfigurationSettingFormData = Infer<typeof ClientConfigurationSettingSchema>;
+
+export const UpdateProjectSchema = GeneratedUpdateProjectSchema.partial();
+export type UpdateProjectFormData = Infer<typeof UpdateProjectSchema>;
+
+export const SourceMapUploadSchema = object({
+    file: custom<File | null>((value) => typeof File !== 'undefined' && value instanceof File, 'Source map file is required'),
+    generated_file_url: string().url('Enter the absolute URL of the generated JavaScript file')
+});
+export type SourceMapUploadFormData = Infer<typeof SourceMapUploadSchema>;

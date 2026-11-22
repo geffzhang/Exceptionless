@@ -1,7 +1,9 @@
-﻿using System;
+﻿using System.ComponentModel.DataAnnotations;
 
-namespace Exceptionless.Web.Models {
-    public class NewOrganization {
-        public string Name { get; set; }
-    }
+namespace Exceptionless.Web.Models;
+
+public record NewOrganization
+{
+    [Required]
+    public string Name { get; set; } = null!;
 }

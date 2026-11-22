@@ -1,100 +1,100 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
+﻿using System.Globalization;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.Extensions.Primitives;
 
-namespace Exceptionless.Web.Utility {
-    public class DelimitedQueryStringValueProvider : QueryStringValueProvider {
-        private readonly CultureInfo _culture;
-        private readonly char[] _delimiters;
-        private readonly IQueryCollection _queryCollection;
+namespace Exceptionless.Web.Utility;
 
-        public DelimitedQueryStringValueProvider(BindingSource bindingSource, IQueryCollection values, CultureInfo culture, char[] delimiters) : base(bindingSource, values, culture) {
-            _queryCollection = values;
-            _culture = culture;
-            _delimiters = delimiters;
-        }
+public class DelimitedQueryStringValueProvider : QueryStringValueProvider
+{
+    private readonly CultureInfo _culture;
+    private readonly char[] _delimiters;
+    private readonly IQueryCollection _queryCollection;
 
-        public char[] Delimiters => _delimiters;
-
-        public override ValueProviderResult GetValue(string key) {
-            if (key == null)
-                throw new ArgumentNullException(nameof(key));
-
-            var values = _queryCollection[key];
-            if (values.Count == 0)
-                return ValueProviderResult.None;
-
-            if (!values.Any(x => _delimiters.Any(x.Contains)))
-                return new ValueProviderResult(values, _culture);
-
-            var stringValues = new StringValues(values.SelectMany(x => x.Split(_delimiters, StringSplitOptions.RemoveEmptyEntries)).ToArray());
-
-            return new ValueProviderResult(stringValues, _culture);
-        }
+    public DelimitedQueryStringValueProvider(BindingSource bindingSource, IQueryCollection values, CultureInfo culture, char[] delimiters) : base(bindingSource, values, culture)
+    {
+        _queryCollection = values;
+        _culture = culture;
+        _delimiters = delimiters;
     }
 
-    public class DelimitedQueryStringValueProviderFactory : IValueProviderFactory {
-        private static readonly char[] DefaultDelimiters = { ',' };
-        private readonly char[] _delimiters;
+    public override ValueProviderResult GetValue(string key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
 
-        public DelimitedQueryStringValueProviderFactory() : this(DefaultDelimiters) { }
+        var values = _queryCollection[key];
+        if (values.Count == 0)
+            return ValueProviderResult.None;
 
-        public DelimitedQueryStringValueProviderFactory(params char[] delimiters) {
-            if (delimiters == null || delimiters.Length == 0)
-                _delimiters = DefaultDelimiters;
-            else
-                _delimiters = delimiters;
-        }
+        if (!values.Any(x => x != null && _delimiters.Any(x.Contains)))
+            return new ValueProviderResult(values, _culture);
 
-        public Task CreateValueProviderAsync(ValueProviderFactoryContext context) {
-            if (context == null)
-                throw new ArgumentNullException(nameof(context));
+        var stringValues = new StringValues(values.SelectMany(x => x?.Split(_delimiters, StringSplitOptions.RemoveEmptyEntries) ?? []).ToArray());
+        return new ValueProviderResult(stringValues, _culture);
+    }
+}
 
-            var valueProvider = new DelimitedQueryStringValueProvider(BindingSource.Query, context.ActionContext.HttpContext.Request.Query, CultureInfo.InvariantCulture, _delimiters);
+public class DelimitedQueryStringValueProviderFactory : IValueProviderFactory
+{
+    private static readonly char[] DefaultDelimiters = [','];
+    private readonly char[] _delimiters;
 
-            context.ValueProviders.Add(valueProvider);
+    public DelimitedQueryStringValueProviderFactory() : this(DefaultDelimiters) { }
 
-            return Task.CompletedTask;
-        }
+    public DelimitedQueryStringValueProviderFactory(params char[] delimiters)
+    {
+        _delimiters = delimiters.Length == 0 ? DefaultDelimiters : delimiters;
     }
 
-    [AttributeUsage(AttributeTargets.Method | AttributeTargets.Class)]
-    public class DelimitedQueryStringAttribute : Attribute, IResourceFilter {
-        private readonly char[] _delimiters;
+    public Task CreateValueProviderAsync(ValueProviderFactoryContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
 
-        public DelimitedQueryStringAttribute(params char[] delimiters) {
-            _delimiters = delimiters;
-        }
+        var valueProvider = new DelimitedQueryStringValueProvider(BindingSource.Query, context.ActionContext.HttpContext.Request.Query, CultureInfo.InvariantCulture, _delimiters);
 
-        public void OnResourceExecuted(ResourceExecutedContext context) {
-            if (context == null)
-                throw new ArgumentNullException(nameof(context));
-        }
+        context.ValueProviders.Add(valueProvider);
 
-        public void OnResourceExecuting(ResourceExecutingContext context) {
-            if (context == null)
-                throw new ArgumentNullException(nameof(context));
+        return Task.CompletedTask;
+    }
+}
 
-            context.ValueProviderFactories.AddDelimitedValueProviderFactory(_delimiters);
-        }
+[AttributeUsage(AttributeTargets.Method | AttributeTargets.Class)]
+public class DelimitedQueryStringAttribute : Attribute, IResourceFilter
+{
+    private readonly char[] _delimiters;
+
+    public DelimitedQueryStringAttribute(params char[] delimiters)
+    {
+        _delimiters = delimiters;
     }
 
-    public static class ValueProviderFactoriesExtensions {
-        public static void AddDelimitedValueProviderFactory(this IList<IValueProviderFactory> valueProviderFactories, char[] delimiters) {
-            var queryStringValueProviderFactory = valueProviderFactories.OfType<QueryStringValueProviderFactory>().FirstOrDefault();
+    public void OnResourceExecuted(ResourceExecutedContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+    }
 
-            if (queryStringValueProviderFactory == null) {
-                valueProviderFactories.Insert(0, new DelimitedQueryStringValueProviderFactory(delimiters));
-            } else {
-                valueProviderFactories.Insert(valueProviderFactories.IndexOf(queryStringValueProviderFactory), new DelimitedQueryStringValueProviderFactory(delimiters));
-                valueProviderFactories.Remove(queryStringValueProviderFactory);
-            }
+    public void OnResourceExecuting(ResourceExecutingContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        context.ValueProviderFactories.AddDelimitedValueProviderFactory(_delimiters);
+    }
+}
+
+public static class ValueProviderFactoriesExtensions
+{
+    public static void AddDelimitedValueProviderFactory(this IList<IValueProviderFactory> valueProviderFactories, char[] delimiters)
+    {
+        var queryStringValueProviderFactory = valueProviderFactories.OfType<QueryStringValueProviderFactory>().FirstOrDefault();
+
+        if (queryStringValueProviderFactory is null)
+        {
+            valueProviderFactories.Insert(0, new DelimitedQueryStringValueProviderFactory(delimiters));
+        }
+        else
+        {
+            valueProviderFactories.Insert(valueProviderFactories.IndexOf(queryStringValueProviderFactory), new DelimitedQueryStringValueProviderFactory(delimiters));
+            valueProviderFactories.Remove(queryStringValueProviderFactory);
         }
     }
 }

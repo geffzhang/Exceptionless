@@ -1,0 +1,1558 @@
+using System.Net;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Exceptionless.Core;
+using Exceptionless.Core.Billing;
+using Exceptionless.Core.Migrations;
+using Exceptionless.Core.Models;
+using Exceptionless.Core.Repositories;
+using Exceptionless.Core.Utility;
+using Exceptionless.Tests.Extensions;
+using Exceptionless.Tests.Utility;
+using Exceptionless.Web.Api.Handlers;
+using Exceptionless.Web.Api.Results;
+using Exceptionless.Web.Models.Admin;
+using Foundatio.Caching;
+using Foundatio.Jobs;
+using Foundatio.Queues;
+using Foundatio.Repositories;
+using Foundatio.Repositories.Models;
+using Foundatio.Repositories.Migrations;
+using Foundatio.Repositories.Utility;
+using Foundatio.Storage;
+using Xunit;
+
+namespace Exceptionless.Tests.Api.Endpoints;
+
+public class AdminEndpointTests : IntegrationTestsBase
+{
+    private readonly WorkItemJob _workItemJob;
+    private readonly IQueue<WorkItemData> _workItemQueue;
+    private readonly IStackRepository _stackRepository;
+    private readonly IEventRepository _eventRepository;
+    private readonly IProjectRepository _projectRepository;
+    private readonly IOrganizationRepository _organizationRepository;
+    private readonly BillingPlans _billingPlans;
+    private readonly ICacheClient _cache;
+    private readonly IUserRepository _userRepository;
+    private readonly IFileStorage _fileStorage;
+    private readonly StackData _stackData;
+    private readonly EventData _eventData;
+
+    public AdminEndpointTests(ITestOutputHelper output, AppWebHostFactory factory) : base(output, factory)
+    {
+        _workItemJob = GetService<WorkItemJob>();
+        _workItemQueue = GetService<IQueue<WorkItemData>>();
+        _stackRepository = GetService<IStackRepository>();
+        _eventRepository = GetService<IEventRepository>();
+        _projectRepository = GetService<IProjectRepository>();
+        _organizationRepository = GetService<IOrganizationRepository>();
+        _billingPlans = GetService<BillingPlans>();
+        _cache = GetService<ICacheClient>();
+        _userRepository = GetService<IUserRepository>();
+        _fileStorage = GetService<IFileStorage>();
+        _stackData = GetService<StackData>();
+        _eventData = GetService<EventData>();
+    }
+
+    [Fact]
+    public async Task AssistantUsageAsync_AsGlobalAdmin_ReturnsOrganizationsRankedByCost()
+    {
+        var month = new DateTime(2026, 8, 1, 0, 0, 0, DateTimeKind.Utc);
+        var organization = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organization);
+        organization.PlanId = "EX_MEDIUM";
+        organization.AssistantUsage.Add(new AssistantUsageInfo
+        {
+            Date = month,
+            PlanId = organization.PlanId,
+            Turns = 2,
+            Completed = 1,
+            Failed = 1,
+            ProviderRequests = 3,
+            ToolCalls = 4,
+            PromptTokens = 12_000,
+            CompletionTokens = 750,
+            CostInMicrodollars = 2345,
+            LastUsedUtc = month.AddHours(1)
+        });
+        await _organizationRepository.SaveAsync(organization, options => options.ImmediateConsistency());
+
+        var response = await SendRequestAsAsync<AdminAssistantUsageResponse>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-usage")
+            .QueryString("month", "2026-08-01")
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(response);
+        Assert.Equal(month, response.Month);
+        Assert.Equal(1, response.ActiveOrganizations);
+        Assert.Equal(2, response.Turns);
+        Assert.Equal(12_000, response.PromptTokens);
+        Assert.Equal(750, response.CompletionTokens);
+        Assert.Equal(0.002345m, response.CostUsd);
+        var usage = Assert.Single(response.Organizations);
+        Assert.Equal(organization.Id, usage.OrganizationId);
+        Assert.Equal(25_000_000, usage.MonthlyTokenLimit);
+        Assert.Equal(5m, usage.MonthlyCostLimitUsd);
+        Assert.Equal(0.0005m, usage.TokenUtilization);
+        Assert.Equal(0.0005m, usage.CostUtilization);
+    }
+
+    [Fact]
+    public async Task AssistantSettingsAsync_AsGlobalAdmin_UpdatesAndClearsRuntimeModelOverride()
+    {
+        var initial = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(initial);
+        Assert.Equal(initial.ConfiguredModel, initial.Model);
+        Assert.False(initial.IsOverridden);
+        Assert.Equal(initial.ConfiguredEnabled, initial.Enabled);
+        Assert.False(initial.IsEnabledOverridden);
+
+        var updated = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .Content(new UpdateAssistantSettings { Model = "  z-ai/glm-5.3-flash  " })
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(updated);
+        Assert.Equal("z-ai/glm-5.3-flash", updated.Model);
+        Assert.Equal(initial.ConfiguredModel, updated.ConfiguredModel);
+        Assert.True(updated.IsOverridden);
+
+        var persistedSettings = await GetService<ISystemSettingsRepository>().GetByIdAsync(SystemSettings.DefaultId, options => options.ImmediateConsistency());
+        Assert.NotNull(persistedSettings);
+        Assert.Equal("z-ai/glm-5.3-flash", persistedSettings.AssistantModel);
+        Assert.False(String.IsNullOrWhiteSpace(persistedSettings.CreatedByUserId));
+        Assert.False(String.IsNullOrWhiteSpace(persistedSettings.UpdatedByUserId));
+
+        await _cache.RemoveAllAsync();
+        var afterCacheClear = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(afterCacheClear);
+        Assert.Equal("z-ai/glm-5.3-flash", afterCacheClear.Model);
+        Assert.True(afterCacheClear.IsOverridden);
+
+        var restoredDefault = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .Content(new UpdateAssistantSettings { Model = initial.ConfiguredModel })
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(restoredDefault);
+        Assert.Equal(initial.ConfiguredModel, restoredDefault.Model);
+        Assert.False(restoredDefault.IsOverridden);
+
+        await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .Content(new UpdateAssistantSettings { Model = "z-ai/glm-5.3-flash" })
+            .StatusCodeShouldBeOk());
+
+        var cleared = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .Content(new UpdateAssistantSettings { Model = null })
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(cleared);
+        Assert.Equal(initial.ConfiguredModel, cleared.Model);
+        Assert.False(cleared.IsOverridden);
+    }
+
+    [Fact]
+    public async Task AssistantSettingsAsync_AsGlobalAdmin_UpdatesAndClearsRuntimeEnabledOverride()
+    {
+        var initial = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(initial);
+
+        var updated = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings", "enabled")
+            .Content(new UpdateAssistantEnabledSettings { Enabled = !initial.ConfiguredEnabled })
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(updated);
+        Assert.Equal(!initial.ConfiguredEnabled, updated.Enabled);
+        Assert.True(updated.IsEnabledOverridden);
+
+        await _cache.RemoveAllAsync();
+        var afterCacheClear = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(afterCacheClear);
+        Assert.Equal(updated.Enabled, afterCacheClear.Enabled);
+        Assert.True(afterCacheClear.IsEnabledOverridden);
+
+        var restoredDefault = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings", "enabled")
+            .Content(new UpdateAssistantEnabledSettings { Enabled = initial.ConfiguredEnabled })
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(restoredDefault);
+        Assert.Equal(initial.ConfiguredEnabled, restoredDefault.Enabled);
+        Assert.False(restoredDefault.IsEnabledOverridden);
+
+        await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings", "enabled")
+            .Content(new UpdateAssistantEnabledSettings { Enabled = !initial.ConfiguredEnabled })
+            .StatusCodeShouldBeOk());
+
+        var cleared = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings", "enabled")
+            .Content(new UpdateAssistantEnabledSettings { Enabled = null })
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(cleared);
+        Assert.Equal(initial.ConfiguredEnabled, cleared.Enabled);
+        Assert.False(cleared.IsEnabledOverridden);
+    }
+
+    [Fact]
+    public async Task AssistantConversationSharingSettingsAsync_AsGlobalAdmin_PersistsBothStatesWithoutChangingOtherSettings()
+    {
+        var initial = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .AsGlobalAdminUser().AppendPaths("admin", "assistant-settings").StatusCodeShouldBeOk());
+        Assert.NotNull(initial);
+        Assert.False(initial.ConversationSharingDefaultEnabled);
+
+        foreach (bool enabled in new[] { true, false })
+        {
+            var updated = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+                .Put().AsGlobalAdminUser().AppendPaths("admin", "assistant-settings", "conversation-sharing")
+                .Content(new UpdateAssistantConversationSharingSettings { Enabled = enabled }).StatusCodeShouldBeOk());
+            Assert.NotNull(updated);
+            Assert.Equal(enabled, updated.ConversationSharingDefaultEnabled);
+
+            await _cache.RemoveAllAsync();
+            var persisted = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+                .AsGlobalAdminUser().AppendPaths("admin", "assistant-settings").StatusCodeShouldBeOk());
+            Assert.NotNull(persisted);
+            Assert.Equal(enabled, persisted.ConversationSharingDefaultEnabled);
+            Assert.Equal(initial.Model, persisted.Model);
+            Assert.Equal(initial.Enabled, persisted.Enabled);
+        }
+    }
+
+    [Fact]
+    public Task AssistantConversationSharingSettingsAsync_AsOrganizationUser_ReturnsForbidden() => SendRequestAsync(request => request
+        .Put().AsTestOrganizationUser().AppendPaths("admin", "assistant-settings", "conversation-sharing")
+        .Content(new UpdateAssistantConversationSharingSettings { Enabled = true }).StatusCodeShouldBeForbidden());
+
+    [Fact]
+    public Task AssistantConversationSharingSettingsAsync_MissingChoice_ReturnsBadRequest() => SendRequestAsync(request => request
+        .Put().AsGlobalAdminUser().AppendPaths("admin", "assistant-settings", "conversation-sharing")
+        .Content(new { }).StatusCodeShouldBeBadRequest());
+
+    [Fact]
+    public Task AssistantConversationSharingSettingsAsync_AsAnonymous_ReturnsUnauthorized() => SendRequestAsync(request => request
+        .Put().AsAnonymousUser().AppendPaths("admin", "assistant-settings", "conversation-sharing")
+        .Content(new UpdateAssistantConversationSharingSettings { Enabled = true }).StatusCodeShouldBeUnauthorized());
+
+    [Fact]
+    public async Task EventSubmissionSettingsAsync_AsGlobalAdmin_UpdatesAndClearsRuntimeOverride()
+    {
+        var initial = await SendRequestAsAsync<EventSubmissionSettings>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "event-submission-settings")
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(initial);
+        Assert.Equal(initial.ConfiguredEnabled, initial.Enabled);
+        Assert.False(initial.IsOverridden);
+
+        var updated = await SendRequestAsAsync<EventSubmissionSettings>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "event-submission-settings")
+            .Content(new UpdateEventSubmissionSettings { Enabled = !initial.ConfiguredEnabled })
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(updated);
+        Assert.Equal(!initial.ConfiguredEnabled, updated.Enabled);
+        Assert.True(updated.IsOverridden);
+
+        await _cache.RemoveAllAsync();
+        var afterCacheClear = await SendRequestAsAsync<EventSubmissionSettings>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "event-submission-settings")
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(afterCacheClear);
+        Assert.Equal(updated.Enabled, afterCacheClear.Enabled);
+        Assert.True(afterCacheClear.IsOverridden);
+
+        var restoredDefault = await SendRequestAsAsync<EventSubmissionSettings>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "event-submission-settings")
+            .Content(new UpdateEventSubmissionSettings { Enabled = initial.ConfiguredEnabled })
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(restoredDefault);
+        Assert.Equal(initial.ConfiguredEnabled, restoredDefault.Enabled);
+        Assert.False(restoredDefault.IsOverridden);
+
+        await SendRequestAsAsync<EventSubmissionSettings>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "event-submission-settings")
+            .Content(new UpdateEventSubmissionSettings { Enabled = !initial.ConfiguredEnabled })
+            .StatusCodeShouldBeOk());
+
+        var cleared = await SendRequestAsAsync<EventSubmissionSettings>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "event-submission-settings")
+            .Content(new UpdateEventSubmissionSettings { Enabled = null })
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(cleared);
+        Assert.Equal(initial.ConfiguredEnabled, cleared.Enabled);
+        Assert.False(cleared.IsOverridden);
+    }
+
+    [Fact]
+    public async Task TrialSettingsAsync_AsGlobalAdmin_SavesNormalizedDomainsAndRestoresDefaults()
+    {
+        // Arrange
+        var update = new UpdateTrialSettings { BlockedEmailDomains = [" Spam.Test ", "@spam.test", "other.test"] };
+
+        // Act
+        var initial = await SendRequestAsAsync<TrialSettings>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "trial-settings")
+            .StatusCodeShouldBeOk());
+
+        var updated = await SendRequestAsAsync<TrialSettings>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "trial-settings")
+            .Content(update)
+            .StatusCodeShouldBeOk());
+
+        await _cache.RemoveAllAsync();
+        var afterCacheClear = await SendRequestAsAsync<TrialSettings>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "trial-settings")
+            .StatusCodeShouldBeOk());
+
+        var restored = await SendRequestAsAsync<TrialSettings>(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "trial-settings")
+            .Content(new UpdateTrialSettings { BlockedEmailDomains = null })
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(initial);
+        Assert.True(initial.IsDefault);
+        Assert.Contains("mailinator.com", initial.BlockedEmailDomains);
+        Assert.Equal(initial.DefaultBlockedEmailDomains, initial.BlockedEmailDomains);
+        Assert.NotNull(updated);
+        Assert.False(updated.IsDefault);
+        Assert.Equal(["other.test", "spam.test"], updated.BlockedEmailDomains);
+        Assert.Equal(updated.BlockedEmailDomains, afterCacheClear?.BlockedEmailDomains);
+        Assert.NotNull(restored);
+        Assert.True(restored.IsDefault);
+        Assert.Equal(initial.BlockedEmailDomains, restored.BlockedEmailDomains);
+    }
+
+    [Fact]
+    public async Task TrialSettingsAsync_InvalidDomain_ReturnsUnprocessableEntity()
+    {
+        // Arrange
+        var update = new UpdateTrialSettings { BlockedEmailDomains = ["not a domain"] };
+
+        // Act
+        var problem = await SendRequestAsAsync<Microsoft.AspNetCore.Mvc.ProblemDetails>(request => request
+            .Put().AsGlobalAdminUser().AppendPaths("admin", "trial-settings").Content(update)
+            .StatusCodeShouldBeUnprocessableEntity());
+
+        // Assert
+        Assert.Equal(422, problem?.Status);
+    }
+
+    [Fact]
+    public async Task TrialSettingsAsync_AsUser_ReturnsForbidden()
+    {
+        // Arrange
+        var update = new UpdateTrialSettings { BlockedEmailDomains = ["spam.test"] };
+
+        // Act
+        var problem = await SendRequestAsAsync<Microsoft.AspNetCore.Mvc.ProblemDetails>(request => request
+            .Put().AsTestOrganizationUser().AppendPaths("admin", "trial-settings").Content(update)
+            .StatusCodeShouldBeForbidden());
+
+        // Assert
+        Assert.Equal(403, problem?.Status);
+    }
+
+    [Fact]
+    public async Task RuntimeSettingsAsync_LegacyDocumentUsesDeploymentDefaults()
+    {
+        await GetService<ISystemSettingsRepository>().SaveAsync(new SystemSettings
+        {
+            AssistantModel = "legacy/model",
+            CreatedByUserId = TestConstants.UserId,
+            CreatedUtc = TimeProvider.GetUtcNow().UtcDateTime,
+            UpdatedByUserId = TestConstants.UserId,
+            UpdatedUtc = TimeProvider.GetUtcNow().UtcDateTime
+        }, options => options.ImmediateConsistency());
+
+        var assistantSettings = await SendRequestAsAsync<AssistantModelSettingsResponse>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .StatusCodeShouldBeOk());
+        var eventSubmissionSettings = await SendRequestAsAsync<EventSubmissionSettings>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "event-submission-settings")
+            .StatusCodeShouldBeOk());
+
+        Assert.NotNull(assistantSettings);
+        Assert.Equal(assistantSettings.ConfiguredEnabled, assistantSettings.Enabled);
+        Assert.False(assistantSettings.IsEnabledOverridden);
+        Assert.NotNull(eventSubmissionSettings);
+        Assert.Equal(eventSubmissionSettings.ConfiguredEnabled, eventSubmissionSettings.Enabled);
+        Assert.False(eventSubmissionSettings.IsOverridden);
+    }
+
+    [Fact]
+    public Task AssistantSettingsAsync_AsOrganizationUser_ReturnsForbidden()
+    {
+        return SendRequestAsync(request => request
+            .AsTestOrganizationUser()
+            .AppendPaths("admin", "assistant-settings")
+            .StatusCodeShouldBeForbidden());
+    }
+
+    [Fact]
+    public Task AssistantSettingsAsync_ModelIsTooLong_ReturnsUnprocessableEntity()
+    {
+        return SendRequestAsync(request => request
+            .Put()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assistant-settings")
+            .Content(new UpdateAssistantSettings { Model = new string('m', 201) })
+            .StatusCodeShouldBeUnprocessableEntity());
+    }
+
+    protected override async Task ResetDataAsync()
+    {
+        await base.ResetDataAsync();
+        var service = GetService<SampleDataService>();
+        await service.CreateDataAsync();
+    }
+
+    [Fact]
+    public async Task RequeueAsync_WithEmptyPath_UsesDefaultQueuePath()
+    {
+        // Arrange
+        await using var stream = new MemoryStream([1]);
+        await _fileStorage.SaveFileAsync("q/empty-path-event.json", stream, TestCancellationToken);
+
+        // Act
+        var response = await SendRequestAsAsync<RequeueResult>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "requeue")
+            .QueryString("path", String.Empty)
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(response);
+        Assert.Equal(1, response.Enqueued);
+    }
+
+    [Fact]
+    public async Task RequeueAsync_WithoutPath_ReturnsEmptyEnqueuedCount()
+    {
+        // Arrange
+        const int expectedEnqueuedCount = 0;
+
+        // Act
+        var response = await SendRequestAsAsync<RequeueResult>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "requeue")
+            .StatusCodeShouldBeOk()
+        );
+
+        // Assert
+        Assert.NotNull(response);
+        Assert.Equal(expectedEnqueuedCount, response.Enqueued);
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenFixStackStatsWithExplicitUtcWindow_ShouldRepairStatsEndToEnd()
+    {
+        // Arrange
+        TimeProvider.SetUtcNow(new DateTime(2026, 2, 15, 12, 0, 0, DateTimeKind.Utc));
+        var stack = await CreateCorruptedStackWithEventAsync(new DateTimeOffset(2026, 2, 14, 0, 0, 0, TimeSpan.Zero));
+
+        // Act
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "fix-stack-stats")
+            .QueryString("utcStart", "2026-02-10T00:00:00Z")
+            .QueryString("utcEnd", "2026-02-23T00:00:00Z")
+            .StatusCodeShouldBeOk());
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+
+        stack = await _stackRepository.GetByIdAsync(stack.Id);
+
+        // Assert
+        Assert.NotNull(stack);
+        Assert.Equal(1, stack.TotalOccurrences);
+        Assert.Equal(new DateTime(2026, 2, 14, 0, 0, 0, DateTimeKind.Utc), stack.FirstOccurrence);
+        Assert.Equal(new DateTime(2026, 2, 14, 0, 0, 0, DateTimeKind.Utc), stack.LastOccurrence);
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenFixStackStatsWindowIsOmitted_ShouldUseDefaultStartAndCurrentUtcEnd()
+    {
+        // Arrange
+        TimeProvider.SetUtcNow(new DateTime(2026, 2, 5, 12, 0, 0, DateTimeKind.Utc));
+        var beforeWindow = await CreateCorruptedStackWithEventAsync(new DateTimeOffset(2025, 11, 1, 12, 0, 0, TimeSpan.Zero));
+
+        TimeProvider.SetUtcNow(new DateTime(2026, 2, 15, 12, 0, 0, DateTimeKind.Utc));
+        var inWindow = await CreateCorruptedStackWithEventAsync(new DateTimeOffset(2026, 2, 15, 12, 0, 0, TimeSpan.Zero));
+
+        // Act
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "fix-stack-stats")
+            .StatusCodeShouldBeOk());
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+
+        beforeWindow = await _stackRepository.GetByIdAsync(beforeWindow.Id);
+        inWindow = await _stackRepository.GetByIdAsync(inWindow.Id);
+
+        // Assert
+        Assert.NotNull(beforeWindow);
+        Assert.NotNull(inWindow);
+        Assert.Equal(0, beforeWindow.TotalOccurrences);
+        Assert.Equal(1, inWindow.TotalOccurrences);
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenFixStackStatsUsesOffsetUtcTimestamp_ShouldAcceptModelBindingValue()
+    {
+        // Arrange
+        TimeProvider.SetUtcNow(new DateTime(2026, 2, 15, 12, 0, 0, DateTimeKind.Utc));
+        var stack = await CreateCorruptedStackWithEventAsync(new DateTimeOffset(2026, 2, 14, 0, 0, 0, TimeSpan.Zero));
+
+        // Act
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "fix-stack-stats")
+            .QueryString("utcStart", "2026-02-10T00:00:00+00:00")
+            .QueryString("utcEnd", "2026-02-23T00:00:00+00:00")
+            .StatusCodeShouldBeOk());
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+
+        stack = await _stackRepository.GetByIdAsync(stack.Id);
+        var stats = await _workItemQueue.GetQueueStatsAsync();
+
+        // Assert
+        Assert.NotNull(stack);
+        Assert.Equal(1, stack.TotalOccurrences);
+        Assert.Equal(1, stats.Enqueued);
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenFixStackStatsEndDateIsBeforeStartDate_ShouldReturnUnprocessableEntity()
+    {
+        // Arrange
+        var response = await SendRequestAsAsync<Microsoft.AspNetCore.Mvc.ValidationProblemDetails>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "fix-stack-stats")
+            .QueryString("utcStart", "2026-02-20T00:00:00Z")
+            .QueryString("utcEnd", "2026-02-10T00:00:00Z")
+            .StatusCodeShouldBeUnprocessableEntity());
+
+        // Act
+        var stats = await _workItemQueue.GetQueueStatsAsync();
+
+        // Assert
+        Assert.NotNull(response);
+        Assert.True(response.Errors.ContainsKey("utc_end"));
+        Assert.Equal(0, stats.Enqueued);
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenFixStackStatsStartDateIsInvalid_ShouldReturnBadRequestAndNotQueueWorkItem()
+    {
+        // Arrange
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "fix-stack-stats")
+            .QueryString("utcStart", "not-a-dateZ")
+            .StatusCodeShouldBeBadRequest());
+
+        // Act
+        var stats = await _workItemQueue.GetQueueStatsAsync();
+
+        // Assert
+        Assert.Equal(0, stats.Enqueued);
+    }
+
+    private async Task<Stack> CreateCorruptedStackWithEventAsync(DateTimeOffset occurrenceDate)
+    {
+        var utcOccurrenceDate = occurrenceDate.UtcDateTime;
+        var stack = _stackData.GenerateStack(generateId: true,
+            organizationId: TestConstants.OrganizationId,
+            projectId: TestConstants.ProjectId,
+            totalOccurrences: 0,
+            utcFirstOccurrence: utcOccurrenceDate.AddDays(1),
+            utcLastOccurrence: utcOccurrenceDate.AddDays(-1));
+
+        stack = await _stackRepository.AddAsync(stack, o => o.ImmediateConsistency());
+
+        await _eventRepository.AddAsync(
+            [_eventData.GenerateEvent(TestConstants.OrganizationId, TestConstants.ProjectId, stack.Id, occurrenceDate: occurrenceDate)],
+            o => o.ImmediateConsistency());
+
+        await RefreshDataAsync();
+        return stack;
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenUpdateProjectNotificationSettingsWithOrphanedUser_ShouldRemoveOrphanedEntries()
+    {
+        // Arrange
+        var project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+
+        string orphanedUserId = ObjectId.GenerateNewId().ToString();
+        project.NotificationSettings[orphanedUserId] = new NotificationSettings { ReportNewErrors = true };
+        await _projectRepository.SaveAsync(project, o => o.ImmediateConsistency());
+
+        int settingsCountBefore = project.NotificationSettings.Count;
+
+        // Act
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "update-project-notification-settings")
+            .StatusCodeShouldBeOk());
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+
+        // Assert
+        project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+        Assert.DoesNotContain(orphanedUserId, project.NotificationSettings.Keys);
+        Assert.Equal(settingsCountBefore - 1, project.NotificationSettings.Count);
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenUpdateProjectNotificationSettingsWithValidUser_ShouldPreserveSettings()
+    {
+        // Arrange
+        var project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+
+        var globalAdmin = await _userRepository.GetByEmailAddressAsync(SampleDataService.TEST_USER_EMAIL);
+        Assert.NotNull(globalAdmin);
+        Assert.Contains(globalAdmin.Id, project.NotificationSettings.Keys);
+
+        int settingsCountBefore = project.NotificationSettings.Count;
+
+        // Act
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "update-project-notification-settings")
+            .StatusCodeShouldBeOk());
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+
+        // Assert
+        project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+        Assert.Contains(globalAdmin.Id, project.NotificationSettings.Keys);
+        Assert.Equal(settingsCountBefore, project.NotificationSettings.Count);
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenUpdateProjectNotificationSettingsWithIntegration_ShouldPreserveIntegrationKey()
+    {
+        // Arrange
+        var project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+
+        project.NotificationSettings[Project.NotificationIntegrations.Slack] = new NotificationSettings { ReportNewErrors = true };
+        string orphanedUserId = ObjectId.GenerateNewId().ToString();
+        project.NotificationSettings[orphanedUserId] = new NotificationSettings { ReportNewErrors = true };
+        await _projectRepository.SaveAsync(project, o => o.ImmediateConsistency());
+
+        // Act
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "update-project-notification-settings")
+            .StatusCodeShouldBeOk());
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+
+        // Assert
+        project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+        Assert.Contains(Project.NotificationIntegrations.Slack, project.NotificationSettings.Keys);
+        Assert.DoesNotContain(orphanedUserId, project.NotificationSettings.Keys);
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenUpdateProjectNotificationSettingsWithDeletedUser_ShouldRemoveOrphanedEntries()
+    {
+        // Arrange
+        var project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+
+        string deletedUserId = ObjectId.GenerateNewId().ToString();
+        project.NotificationSettings[deletedUserId] = new NotificationSettings { ReportNewErrors = true };
+        await _projectRepository.SaveAsync(project, o => o.ImmediateConsistency());
+
+        Assert.Null(await _userRepository.GetByIdAsync(deletedUserId));
+
+        // Act
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "update-project-notification-settings")
+            .StatusCodeShouldBeOk());
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+
+        // Assert
+        project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+        Assert.DoesNotContain(deletedUserId, project.NotificationSettings.Keys);
+    }
+
+    [Fact]
+    public async Task RunJobAsync_WhenUpdateProjectNotificationSettingsWithOrgFilter_ShouldOnlyProcessTargetOrg()
+    {
+        // Arrange
+        var project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+
+        string orphanedUserId = ObjectId.GenerateNewId().ToString();
+        project.NotificationSettings[orphanedUserId] = new NotificationSettings { ReportNewErrors = true };
+        await _projectRepository.SaveAsync(project, o => o.ImmediateConsistency());
+
+        // Act: run cleanup for a different org
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "update-project-notification-settings")
+            .QueryString("organizationId", TestConstants.OrganizationId2)
+            .StatusCodeShouldBeOk());
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+
+        // Assert: orphaned user in the OTHER org should still be there
+        project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+        Assert.Contains(orphanedUserId, project.NotificationSettings.Keys);
+
+        // Act: now run for the correct org
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "maintenance", "update-project-notification-settings")
+            .QueryString("organizationId", TestConstants.OrganizationId)
+            .StatusCodeShouldBeOk());
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+
+        // Assert
+        project = await _projectRepository.GetByIdAsync(TestConstants.ProjectId);
+        Assert.NotNull(project);
+        Assert.DoesNotContain(orphanedUserId, project.NotificationSettings.Keys);
+    }
+
+    [Fact]
+    public async Task GetStats_AsGlobalAdmin_ReturnsAllFieldsPopulated()
+    {
+        // Act
+        var stats = await SendRequestAsAsync<AdminStatsResponse>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "stats")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(stats);
+        Assert.True(stats.Organizations.Total >= 0);
+        Assert.True(stats.Users.Total >= 0);
+        Assert.True(stats.Projects.Total >= 0);
+        Assert.True(stats.Stacks.Total >= 0);
+        Assert.True(stats.Events.Total >= 0);
+
+        Assert.NotNull(stats.Organizations.Aggregations);
+        Assert.NotNull(stats.Stacks.Aggregations);
+        Assert.NotNull(stats.Events.Aggregations);
+    }
+
+    [Fact]
+    public async Task GetStats_AsGlobalAdmin_BillingStatusBreakdownSumsToOrgCount()
+    {
+        // Act
+        var stats = await SendRequestAsAsync<AdminStatsResponse>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "stats")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(stats);
+        var billingTerms = stats.Organizations.Aggregations.Terms<string>("terms_billing_status");
+        Assert.NotNull(billingTerms);
+        var billingBuckets = billingTerms.Buckets;
+        Assert.NotNull(billingBuckets);
+        long billingTotal = billingBuckets.Sum(b => b.Total ?? 0);
+        Assert.Equal(stats.Organizations.Total, billingTotal);
+    }
+
+    [Fact]
+    public async Task GetStats_AsGlobalAdmin_StacksByStatusSumsToStackCount()
+    {
+        // Act
+        var stats = await SendRequestAsAsync<AdminStatsResponse>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "stats")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(stats);
+        var statusTerms = stats.Stacks.Aggregations.Terms<string>("terms_status");
+        Assert.NotNull(statusTerms);
+        var statusBuckets = statusTerms.Buckets;
+        Assert.NotNull(statusBuckets);
+        long statusTotal = statusBuckets.Sum(b => b.Total ?? 0);
+        Assert.Equal(stats.Stacks.Total, statusTotal);
+    }
+
+    [Fact]
+    public async Task GetStats_AsGlobalAdmin_StacksByTypeStatusHasValidStructure()
+    {
+        // Act
+        var stats = await SendRequestAsAsync<AdminStatsResponse>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "stats")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(stats);
+        var typeTerms = stats.Stacks.Aggregations.Terms<string>("terms_type");
+        Assert.NotNull(typeTerms);
+        var typeBuckets = typeTerms.Buckets;
+        Assert.NotNull(typeBuckets);
+        foreach (var typeBucket in typeBuckets)
+        {
+            Assert.NotNull(typeBucket.Key);
+            Assert.True(typeBucket.Total >= 0);
+            var nestedStatusTerms = typeBucket.Aggregations.Terms<string>("terms_status");
+            Assert.NotNull(nestedStatusTerms);
+            var nestedStatusBuckets = nestedStatusTerms.Buckets;
+            Assert.NotNull(nestedStatusBuckets);
+            long subTotal = nestedStatusBuckets.Sum(b => b.Total ?? 0);
+            Assert.Equal(typeBucket.Total, subTotal);
+        }
+    }
+
+    [Fact]
+    public Task GetStats_WithoutAuth_ReturnsUnauthorized()
+    {
+        return SendRequestAsync(r => r
+            .AppendPaths("admin", "stats")
+            .StatusCodeShouldBeUnauthorized());
+    }
+
+    [Fact]
+    public Task RunJobAsync_AsAuthenticatedNonGlobalAdmin_ReturnsForbidden()
+    {
+        return SendRequestAsync(r => r
+            .AsTestOrganizationUser()
+            .AppendPaths("admin", "maintenance", "fix-stack-stats")
+            .StatusCodeShouldBeForbidden());
+    }
+
+    [Theory]
+    [InlineData("admin/stats")]
+    [InlineData("admin/migrations")]
+    [InlineData("admin/elasticsearch")]
+    [InlineData("admin/elasticsearch/snapshots")]
+    public Task AdminReadEndpoints_AsAuthenticatedNonGlobalAdmin_ReturnForbidden(string path)
+    {
+        return SendRequestAsync(r => r
+            .AsTestOrganizationUser()
+            .AppendPath(path)
+            .StatusCodeShouldBeForbidden());
+    }
+
+    [Fact]
+    public async Task GetMigrations_AsGlobalAdmin_ReturnsAllRegisteredMigrations()
+    {
+        // Act
+        var response = await SendRequestAsAsync<MigrationsResponse>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "migrations")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(response);
+        Assert.NotNull(response.States);
+
+        foreach (var state in response.States)
+        {
+            Assert.NotNull(state.Id);
+            Assert.True(Enum.IsDefined(state.MigrationType));
+        }
+    }
+
+    [Fact]
+    public Task GetMigrations_WithoutAuth_ReturnsUnauthorized()
+    {
+        return SendRequestAsync(r => r
+            .AppendPaths("admin", "migrations")
+            .StatusCodeShouldBeUnauthorized());
+    }
+
+    [Fact]
+    public async Task GetElasticsearch_AsGlobalAdmin_ReturnsClusterHealthAndIndices()
+    {
+        // Act
+        var elasticsearch = await SendRequestAsAsync<ElasticsearchInfoResponse>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "elasticsearch")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(elasticsearch);
+        Assert.NotNull(elasticsearch.Health);
+        Assert.NotNull(elasticsearch.Indices);
+        Assert.NotNull(elasticsearch.IndexDetails);
+    }
+
+    [Fact]
+    public async Task GetElasticsearch_AsGlobalAdmin_IndexDetailsContainExpectedFields()
+    {
+        // Act
+        var elasticsearch = await SendRequestAsAsync<ElasticsearchInfoResponse>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "elasticsearch")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(elasticsearch);
+        Assert.NotNull(elasticsearch.IndexDetails);
+        Assert.All(elasticsearch.IndexDetails, indexDetail =>
+        {
+            Assert.True(indexDetail.DocsCount >= 0);
+            Assert.True(indexDetail.StoreSizeInBytes >= 0);
+            Assert.True(indexDetail.UnassignedShards >= 0);
+        });
+    }
+
+    [Fact]
+    public Task GetElasticsearch_WithoutAuth_ReturnsUnauthorized()
+    {
+        return SendRequestAsync(r => r
+            .AppendPaths("admin", "elasticsearch")
+            .StatusCodeShouldBeUnauthorized());
+    }
+
+    [Fact]
+    public async Task GetElasticsearchSnapshots_AsGlobalAdmin_ReturnsTypedResponse()
+    {
+        // Act
+        var snapshots = await SendRequestAsAsync<ElasticsearchSnapshotsResponse>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "elasticsearch", "snapshots")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(snapshots);
+        Assert.NotNull(snapshots.Repositories);
+        Assert.NotNull(snapshots.Snapshots);
+    }
+
+    [Fact]
+    public Task GetElasticsearchSnapshots_WithoutAuth_ReturnsUnauthorized()
+    {
+        return SendRequestAsync(r => r
+            .AppendPaths("admin", "elasticsearch", "snapshots")
+            .StatusCodeShouldBeUnauthorized());
+    }
+
+    [Fact]
+    public void FormatSnapshotDuration_WhenDurationInMillisIsPresent_ReturnsCompactDuration()
+    {
+        // Arrange
+        var durationInMillis = TimeSpan.FromMilliseconds(7416);
+
+        // Act
+        var duration = AdminHandler.FormatSnapshotDuration(null, durationInMillis, null, null);
+
+        // Assert
+        Assert.Equal("7.4s", duration);
+    }
+
+    [Fact]
+    public void FormatSnapshotDuration_WhenTypedDurationIsMissing_FallsBackToStartAndEndTime()
+    {
+        // Arrange
+        var startTime = new DateTime(2026, 6, 22, 13, 59, 59, 962, DateTimeKind.Utc);
+        var endTime = new DateTime(2026, 6, 22, 14, 0, 7, 378, DateTimeKind.Utc);
+
+        // Act
+        var duration = AdminHandler.FormatSnapshotDuration(null, null, startTime, endTime);
+
+        // Assert
+        Assert.Equal("7.4s", duration);
+    }
+
+    [Fact]
+    public async Task RerunMigrationAsync_AsGlobalAdmin_QueuesSupportedCompletedMigration()
+    {
+        // Arrange
+        var migrationStateRepository = GetService<IMigrationStateRepository>();
+        await migrationStateRepository.AddAsync(new MigrationState
+        {
+            Id = "5",
+            Version = 5,
+            MigrationType = MigrationType.VersionedAndResumable,
+            StartedUtc = DateTime.UtcNow.AddMinutes(-1),
+            CompletedUtc = DateTime.UtcNow
+        });
+
+        // Act
+        var appOptions = GetService<AppOptions>();
+        bool runJobsInProcess = appOptions.RunJobsInProcess;
+        WorkInProgressResult? result;
+        WorkInProgressResult? redispatchedResult;
+        try
+        {
+            appOptions.RunJobsInProcess = true;
+            result = await SendRequestAsAsync<WorkInProgressResult>(request => request
+                .Post()
+                .AsGlobalAdminUser()
+                .AppendPaths("admin", "migrations", "5", "rerun")
+                .Content(new RerunMigrationRequest("RERUN 5"))
+                .StatusCodeShouldBeAccepted());
+            redispatchedResult = await SendRequestAsAsync<WorkInProgressResult>(request => request
+                .Post()
+                .AsGlobalAdminUser()
+                .AppendPaths("admin", "migrations", "5", "rerun")
+                .Content(new RerunMigrationRequest("RERUN 5"))
+                .StatusCodeShouldBeAccepted());
+        }
+        finally
+        {
+            appOptions.RunJobsInProcess = runJobsInProcess;
+        }
+
+        // Assert
+        Assert.NotNull(result);
+        Assert.NotNull(redispatchedResult);
+        Assert.Single(result.Workers);
+        Assert.Equal(result.Workers, redispatchedResult.Workers);
+        var operation = await GetService<MigrationRerunService>().GetOperationAsync(result.Workers[0]);
+        Assert.NotNull(operation);
+        Assert.Equal(MigrationRerunStatus.Queued, operation.Status);
+        Assert.Equal(MigrationRerunSource.UserInterface, operation.Source);
+        Assert.False(String.IsNullOrWhiteSpace(operation.RequestedByUserId));
+        var status = await SendRequestAsAsync<MigrationRerunOperationResponse>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "migrations", "reruns", operation.Id)
+            .StatusCodeShouldBeOk());
+        Assert.NotNull(status);
+        Assert.Equal("Queued", status.Status);
+
+        var migrations = await SendRequestAsAsync<MigrationsResponse>(request => request
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "migrations")
+            .StatusCodeShouldBeOk());
+        Assert.NotNull(migrations);
+        Assert.True(Assert.Single(migrations.States, state => state.Id == "5").CanRerun);
+
+        var queueStats = await _workItemQueue.GetQueueStatsAsync();
+        Assert.Equal(1, queueStats.Enqueued);
+
+        await _workItemJob.RunUntilEmptyAsync(TestCancellationToken);
+        operation = await GetService<MigrationRerunService>().GetOperationAsync(operation.Id);
+        Assert.NotNull(operation);
+        Assert.Equal(MigrationRerunStatus.Completed, operation.Status);
+    }
+
+    [Fact]
+    public async Task RerunMigrationAsync_WithOutOfProcessJobsAndInMemoryInfrastructure_ReturnsServiceUnavailable()
+    {
+        // Arrange
+        var migrationStateRepository = GetService<IMigrationStateRepository>();
+        await migrationStateRepository.AddAsync(new MigrationState
+        {
+            Id = "5",
+            Version = 5,
+            MigrationType = MigrationType.VersionedAndResumable,
+            StartedUtc = DateTime.UtcNow.AddMinutes(-1),
+            CompletedUtc = DateTime.UtcNow
+        });
+
+        // Act / Assert
+        await SendRequestAsync(request => request
+            .Post()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "migrations", "5", "rerun")
+            .Content(new RerunMigrationRequest("RERUN 5"))
+            .ExpectedStatus(HttpStatusCode.ServiceUnavailable));
+    }
+
+    [Fact]
+    public Task RerunMigrationAsync_WithInvalidConfirmation_ReturnsValidationError()
+    {
+        return SendRequestAsync(request => request
+            .Post()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "migrations", "5", "rerun")
+            .Content(new RerunMigrationRequest("5"))
+            .StatusCodeShouldBeUnprocessableEntity());
+    }
+
+    [Fact]
+    public async Task RerunMigrationAsync_WithIncompleteMigration_ReturnsValidationError()
+    {
+        // Arrange
+        await GetService<IMigrationStateRepository>().AddAsync(new MigrationState
+        {
+            Id = "5",
+            Version = 5,
+            MigrationType = MigrationType.VersionedAndResumable,
+            StartedUtc = DateTime.UtcNow
+        });
+
+        // Act / Assert
+        await SendRequestAsync(request => request
+            .Post()
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "migrations", "5", "rerun")
+            .Content(new RerunMigrationRequest("RERUN 5"))
+            .StatusCodeShouldBeUnprocessableEntity());
+    }
+
+    [Fact]
+    public Task RerunMigrationAsync_AsNonAdmin_ReturnsForbidden()
+    {
+        return SendRequestAsync(request => request
+            .Post()
+            .AsTestOrganizationUser()
+            .AppendPaths("admin", "migrations", "5", "rerun")
+            .Content(new RerunMigrationRequest("RERUN 5"))
+            .StatusCodeShouldBeForbidden());
+    }
+
+    [Fact]
+    public async Task GetSettings_AsGlobalAdmin_ReturnsAppOptions()
+    {
+        // Act
+        var options = await SendRequestAsAsync<Dictionary<string, JsonElement>>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "settings")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(options);
+        Assert.True(options.ContainsKey("base_url"));
+        Assert.True(options.ContainsKey("app_mode"));
+    }
+
+    [Fact]
+    public Task GetSettings_AsNonAdmin_ReturnsForbidden()
+    {
+        return SendRequestAsync(r => r
+            .AsTestOrganizationUser()
+            .AppendPaths("admin", "settings")
+            .StatusCodeShouldBeForbidden());
+    }
+
+    [Fact]
+    public Task GetSettings_WithoutAuth_ReturnsUnauthorized()
+    {
+        return SendRequestAsync(r => r
+            .AppendPaths("admin", "settings")
+            .StatusCodeShouldBeUnauthorized());
+    }
+
+    [Fact]
+    public async Task EchoRequest_AsGlobalAdmin_ReturnsForwardedIpAddressAndScheme()
+    {
+        // Arrange
+        const string clientIpAddress = "203.0.113.42";
+        const string scheme = "https";
+
+        // Act
+        var response = await SendRequestAsAsync<JsonElement>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "echo")
+            .Header("X-Forwarded-For", clientIpAddress)
+            .Header("X-Forwarded-Proto", scheme)
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.Equal(clientIpAddress, response.GetProperty("ip_address").GetString());
+        Assert.Equal(scheme, response.GetProperty("scheme").GetString());
+        Assert.Equal(JsonValueKind.Object, response.GetProperty("headers").ValueKind);
+    }
+
+    [Fact]
+    public Task EchoRequest_AsNonAdmin_ReturnsForbidden()
+    {
+        return SendRequestAsync(r => r
+            .AsTestOrganizationUser()
+            .AppendPaths("admin", "echo")
+            .StatusCodeShouldBeForbidden());
+    }
+
+    [Fact]
+    public Task EchoRequest_WithoutAuth_ReturnsUnauthorized()
+    {
+        return SendRequestAsync(r => r
+            .AppendPaths("admin", "echo")
+            .StatusCodeShouldBeUnauthorized());
+    }
+
+    [Fact]
+    public async Task GenerateSampleEventsAsync_WithInvalidDaysBack_ReturnsValidationError()
+    {
+        // Arrange
+        const int eventCount = 25;
+        const int daysBack = 0;
+
+        // Act
+        var response = await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "generate-sample-events")
+            .QueryString("eventCount", eventCount)
+            .QueryString("daysBack", daysBack)
+            .StatusCodeShouldBeUnprocessableEntity());
+
+        // Assert
+        Assert.NotNull(response);
+        var stats = await _workItemQueue.GetQueueStatsAsync();
+        Assert.Equal(0, stats.Enqueued);
+    }
+
+    [Fact]
+    public async Task GenerateSampleEventsAsync_WithInvalidEventCount_ReturnsValidationError()
+    {
+        // Arrange
+        const int eventCount = 0;
+        const int daysBack = 7;
+
+        // Act
+        var response = await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "generate-sample-events")
+            .QueryString("eventCount", eventCount)
+            .QueryString("daysBack", daysBack)
+            .StatusCodeShouldBeUnprocessableEntity());
+
+        // Assert
+        Assert.NotNull(response);
+        var stats = await _workItemQueue.GetQueueStatsAsync();
+        Assert.Equal(0, stats.Enqueued);
+    }
+
+    [Fact]
+    public async Task GenerateSampleEventsAsync_WithValidArguments_QueuesGenerateSampleEventsWorkItem()
+    {
+        // Arrange
+        const int eventCount = 25;
+        const int daysBack = 14;
+
+        // Act
+        var response = await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "generate-sample-events")
+            .QueryString("eventCount", eventCount)
+            .QueryString("daysBack", daysBack)
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(response);
+        var stats = await _workItemQueue.GetQueueStatsAsync();
+        Assert.Equal(1, stats.Enqueued);
+    }
+
+    [Fact]
+    public async Task GetAssemblies_AsGlobalAdmin_ReturnsAssemblyList()
+    {
+        // Act
+        var assemblies = await SendRequestAsAsync<IReadOnlyCollection<AssemblyDetailResponse>>(r => r
+            .AsGlobalAdminUser()
+            .AppendPaths("admin", "assemblies")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(assemblies);
+        Assert.NotEmpty(assemblies);
+        Assert.Contains(assemblies, a => !String.IsNullOrEmpty(a.AssemblyName));
+    }
+
+    [Fact]
+    public Task GetAssemblies_AsNonAdmin_ReturnsForbidden()
+    {
+        return SendRequestAsync(r => r
+            .AsTestOrganizationUser()
+            .AppendPaths("admin", "assemblies")
+            .StatusCodeShouldBeForbidden());
+    }
+
+    [Fact]
+    public Task GetAssemblies_WithoutAuth_ReturnsUnauthorized()
+    {
+        return SendRequestAsync(r => r
+            .AppendPaths("admin", "assemblies")
+            .StatusCodeShouldBeUnauthorized());
+    }
+
+    [Fact]
+    public async Task ChangePlanAsync_ValidOrganizationAndPlan_ChangesOrganizationPlan()
+    {
+        // Arrange
+        var organizationBefore = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organizationBefore);
+
+        // Act
+        var result = await SendRequestAsAsync<ChangePlanResponse>(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "change-plan")
+            .QueryString("organizationId", SampleDataService.TEST_ORG_ID)
+            .QueryString("planId", _billingPlans.SmallPlan.Id)
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(result);
+        Assert.True(result.Success);
+
+        var organizationAfter = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organizationAfter);
+        Assert.Equal(_billingPlans.SmallPlan.Id, organizationAfter.PlanId);
+    }
+
+    [Fact]
+    public async Task ChangePlanAsync_TrialPlanOnFreeOrganization_StartsTrial()
+    {
+        // Arrange
+        string trialPlanId = _billingPlans.TrialPlan.Id;
+
+        // Act
+        var result = await SendRequestAsAsync<ChangePlanResponse>(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "change-plan")
+            .QueryString("organizationId", SampleDataService.FREE_ORG_ID)
+            .QueryString("planId", trialPlanId)
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(result);
+        Assert.True(result.Success, result.Message);
+
+        var organization = await _organizationRepository.GetByIdAsync(SampleDataService.FREE_ORG_ID);
+        Assert.NotNull(organization);
+        Assert.Equal(trialPlanId, organization.PlanId);
+        Assert.NotNull(organization.TrialEndsUtc);
+        Assert.True(organization.TrialEndsUtc > TimeProvider.GetUtcNow().UtcDateTime.AddDays(6));
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(30)]
+    public async Task ChangePlanAsync_CustomTrialEnd_SavesExactUtcDate(int daysFromNow)
+    {
+        // Arrange
+        var expectedEnd = TimeProvider.GetUtcNow().AddDays(daysFromNow);
+
+        // Act
+        var result = await SendRequestAsAsync<ChangePlanResponse>(request => request.AsGlobalAdminUser().Post()
+            .AppendPaths("admin", "change-plan").QueryString("organizationId", SampleDataService.FREE_ORG_ID)
+            .QueryString("planId", "EX_TRIAL").QueryString("trialEndsUtc", expectedEnd.ToString("O")).StatusCodeShouldBeOk());
+        var organization = await _organizationRepository.GetByIdAsync(SampleDataService.FREE_ORG_ID);
+
+        // Assert
+        Assert.True(result?.Success, result?.Message);
+        Assert.Equal(expectedEnd.UtcDateTime, organization?.TrialEndsUtc);
+    }
+
+    [Fact]
+    public async Task ChangePlanAsync_TrialPlanOnPaidOrganization_ReturnsFailure()
+    {
+        // Arrange
+        var organization = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organization);
+        string originalPlanId = organization.PlanId;
+
+        // Act
+        var result = await SendRequestAsAsync<ChangePlanResponse>(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "change-plan")
+            .QueryString("organizationId", SampleDataService.TEST_ORG_ID)
+            .QueryString("planId", _billingPlans.TrialPlan.Id)
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(result);
+        Assert.False(result.Success);
+
+        var organizationAfter = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organizationAfter);
+        Assert.Equal(originalPlanId, organizationAfter.PlanId);
+    }
+
+    [Fact]
+    public async Task ChangePlanAsync_InvalidPlanId_ReturnsFailure()
+    {
+        // Arrange
+        var organizationBefore = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organizationBefore);
+        string originalPlan = organizationBefore.PlanId;
+
+        // Act
+        var result = await SendRequestAsAsync<ChangePlanResponse>(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "change-plan")
+            .QueryString("organizationId", SampleDataService.TEST_ORG_ID)
+            .QueryString("planId", "NONEXISTENT_PLAN")
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        Assert.NotNull(result);
+        Assert.False(result.Success);
+        Assert.Equal("Invalid PlanId.", result.Message);
+
+        // Verify plan was not changed
+        var organizationAfter = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organizationAfter);
+        Assert.Equal(originalPlan, organizationAfter.PlanId);
+    }
+
+    [Fact]
+    public Task ChangePlanAsync_AsNonAdmin_ReturnsForbidden()
+    {
+        return SendRequestAsync(r => r
+            .AsTestOrganizationUser()
+            .Post()
+            .AppendPaths("admin", "change-plan")
+            .QueryString("organizationId", SampleDataService.TEST_ORG_ID)
+            .QueryString("planId", _billingPlans.SmallPlan.Id)
+            .StatusCodeShouldBeForbidden());
+    }
+
+    [Fact]
+    public async Task SetBonusAsync_ValidOrganization_AppliesBonus()
+    {
+        // Arrange
+        var organizationBefore = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organizationBefore);
+
+        // Act
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "set-bonus")
+            .QueryString("organizationId", SampleDataService.TEST_ORG_ID)
+            .QueryString("bonusEvents", 5000)
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        var organizationAfter = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organizationAfter);
+        Assert.Equal(5000, organizationAfter.BonusEventsPerMonth);
+    }
+
+    [Fact]
+    public async Task SetBonusAsync_WithExpiration_AppliesBonusWithExpiry()
+    {
+        // Arrange
+        string expiresUtc = TimeProvider.GetUtcNow().AddDays(30).ToString("o");
+
+        // Act
+        await SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "set-bonus")
+            .QueryString("organizationId", SampleDataService.TEST_ORG_ID)
+            .QueryString("bonusEvents", 10000)
+            .QueryString("expires", expiresUtc)
+            .StatusCodeShouldBeOk());
+
+        // Assert
+        var organization = await _organizationRepository.GetByIdAsync(SampleDataService.TEST_ORG_ID);
+        Assert.NotNull(organization);
+        Assert.Equal(10000, organization.BonusEventsPerMonth);
+        Assert.NotNull(organization.BonusExpiration);
+    }
+
+    [Fact]
+    public Task SetBonusAsync_InvalidOrganization_ReturnsValidationError()
+    {
+        // Act
+        return SendRequestAsync(r => r
+            .AsGlobalAdminUser()
+            .Post()
+            .AppendPaths("admin", "set-bonus")
+            .QueryString("organizationId", "000000000000000000000000")
+            .QueryString("bonusEvents", 1000)
+            .StatusCodeShouldBeUnprocessableEntity());
+    }
+
+    [Fact]
+    public Task SetBonusAsync_AsNonAdmin_ReturnsForbidden()
+    {
+        return SendRequestAsync(r => r
+            .AsTestOrganizationUser()
+            .Post()
+            .AppendPaths("admin", "set-bonus")
+            .QueryString("organizationId", SampleDataService.TEST_ORG_ID)
+            .QueryString("bonusEvents", 1000)
+            .StatusCodeShouldBeForbidden());
+    }
+
+    private sealed record AssistantModelSettingsResponse(
+        string Model,
+        string ConfiguredModel,
+        bool IsOverridden,
+        bool Enabled,
+        bool ConfiguredEnabled,
+        bool IsEnabledOverridden,
+        bool IsConfigured,
+        bool ConversationSharingDefaultEnabled);
+    private sealed record RequeueResult([property: JsonPropertyName("enqueued")] int Enqueued);
+}

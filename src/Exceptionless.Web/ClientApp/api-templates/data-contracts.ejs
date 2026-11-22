@@ -1,0 +1,41 @@
+<%
+const { modelTypes, utils, config } = it;
+const { formatDescription, require, _, Ts } = utils;
+
+const buildGenerics = (contract) => {
+  if (!contract.genericArgs || !contract.genericArgs.length) return '';
+
+  return '<' + contract.genericArgs.map(({ name, default: defaultType, extends: extendsType }) => {
+    return [
+      name,
+      extendsType && `extends ${extendsType}`,
+      defaultType && `= ${defaultType}`,
+    ].join('')
+  }).join(',') + '>'
+}
+
+const dataContractTemplates = {
+  enum: (contract) => {
+    return `enum ${contract.name} {\n${contract.content}\n}`;
+  },
+  interface: (contract) => {
+    return includeFile('./class-data-contract.ejs', { ...it, contract });
+  },
+  type: (contract) => {
+    return `type ${contract.name}${buildGenerics(contract)} = ${contract.content}`;
+  }
+}
+%>
+<% if (config.internalTemplateOptions.addUtilRequiredKeysType) { %>
+type <%~ config.Ts.CodeGenKeyword.UtilRequiredKeys %><T, K extends keyof T> = Omit<T, K> & Required<Pick<T, K>>
+
+<% } %>
+<%
+const visibleContracts = modelTypes.filter(c => !c.internal);
+const outputs = visibleContracts.map(contract => {
+    const jsdoc = includeFile('./data-contract-jsdoc.ejs', { ...it, data: { ...contract, ...contract.typeData } }).trim();
+    const content = (dataContractTemplates[contract.typeIdentifier] || dataContractTemplates.type)(contract);
+    return jsdoc ? `${jsdoc}\nexport ${content}` : `export ${content}`;
+});
+%>
+<%~ outputs.join('\n\n') %>

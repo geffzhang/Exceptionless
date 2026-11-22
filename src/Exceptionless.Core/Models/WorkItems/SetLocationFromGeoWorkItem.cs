@@ -1,8 +1,7 @@
-﻿using System;
+﻿namespace Exceptionless.Core.Models.WorkItems;
 
-namespace Exceptionless.Core.Models.WorkItems {
-    public class SetLocationFromGeoWorkItem {
-        public string EventId { get; set; }
-        public string Geo { get; set; }
-    }
+public record SetLocationFromGeoWorkItem
+{
+    public required string EventId { get; init; }
+    public string? Geo { get; init; }
 }

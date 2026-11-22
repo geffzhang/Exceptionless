@@ -1,20 +1,18 @@
-﻿using System;
-using System.Collections.Generic;
+﻿using Exceptionless.Core.Attributes;
 
-namespace Exceptionless.Web.Models {
-    public class Invoice {
-        public Invoice() {
-            Items = new List<InvoiceLineItem>();
-        }
+namespace Exceptionless.Web.Models;
 
-        public string Id { get; set; }
-        public string OrganizationId { get; set; }
-        public string OrganizationName { get; set; }
+public record Invoice
+{
+    public required string Id { get; set; }
+    [ObjectId]
+    public required string OrganizationId { get; set; }
+    public required string OrganizationName { get; set; }
 
-        public DateTime Date { get; set; }
-        public bool Paid { get; set; }
-        public decimal Total { get; set; }
+    public required DateTime Date { get; set; }
+    public required bool Paid { get; set; }
+    public required string Status { get; set; }
+    public required decimal Total { get; set; }
 
-        public IList<InvoiceLineItem> Items { get; set; }
-    }
+    public IList<InvoiceLineItem> Items { get; set; } = new List<InvoiceLineItem>();
 }

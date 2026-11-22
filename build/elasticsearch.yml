@@ -1,6 +1,0 @@
-﻿# development configuration
-cluster.name: exceptionless
-action.destructive_requires_name: false
-action.auto_create_index: .security,.monitoring*,.watches,.triggered_watches,.watcher-history*
-bootstrap.memory_lock: true
-xpack.security.enabled: false

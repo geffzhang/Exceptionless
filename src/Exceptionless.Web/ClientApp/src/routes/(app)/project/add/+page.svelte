@@ -1,0 +1,145 @@
+<script lang="ts">
+    import { goto } from '$app/navigation';
+    import { resolve } from '$app/paths';
+    import { ProblemDetails } from '@foundatiofx/fetchclient';
+    import { createForm } from '@tanstack/svelte-form';
+    import { untrack } from 'svelte';
+    import { toast } from 'svelte-sonner';
+
+    import type { NewProject } from '#features/projects/models.ts';
+
+    import ErrorMessage from '#comp/error-message.svelte';
+    import { H3, Muted } from '#comp/typography/index.ts';
+    import { Button } from '#comp/ui/button/index.ts';
+    import * as Field from '#comp/ui/field/index.ts';
+    import { Input } from '#comp/ui/input/index.ts';
+    import { Spinner } from '#comp/ui/spinner/index.ts';
+    import { showBillingDialogOnUpgradeProblem } from '#features/billing/index.ts';
+    import { organization } from '#features/organizations/context.svelte.ts';
+    import { createProductTourActions } from '#features/product-tours/actions.svelte.ts';
+    import ProductTourSpotlight from '#features/product-tours/components/product-tour-spotlight.svelte';
+    import { productTourCheckpoint } from '#features/product-tours/state.svelte.ts';
+    import { postProject } from '#features/projects/api.svelte.ts';
+    import { type NewProjectFormData, NewProjectSchema } from '#features/projects/schemas.ts';
+    import { ariaInvalid, getFormErrorMessages, mapFieldErrors, problemDetailsToFormErrors } from '#features/shared/validation.ts';
+
+    let toastId = $state<number | string>();
+    const createProject = postProject();
+    const tourActions = createProductTourActions();
+    const projectConfigureCheckpoint = $derived(productTourCheckpoint.current?.tourName === 'project-configure' ? productTourCheckpoint.current : undefined);
+
+    const form = createForm(() => ({
+        defaultValues: {
+            delete_bot_data_enabled: true,
+            name: '',
+            organization_id: organization.current ?? ''
+        } as NewProjectFormData,
+        validators: {
+            onSubmit: NewProjectSchema,
+            onSubmitAsync: async ({ value }) => {
+                toast.dismiss(toastId);
+                try {
+                    const { id } = await createProject.mutateAsync({
+                        ...value,
+                        organization_id: organization.current ?? value.organization_id
+                    } as NewProject);
+                    const checkpoint = projectConfigureCheckpoint;
+                    if (checkpoint) {
+                        productTourCheckpoint.advance(checkpoint, 'choose-platform');
+                    }
+                    toastId = toast.success('Project added successfully');
+                    await goto(
+                        resolve('/(app)/project/[projectId]/configure', {
+                            projectId: id
+                        }) + '?redirect=true'
+                    );
+                    return null;
+                } catch (error: unknown) {
+                    if (showBillingDialogOnUpgradeProblem(error, organization.current, () => form.handleSubmit())) {
+                        return null;
+                    }
+
+                    if (error instanceof ProblemDetails) {
+                        toastId = toast.error(error.title || 'Error creating project. Please try again.');
+                        return problemDetailsToFormErrors(error);
+                    }
+
+                    toastId = toast.error('Error creating project. Please try again.');
+                    return {
+                        form: 'An unexpected error occurred, please try again.'
+                    };
+                }
+            }
+        }
+    }));
+
+    $effect(() => {
+        const organizationId = organization.current ?? '';
+        untrack(() => form.setFieldValue('organization_id', organizationId));
+    });
+</script>
+
+<div class="mx-auto flex w-[calc(100vw-2rem)] max-w-lg flex-col gap-4">
+    <div class="flex flex-col gap-1">
+        <H3>Add Project</H3>
+        <Muted>Create a project, then configure a client to send your first event.</Muted>
+    </div>
+    <form
+        data-tour="project-setup-form"
+        onsubmit={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            form.handleSubmit();
+        }}
+    >
+        <form.Subscribe selector={(state) => state.errors}>
+            {#snippet children(errors)}
+                <ErrorMessage message={getFormErrorMessages(errors)}></ErrorMessage>
+            {/snippet}
+        </form.Subscribe>
+        <form.Field name="name">
+            {#snippet children(field)}
+                <Field.Field data-invalid={ariaInvalid(field)}>
+                    <Field.Label for={field.name}>Project Name</Field.Label>
+                    <Input
+                        data-tour="project-name"
+                        id={field.name}
+                        name={field.name}
+                        placeholder="Enter project name"
+                        value={field.state.value}
+                        onblur={field.handleBlur}
+                        oninput={(e) => field.handleChange(e.currentTarget.value)}
+                        aria-invalid={ariaInvalid(field)}
+                    />
+                    <Field.Error errors={mapFieldErrors(field.state.meta.errors)} />
+                </Field.Field>
+            {/snippet}
+        </form.Field>
+        <form.Subscribe selector={(state) => state.isSubmitting}>
+            {#snippet children(isSubmitting)}
+                <Button type="submit" class="mt-4" disabled={isSubmitting}>
+                    {#if isSubmitting}
+                        <Spinner /> Adding Project...
+                    {:else}
+                        Continue to Client Setup
+                    {/if}
+                </Button>
+            {/snippet}
+        </form.Subscribe>
+    </form>
+</div>
+
+{#if projectConfigureCheckpoint?.checkpointName === 'project-name'}
+    <ProductTourSpotlight
+        checkpoint={projectConfigureCheckpoint}
+        showProgress={false}
+        onDismiss={tourActions.dismiss}
+        side="top"
+        target="[data-tour='project-setup-form']"
+        title="Name your project"
+    >
+        {#snippet description()}
+            Give your app a name, then select <strong>Continue to Client Setup</strong> to connect it.
+        {/snippet}
+    </ProductTourSpotlight>
+{/if}

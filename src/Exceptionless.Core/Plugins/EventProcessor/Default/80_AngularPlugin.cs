@@ -1,43 +1,53 @@
-﻿using System;
-using System.Threading.Tasks;
+﻿using Exceptionless.Core.Extensions;
 using Exceptionless.Core.Models;
-using Exceptionless.Core.Models.Data;
 using Exceptionless.Core.Pipeline;
+using Foundatio.Serializer;
 using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Plugins.EventProcessor {
-    [Priority(80)]
-    public sealed class AngularPlugin : EventProcessorPluginBase {
-        public AngularPlugin(ILoggerFactory loggerFactory = null) : base(loggerFactory) {}
+namespace Exceptionless.Core.Plugins.EventProcessor;
 
-        public override Task EventProcessingAsync(EventContext context) {
-            if (!context.Event.IsError())
-                return Task.CompletedTask;
+[Priority(80)]
+public sealed class AngularPlugin : EventProcessorPluginBase
+{
+    private readonly ITextSerializer _serializer;
 
-            var error = context.Event.GetError();
-            if (error == null)
-                return Task.CompletedTask;
+    public AngularPlugin(ITextSerializer serializer, AppOptions options, ILoggerFactory loggerFactory) : base(options, loggerFactory)
+    {
+        _serializer = serializer;
+    }
 
-            string submissionMethod = context.Event.GetSubmissionMethod();
-            if (submissionMethod == null || !String.Equals("$exceptionHandler", submissionMethod))
-                return Task.CompletedTask;
-
-            if (context.StackSignatureData.Count != 1 || !context.StackSignatureData.ContainsKey("NoStackingInformation"))
-                return Task.CompletedTask;
-
-            string cause = context.Event.Message;
-            if (String.IsNullOrEmpty(cause))
-                return Task.CompletedTask;
-
-            if (cause.StartsWith("Possibly unhandled rejection")) {
-                context.StackSignatureData.Remove("NoStackingInformation");
-                context.StackSignatureData.Add("ExceptionType", error.Type ?? "Error");
-                context.StackSignatureData.Add("Source", "unhandledRejection");
-
-                error.Data[Error.KnownDataKeys.TargetInfo] = new SettingsDictionary(context.StackSignatureData);
-            }
-
+    public override Task EventProcessingAsync(EventContext context)
+    {
+        if (!context.Event.IsError())
             return Task.CompletedTask;
+
+        var error = context.Event.GetError(_serializer, _logger);
+        if (error is null)
+            return Task.CompletedTask;
+
+        string? submissionMethod = context.Event.GetSubmissionMethod();
+        if (submissionMethod is null || !String.Equals("$exceptionHandler", submissionMethod))
+            return Task.CompletedTask;
+
+        if (context.StackSignatureData.Count != 1 || !context.StackSignatureData.ContainsKey("NoStackingInformation"))
+            return Task.CompletedTask;
+
+        string? cause = context.Event.Message;
+        if (String.IsNullOrEmpty(cause))
+            return Task.CompletedTask;
+
+        if (cause.StartsWith("Possibly unhandled rejection"))
+        {
+            context.StackSignatureData.Remove("NoStackingInformation");
+            context.StackSignatureData.Add("ExceptionType", error.Type ?? "Error");
+            context.StackSignatureData.Add("Source", "unhandledRejection");
+
+            error.SetTargetInfo(new SettingsDictionary(context.StackSignatureData));
+
+            // Write the mutated error back so @target persists (see ErrorPlugin for rationale).
+            context.Event.SetError(error);
         }
+
+        return Task.CompletedTask;
     }
 }

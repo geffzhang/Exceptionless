@@ -1,89 +1,111 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
-using Exceptionless.Core.Extensions;
-using Exceptionless.Core.Models.WorkItems;
+﻿using Exceptionless.Core.Models;
 using Exceptionless.Core.Plugins.EventProcessor;
 using Exceptionless.Core.Repositories;
 using Exceptionless.Core.Utility;
-using Foundatio.Jobs;
-using Foundatio.Queues;
 using McSherry.SemanticVersioning;
 using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Pipeline {
-    [Priority(30)]
-    public class CheckForRegressionAction : EventPipelineActionBase {
-        private readonly IStackRepository _stackRepository;
-        private readonly IQueue<WorkItemData> _workItemQueue;
-        private readonly SemanticVersionParser _semanticVersionParser;
+namespace Exceptionless.Core.Pipeline;
 
-        public CheckForRegressionAction(IStackRepository stackRepository, IQueue<WorkItemData> workItemQueue, SemanticVersionParser semanticVersionParser, ILoggerFactory loggerFactory = null) : base(loggerFactory) {
-            _stackRepository = stackRepository;
-            _workItemQueue = workItemQueue;
-            _semanticVersionParser = semanticVersionParser;
-            ContinueOnError = true;
-        }
+[Priority(30)]
+public class CheckForRegressionAction : EventPipelineActionBase
+{
+    private readonly IStackRepository _stackRepository;
+    private readonly SemanticVersionParser _semanticVersionParser;
 
-        public override async Task ProcessBatchAsync(ICollection<EventContext> contexts) {
-            var stacks = contexts.Where(c => !c.Stack.IsRegressed && c.Stack.DateFixed.HasValue).OrderBy(c => c.Event.Date).GroupBy(c => c.Event.StackId);
-            foreach (var stackGroup in stacks) {
-                try {
-                    var stack = stackGroup.First().Stack;
+    public CheckForRegressionAction(IStackRepository stackRepository, SemanticVersionParser semanticVersionParser, AppOptions options, ILoggerFactory loggerFactory) : base(options, loggerFactory)
+    {
+        _stackRepository = stackRepository;
+        _semanticVersionParser = semanticVersionParser;
+        ContinueOnError = true;
+    }
 
-                    EventContext regressedContext = null;
-                    SemanticVersion regressedVersion = null;
-                    if (String.IsNullOrEmpty(stack.FixedInVersion)) {
-                        regressedContext = stackGroup.FirstOrDefault(c => stack.DateFixed < c.Event.Date.UtcDateTime);
-                    } else {
-                        var fixedInVersion = await _semanticVersionParser.ParseAsync(stack.FixedInVersion).AnyContext();
-                        var versions = stackGroup.GroupBy(c => c.Event.GetVersion());
-                        foreach (var versionGroup in versions) {
-                            var version = await _semanticVersionParser.ParseAsync(versionGroup.Key).AnyContext() ?? _semanticVersionParser.Default;
-                            if (version < fixedInVersion)
-                                continue;
-                            
+    public override async Task ProcessBatchAsync(ICollection<EventContext> contexts)
+    {
+        var stacks = contexts
+            .Where(c => c.Stack is { Status: StackStatus.Fixed, DateFixed: not null })
+            .OrderBy(c => c.Event.Date)
+            .GroupBy(c => c.Event.StackId);
+
+        // more than one event in this batch, likely to be the same version
+        Dictionary<string, SemanticVersion>? versionCache = null;
+        if (contexts.Count > 1)
+            versionCache = new Dictionary<string, SemanticVersion>();
+
+        foreach (var stackGroup in stacks)
+        {
+            try
+            {
+                var stack = stackGroup.First().Stack;
+
+                EventContext? regressedContext = null;
+                SemanticVersion? regressedVersion = null;
+                if (String.IsNullOrEmpty(stack!.FixedInVersion))
+                {
+                    regressedContext = stackGroup.FirstOrDefault(c => stack.DateFixed < c.Event.Date.UtcDateTime);
+                }
+                else
+                {
+                    var fixedInVersion = _semanticVersionParser.Parse(stack.FixedInVersion, versionCache);
+                    var versions = stackGroup.GroupBy(c => c.Event.GetVersion());
+                    foreach (var versionGroup in versions)
+                    {
+                        var version = _semanticVersionParser.Parse(versionGroup.Key, versionCache) ?? _semanticVersionParser.Default;
+                        if (version < fixedInVersion)
+                        {
+                            foreach (var ctx in versionGroup.Where(s => s.Organization.HasPremiumFeatures))
+                            {
+                                _logger.LogDebug("Discarding fixed stack event: Version {Version} is older than fixed in version {FixedInVersion}", version, fixedInVersion);
+                                ctx.IsDiscarded = true;
+                                ctx.IsCancelled = true;
+                            }
+
+                            continue;
+                        }
+
+                        if (regressedContext is null)
+                        {
                             regressedVersion = version;
                             regressedContext = versionGroup.First();
-                            break;
                         }
                     }
+                }
 
-                    if (regressedContext == null)
-                        return;
+                if (regressedContext is null)
+                    continue;
 
-                    _logger.LogTrace("Marking stack and events as regressed in version: {Version}", regressedVersion);
-                    stack.IsRegressed = true;
-                    await _stackRepository.MarkAsRegressedAsync(stack.Id).AnyContext();
-                    await _workItemQueue.EnqueueAsync(new StackWorkItem {
-                        OrganizationId = stack.OrganizationId,
-                        ProjectId = stack.ProjectId,
-                        StackId = stack.Id,
-                        UpdateIsFixed = true,
-                        IsFixed = false
-                    }).AnyContext();
+                _logger.LogDebug("Marking stack and events as regressed in version: {Version}", regressedVersion);
+                await _stackRepository.MarkAsRegressedAsync(stack.Id);
 
-                    foreach (var ctx in stackGroup) {
-                        ctx.Event.IsFixed = false;
-                        ctx.IsRegression = ctx == regressedContext;
+                foreach (var ctx in stackGroup)
+                {
+                    ctx.Stack!.Status = StackStatus.Regressed;
+                    ctx.IsRegression = ctx == regressedContext;
+                }
+            }
+            catch (Exception ex)
+            {
+                foreach (var context in stackGroup)
+                {
+                    bool cont = false;
+                    try
+                    {
+                        cont = HandleError(ex, context);
                     }
-                } catch (Exception ex) {
-                    foreach (var context in stackGroup) {
-                        bool cont = false;
-                        try {
-                            cont = HandleError(ex, context);
-                        } catch {}
-
-                        if (!cont)
-                            context.SetError(ex.Message, ex);
+                    catch (Exception hex)
+                    {
+                        _logger.LogError(hex, "Error calling HandleError: {Message}", ex.Message);
                     }
+
+                    if (!cont)
+                        context.SetError(ex.Message, ex);
                 }
             }
         }
+    }
 
-        public override Task ProcessAsync(EventContext ctx) {
-            return Task.CompletedTask;
-        }
+    public override Task ProcessAsync(EventContext ctx)
+    {
+        return Task.CompletedTask;
     }
 }

@@ -1,0 +1,422 @@
+import { type FetchClientResponse, ProblemDetails, useFetchClient } from '@foundatiofx/fetchclient';
+import { createMutation, createQuery, QueryClient, useQueryClient } from '@tanstack/svelte-query';
+
+import type { TrialEndedNoticeKey } from '#features/billing/trial.ts';
+import type { ProductTourKey } from '#features/product-tours/models.ts';
+import type { WebSocketMessageValue } from '#features/websockets/models.ts';
+import type { WorkInProgressResult } from '#shared/models/index.ts';
+
+import { accessToken } from '#features/auth/index.svelte.ts';
+import { fetchApiJson } from '#features/shared/api/api.svelte.ts';
+
+import type {
+    OAuthGrant,
+    RecordProductTourResult,
+    UpdateEmailAddressResult,
+    UpdateUser,
+    UpdateUserEmailAddress,
+    VerifyEmailAddressResult,
+    ViewCurrentUser,
+    ViewUser
+} from './models';
+
+/**
+ * Refreshes the user queries a `UserChanged` message affects. Returns whether the signed-in user may have changed, so
+ * callers can refresh state derived from them, such as Exie access after an email is verified in another tab.
+ */
+export async function invalidateUserQueries(queryClient: QueryClient, message: WebSocketMessageValue<'UserChanged'>): Promise<boolean> {
+    const { id } = message;
+    if (id) {
+        await queryClient.invalidateQueries({
+            queryKey: queryKeys.id(id)
+        });
+
+        const currentUser = queryClient.getQueryData<ViewCurrentUser>(queryKeys.me());
+        if (currentUser?.id !== id) {
+            return false;
+        }
+
+        await queryClient.invalidateQueries({
+            queryKey: queryKeys.me()
+        });
+        return true;
+    }
+
+    await queryClient.invalidateQueries({
+        queryKey: queryKeys.type
+    });
+    return true;
+}
+
+export const queryKeys = {
+    avatar: (id: string | undefined) => [...queryKeys.id(id), 'avatar'] as const,
+    deleteCurrentUser: () => [...queryKeys.me(), 'delete'] as const,
+    deleteOAuthGrant: (id: string | undefined) => [...queryKeys.oauthGrants(), id, 'delete'] as const,
+    id: (id: string | undefined) => [...queryKeys.type, id] as const,
+    idEmailAddress: (id?: string) => [...queryKeys.id(id), 'email-address'] as const,
+    ids: (ids: string[] | undefined) => [...queryKeys.type, ...(ids ?? [])] as const,
+    me: () => [...queryKeys.type, 'me'] as const,
+    oauthGrants: () => [...queryKeys.me(), 'oauth-grants'] as const,
+    organization: (id: string | undefined) => [...queryKeys.type, 'organization', id] as const,
+    patchUser: (id: string | undefined) => [...queryKeys.id(id), 'patch'] as const,
+    postEmailAddress: (id: string | undefined) => [...queryKeys.idEmailAddress(id), 'update'] as const,
+    productTour: () => [...queryKeys.me(), 'product-tour'] as const,
+    type: ['User'] as const
+};
+
+export interface GetOrganizationUsersParams {
+    limit?: number;
+    page?: number;
+}
+
+export interface GetOrganizationUsersRequest {
+    params?: GetOrganizationUsersParams;
+    route: {
+        organizationId: string | undefined;
+    };
+}
+
+export interface PatchUserRequest {
+    route: {
+        id: string | undefined;
+    };
+}
+
+export interface PostEmailAddressRequest {
+    route: {
+        id: string | undefined;
+    };
+}
+
+export interface ResendVerificationEmailRequest {
+    route: {
+        id: string | undefined;
+    };
+}
+
+export interface UserAvatarRequest {
+    route: {
+        id: string | undefined;
+    };
+}
+
+export type VerifyEmailAddressOutcome = { emailAddress?: string; status: 'verified' } | { status: 'expired' | 'invalid' };
+
+export function deleteCurrentUser() {
+    return createMutation<WorkInProgressResult, ProblemDetails, void>(() => ({
+        enabled: () => !!accessToken.current,
+        mutationFn: async () => {
+            const client = useFetchClient();
+            const response = await client.deleteJSON<WorkInProgressResult>('users/me');
+            return response.data!;
+        },
+        mutationKey: queryKeys.deleteCurrentUser()
+    }));
+}
+
+export function deleteOAuthGrantMutation() {
+    const queryClient = useQueryClient();
+    return createMutation<void, ProblemDetails, string>(() => ({
+        enabled: () => !!accessToken.current,
+        mutationFn: async (id: string) => {
+            const client = useFetchClient();
+            await client.delete(`users/me/oauth-grants/${id}`);
+        },
+        mutationKey: queryKeys.deleteOAuthGrant(undefined),
+        onSuccess: () => {
+            queryClient.invalidateQueries({
+                queryKey: queryKeys.oauthGrants()
+            });
+        }
+    }));
+}
+
+export function deleteUserAvatar(request: UserAvatarRequest) {
+    const queryClient = useQueryClient();
+    return createMutation<ViewCurrentUser, ProblemDetails, void>(() => ({
+        enabled: () => !!accessToken.current && !!request.route.id,
+        mutationFn: async () => {
+            return await fetchApiJson<ViewCurrentUser>(`users/${request.route.id}/avatar`, {
+                method: 'DELETE'
+            });
+        },
+        mutationKey: queryKeys.avatar(request.route.id),
+        onSuccess: (data) => {
+            queryClient.setQueryData(queryKeys.id(request.route.id), data);
+
+            const currentUser = queryClient.getQueryData<ViewCurrentUser>(queryKeys.me());
+            if (currentUser?.id === request.route.id) {
+                queryClient.setQueryData(queryKeys.me(), data);
+            }
+        }
+    }));
+}
+
+export function getMeQuery() {
+    const queryClient = useQueryClient();
+
+    return createQuery<ViewCurrentUser, ProblemDetails>(() => ({
+        enabled: () => !!accessToken.current,
+        onSuccess: (data: ViewCurrentUser) => {
+            queryClient.setQueryData(queryKeys.id(data.id!), data);
+        },
+        queryClient,
+        queryFn: async ({ signal }: { signal: AbortSignal }) => {
+            const client = useFetchClient();
+            const response = await client.getJSON<ViewCurrentUser>('users/me', {
+                signal
+            });
+
+            return response.data!;
+        },
+        queryKey: queryKeys.me()
+    }));
+}
+
+export function getOAuthGrantsQuery() {
+    return createQuery<OAuthGrant[], ProblemDetails>(() => ({
+        enabled: () => !!accessToken.current,
+        queryFn: async ({ signal }: { signal: AbortSignal }) => {
+            const client = useFetchClient();
+            const response = await client.getJSON<OAuthGrant[]>('users/me/oauth-grants', {
+                signal
+            });
+
+            return response.data ?? [];
+        },
+        queryKey: queryKeys.oauthGrants()
+    }));
+}
+
+export function getOrganizationUsersQuery(request: GetOrganizationUsersRequest) {
+    const queryClient = useQueryClient();
+
+    return createQuery<FetchClientResponse<ViewUser[]>, ProblemDetails>(() => ({
+        enabled: () => !!accessToken.current && !!request.route.organizationId,
+        onSuccess: (data: FetchClientResponse<ViewUser[]>) => {
+            data.data?.forEach((user) => {
+                queryClient.setQueryData(queryKeys.id(user.id!), user);
+            });
+        },
+        queryClient,
+        queryFn: async ({ signal }: { signal: AbortSignal }) => {
+            const client = useFetchClient();
+            const response = await client.getJSON<ViewUser[]>(`organizations/${request.route.organizationId}/users`, {
+                params: {
+                    ...request.params,
+                    limit: request.params?.limit ?? 1000
+                },
+                signal
+            });
+
+            return response;
+        },
+        queryKey: [
+            ...queryKeys.organization(request.route.organizationId),
+            {
+                params: request.params
+            }
+        ]
+    }));
+}
+
+export function patchUser(request: PatchUserRequest) {
+    const queryClient = useQueryClient();
+    return createMutation<ViewCurrentUser, ProblemDetails, UpdateUser>(() => ({
+        enabled: () => !!accessToken.current && !!request.route.id,
+        mutationFn: async (data: UpdateUser) => {
+            const client = useFetchClient();
+            const response = await client.patchJSON<ViewCurrentUser>(`users/${request.route.id}`, data);
+            return response.data!;
+        },
+        mutationKey: queryKeys.patchUser(request.route.id),
+        onError: () => {
+            queryClient.invalidateQueries({
+                queryKey: queryKeys.id(request.route.id)
+            });
+        },
+        onSuccess: (data) => {
+            queryClient.setQueryData(queryKeys.id(request.route.id), data);
+
+            const currentUser = queryClient.getQueryData<ViewCurrentUser>(queryKeys.me());
+            if (currentUser?.id === request.route.id) {
+                queryClient.setQueryData(queryKeys.me(), data);
+            }
+        }
+    }));
+}
+
+export function postEmailAddress(request: PostEmailAddressRequest) {
+    const queryClient = useQueryClient();
+    return createMutation<UpdateEmailAddressResult, ProblemDetails, UpdateUserEmailAddress>(() => ({
+        enabled: () => !!accessToken.current && !!request.route.id,
+        mutationFn: async (data: Pick<ViewCurrentUser, 'email_address'>) => {
+            const client = useFetchClient();
+            const response = await client.postJSON<UpdateEmailAddressResult>(`users/${request.route.id}/email-address/${data.email_address}`);
+            return response.data!;
+        },
+        mutationKey: queryKeys.postEmailAddress(request.route.id),
+        onSuccess: (data, variables) => {
+            const partialUserData: Partial<ViewCurrentUser> = {
+                email_address: variables.email_address,
+                is_email_address_verified: data.is_verified
+            };
+
+            const user = queryClient.getQueryData<ViewCurrentUser>(queryKeys.id(request.route.id));
+            if (user) {
+                queryClient.setQueryData(queryKeys.id(request.route.id), <ViewCurrentUser>{
+                    ...user,
+                    ...partialUserData
+                });
+            }
+
+            const currentUser = queryClient.getQueryData<ViewCurrentUser>(queryKeys.me());
+            if (currentUser?.id === request.route.id) {
+                queryClient.setQueryData(queryKeys.me(), <ViewCurrentUser>{
+                    ...currentUser,
+                    ...partialUserData
+                });
+            }
+        }
+    }));
+}
+
+export function putCurrentUserProductTour() {
+    const queryClient = useQueryClient();
+    return createMutation<RecordProductTourResult, ProblemDetails, { tourName: ProductTourKey | TrialEndedNoticeKey; userId: string }>(() => ({
+        enabled: () => !!accessToken.current,
+        mutationFn: async ({ tourName, userId }) => {
+            if (queryClient.getQueryData<ViewCurrentUser>(queryKeys.me())?.id !== userId) {
+                throw new Error('The current user changed before the product tour preference was recorded.');
+            }
+
+            return await fetchApiJson<RecordProductTourResult>(`users/me/product-tours/${tourName}/record`, {
+                method: 'PUT'
+            });
+        },
+        mutationKey: queryKeys.productTour(),
+        onSuccess: () =>
+            queryClient.invalidateQueries({
+                queryKey: queryKeys.type
+            })
+    }));
+}
+
+export function resendVerificationEmail(request: ResendVerificationEmailRequest) {
+    return createMutation<void, ProblemDetails, void>(() => ({
+        enabled: () => !!accessToken.current && !!request.route.id,
+        mutationFn: async () => {
+            const client = useFetchClient();
+            await client.getJSON<void>(`users/${request.route.id}/resend-verification-email`);
+        },
+        mutationKey: [...queryKeys.id(request.route.id), 'resend-verification-email']
+    }));
+}
+
+export function setCurrentUserSavedViewDefault(queryClient: QueryClient, organizationId: string, savedViewId: null | string) {
+    const currentUser = queryClient.getQueryData<ViewCurrentUser>(queryKeys.me());
+    if (!currentUser) {
+        return;
+    }
+
+    const organizationPreferences = currentUser.organization_preferences.filter((preference) => preference.organization_id !== organizationId);
+    if (savedViewId) {
+        organizationPreferences.push({
+            default_saved_view_id: savedViewId,
+            organization_id: organizationId
+        });
+    }
+
+    setCurrentUser(queryClient, currentUser, {
+        organization_preferences: organizationPreferences
+    });
+}
+
+export function setCurrentUserSavedViewOrder(queryClient: QueryClient, organizationId: string, viewType: string, savedViewIds: string[]): void {
+    const currentUser = queryClient.getQueryData<ViewCurrentUser>(queryKeys.me());
+    if (!currentUser) {
+        return;
+    }
+
+    const savedViewOrders = (currentUser.saved_view_orders ?? []).filter(
+        (preference) => preference.organization_id !== organizationId || preference.view_type !== viewType
+    );
+    if (savedViewIds.length > 0) {
+        savedViewOrders.push({
+            organization_id: organizationId,
+            saved_view_ids: [...savedViewIds],
+            view_type: viewType
+        });
+    }
+
+    setCurrentUser(queryClient, currentUser, {
+        saved_view_orders: savedViewOrders
+    });
+}
+
+export function uploadUserAvatar(request: UserAvatarRequest) {
+    const queryClient = useQueryClient();
+    return createMutation<ViewCurrentUser, ProblemDetails, File>(() => ({
+        enabled: () => !!accessToken.current && !!request.route.id,
+        mutationFn: async (file: File) => {
+            const data = new FormData();
+            data.append('file', file);
+            return await fetchApiJson<ViewCurrentUser>(`users/${request.route.id}/avatar`, {
+                body: data,
+                method: 'POST'
+            });
+        },
+        mutationKey: queryKeys.avatar(request.route.id),
+        onSuccess: (data) => {
+            queryClient.setQueryData(queryKeys.id(request.route.id), data);
+
+            const currentUser = queryClient.getQueryData<ViewCurrentUser>(queryKeys.me());
+            if (currentUser?.id === request.route.id) {
+                queryClient.setQueryData(queryKeys.me(), data);
+            }
+        }
+    }));
+}
+
+/**
+ * Verifies the current user's email address with the token from the emailed link.
+ * Refreshes the current user so the verification prompt disappears.
+ */
+export async function verifyEmailAddress(queryClient: QueryClient, token: string): Promise<VerifyEmailAddressOutcome> {
+    const client = useFetchClient();
+    const response = await client.getJSON<VerifyEmailAddressResult>(`users/verify-email-address/${encodeURIComponent(token)}`, {
+        expectedStatusCodes: [404, 422]
+    });
+
+    if (response.status === 404) {
+        return {
+            status: 'invalid'
+        };
+    }
+
+    if (response.status === 422) {
+        return {
+            status: 'expired'
+        };
+    }
+
+    // Reset rather than invalidate so pages never render the cached unverified user while the refetch runs.
+    await queryClient.resetQueries({
+        exact: true,
+        queryKey: queryKeys.me()
+    });
+
+    return {
+        emailAddress: response.data?.email_address,
+        status: 'verified'
+    };
+}
+
+function setCurrentUser(queryClient: QueryClient, currentUser: ViewCurrentUser, changes: Partial<ViewCurrentUser>): void {
+    const updatedUser = {
+        ...currentUser,
+        ...changes
+    };
+    queryClient.setQueryData(queryKeys.me(), updatedUser);
+    queryClient.setQueryData(queryKeys.id(currentUser.id), updatedUser);
+}

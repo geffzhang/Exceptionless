@@ -1,0 +1,91 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 100000
+preemptionPolicy: PreemptLowerPriority
+globalDefault: false
+description: "For critical workloads that may preempt normal pods."
+
+---
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: ex-dev
+  namespace: ex-dev
+spec:
+  version: 8.19.22
+  image: exceptionless/elasticsearch:8.19.22 # https://github.com/exceptionless/Exceptionless/tree/main/build/docker/elasticsearch
+  secureSettings:
+    - secretName: ex-dev-snapshots
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
+  nodeSets:
+    - name: main
+      count: 1
+      config:
+        node.roles: [data, ingest, master, remote_cluster_client]
+        action.destructive_requires_name: false
+      podTemplate:
+        spec:
+          priorityClassName: high-priority
+          containers:
+            - name: elasticsearch
+              env:
+                - name: ES_JAVA_OPTS
+                  value: -Xms6g -Xmx6g
+              resources:
+                requests:
+                  memory: 12Gi
+                  cpu: 0.5
+                limits:
+                  memory: 12Gi
+                  cpu: 2
+          # related to "node.store.allow_mmap: false" setting above
+          initContainers:
+            - name: sysctl
+              securityContext:
+                privileged: true
+                runAsUser: 0
+              command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 100Gi
+            storageClassName: default
+
+---
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: ex-dev
+  namespace: ex-dev
+spec:
+  version: 8.19.22
+  count: 1
+  elasticsearchRef:
+    name: ex-dev
+  config:
+    xpack.monitoring.enabled: true
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
+  podTemplate:
+    spec:
+      containers:
+        - name: kibana
+          resources:
+            requests:
+              memory: 300Mi
+              cpu: 50m
+            limits:
+              memory: 1Gi
+              cpu: 500m

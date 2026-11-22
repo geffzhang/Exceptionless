@@ -1,104 +1,516 @@
-﻿using System;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
-using Exceptionless.Core.Validation;
 using Exceptionless.Core.Models;
 using Exceptionless.Core.Plugins.EventParser;
-using Foundatio.Utility;
-using Microsoft.Extensions.Logging;
+using Exceptionless.Core.Validation;
 using Xunit;
-using Xunit.Abstractions;
 
-namespace Exceptionless.Tests.Validation {
-    public class EventValidatorTests : TestWithServices {
-        private readonly PersistentEvent _benchmarkEvent;
-        private readonly PersistentEventValidator _validator;
+namespace Exceptionless.Tests.Validation;
 
-        public EventValidatorTests(ServicesFixture fixture, ITestOutputHelper output) : base(fixture, output) {
-            _validator = new PersistentEventValidator();
+public sealed class EventValidatorTests : TestWithServices
+{
+    private const string ValidObjectId = "123456789012345678901234";
+    private readonly MiniValidationValidator _validator;
 
-            string path = Path.Combine("..", "..", "..", "Search", "Data", "event1.json");
-            var parserPluginManager = GetService<EventParserPluginManager>();
-            var events = parserPluginManager.ParseEvents(File.ReadAllText(path), 2, "exceptionless/2.0.0.0");
-            _benchmarkEvent = events.First();
-        }
+    public EventValidatorTests(ITestOutputHelper output) : base(output)
+    {
+        _validator = GetService<MiniValidationValidator>();
+    }
 
-        [Fact]
-        public void RunBenchmark() {
-            const int iterations = 10000;
+    private PersistentEvent CreateValidEvent()
+    {
+        return new PersistentEvent
+        {
+            Id = ValidObjectId,
+            OrganizationId = ValidObjectId,
+            ProjectId = ValidObjectId,
+            StackId = ValidObjectId,
+            Type = Event.KnownTypes.Error,
+            Date = DateTimeOffset.Now
+        };
+    }
 
-            var sw = Stopwatch.StartNew();
-            for (int i = 0; i < iterations; i++) {
-                var result = _validator.Validate(_benchmarkEvent);
-                Assert.True(result.IsValid);
-            }
+    [Fact]
+    public async Task Validate_ParsedClientEvent_ReturnsSuccess()
+    {
+        // Arrange
+        string path = Path.Combine("..", "..", "..", "Search", "Data", "event1.json");
+        var parserPluginManager = GetService<EventParserPluginManager>();
+        var events = parserPluginManager.ParseEvents(await File.ReadAllTextAsync(path, TestCancellationToken), 2, "exceptionless/2.0.0.0");
 
-            sw.Stop();
-            _logger.LogInformation("Time: {Duration:g}, Avg: ({AverageTickDuration:g}ticks | {AverageDuration}ms)", sw.Elapsed, sw.ElapsedTicks / iterations, sw.ElapsedMilliseconds / iterations);
-        }
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(events[0]);
 
-        [Theory]
-        [InlineData(null, false)]
-        [InlineData("", false)]
-        [InlineData("1", true)]
-        [InlineData("1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456", false)]
-         public void ValidateTag(string tag, bool isValid) {
-            var ev = new PersistentEvent { Type = Event.KnownTypes.Error, Date = SystemClock.OffsetNow, Id = "123456789012345678901234", OrganizationId = "123456789012345678901234", ProjectId = "123456789012345678901234", StackId = "123456789012345678901234" };
-            ev.Tags.Add(tag);
+        // Assert
+        Assert.True(isValid);
+    }
 
-            var result = _validator.Validate(ev);
-            Assert.Equal(isValid, result.IsValid);
-        }
+    [Fact]
+    public async Task Validate_WhenIdIsValidObjectId_ReturnsSuccess()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Id = ValidObjectId;
 
-        [Theory]
-        [InlineData(null, false)]
-        [InlineData("", false)]
-        [InlineData("1", true)]
-        [InlineData("1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456", false)]
-        public async Task ValidateTagAsync(string tag, bool isValid) {
-            var ev = new PersistentEvent { Type = Event.KnownTypes.Error, Date = SystemClock.OffsetNow, Id = "123456789012345678901234", OrganizationId = "123456789012345678901234", ProjectId = "123456789012345678901234", StackId = "123456789012345678901234" };
-            ev.Tags.Add(tag);
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
 
-            var result = await _validator.ValidateAsync(ev);
-            Assert.Equal(isValid, result.IsValid);
-        }
-        [Theory]
-        [InlineData(null, true)]
-        [InlineData("1234567", false)]
-        [InlineData("12345678", true)]
-        [InlineData("1234567890123456", true)]
-        [InlineData("123456789012345678901234567890123123456789012345678901234567890123123456789012345678901234567890123123456789012345678901234567890123123456789012345678901234567890123123456789012345678901234567890123123456789012345678901234567890123123456789012345678901234567890123123456789012345678901234567890123123456789012345678901234567890123123456789012345678901234567890123", false)]
-        public void ValidateReferenceId(string referenceId, bool isValid) {
-            var result = _validator.Validate(new PersistentEvent { Type = Event.KnownTypes.Error, ReferenceId = referenceId, Date = SystemClock.OffsetNow, Id = "123456789012345678901234", OrganizationId = "123456789012345678901234", ProjectId = "123456789012345678901234", StackId = "123456789012345678901234" });
-            Assert.Equal(isValid, result.IsValid);
-        }
+        // Assert
+        Assert.True(isValid);
+    }
 
-        [Theory]
-        [InlineData(null, false)]
-        [InlineData(-60d, true)]
-        [InlineData(0d, true)]
-        [InlineData(60d, true)]
-        [InlineData(61d, false)]
-        public void ValidateDate(double? minutes, bool isValid) {
-            var date = minutes.HasValue ? SystemClock.OffsetNow.AddMinutes(minutes.Value) : DateTimeOffset.MinValue;
-            var result = _validator.Validate(new PersistentEvent { Type = Event.KnownTypes.Error, Date = date, Id = "123456789012345678901234", OrganizationId = "123456789012345678901234", ProjectId = "123456789012345678901234", StackId = "123456789012345678901234" });
-            _logger.LogInformation(date + " " + result.IsValid + " " + String.Join(" ", result.Errors.Select(e => e.ErrorMessage)));
-            Assert.Equal(isValid, result.IsValid);
-        }
+    [Fact]
+    public async Task Validate_WhenIdIsNull_ReturnsSuccess()
+    {
+        // Arrange — Id is auto-generated by repo, null means "not yet assigned"
+        var ev = CreateValidEvent();
+        ev.Id = null!;
 
-        [Theory]
-        [InlineData(Event.KnownTypes.Error, true)]
-        [InlineData(Event.KnownTypes.FeatureUsage, true)]
-        [InlineData(Event.KnownTypes.Log, true)]
-        [InlineData(Event.KnownTypes.NotFound, true)]
-        [InlineData(Event.KnownTypes.SessionEnd, true)]
-        [InlineData(Event.KnownTypes.Session, true)]
-        [InlineData("12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901", false)]
-        public void ValidateType(string type, bool isValid) {
-            var result = _validator.Validate(new PersistentEvent { Type = type, Date = SystemClock.OffsetNow, Id = "123456789012345678901234", OrganizationId = "123456789012345678901234", ProjectId = "123456789012345678901234", StackId = "123456789012345678901234" });
-            Assert.Equal(isValid, result.IsValid);
-        }
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Theory]
+    [InlineData("1234567890123456789012345")]
+    [InlineData("invalid-id")]
+    [InlineData("")]
+    public async Task Validate_WhenIdIsInvalid_ReturnsError(string id)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Id = id;
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+        Assert.Contains(errors.Keys, k => String.Equals(k, nameof(PersistentEvent.Id)));
+    }
+
+    [Fact]
+    public async Task Validate_WhenOrganizationIdIsValidObjectId_ReturnsSuccess()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.OrganizationId = ValidObjectId;
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Theory]
+    [InlineData("1234567890123456789012345")]
+    [InlineData("invalid-id")]
+    [InlineData("")]
+    [InlineData(null)]
+    public async Task Validate_WhenOrganizationIdIsInvalid_ReturnsError(string? organizationId)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.OrganizationId = organizationId!;
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+        Assert.Contains(errors.Keys, k => String.Equals(k, nameof(PersistentEvent.OrganizationId)));
+    }
+
+    [Fact]
+    public async Task Validate_WhenProjectIdIsValidObjectId_ReturnsSuccess()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.ProjectId = ValidObjectId;
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Theory]
+    [InlineData("1234567890123456789012345")]
+    [InlineData("invalid-id")]
+    [InlineData("")]
+    [InlineData(null)]
+    public async Task Validate_WhenProjectIdIsInvalid_ReturnsError(string? projectId)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.ProjectId = projectId!;
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+        Assert.Contains(errors.Keys, k => String.Equals(k, nameof(PersistentEvent.ProjectId)));
+    }
+
+    [Fact]
+    public async Task Validate_WhenStackIdIsValidObjectId_ReturnsSuccess()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.StackId = ValidObjectId;
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Theory]
+    [InlineData("1234567890123456789012345")]
+    [InlineData("invalid-id")]
+    [InlineData("")]
+    [InlineData(null)]
+    public async Task Validate_WhenStackIdIsInvalid_ReturnsError(string? stackId)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.StackId = stackId!;
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+        Assert.Contains(errors.Keys, k => String.Equals(k, nameof(PersistentEvent.StackId)));
+    }
+
+    [Fact]
+    public async Task Validate_WhenTagIsValid_ReturnsSuccess()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Tags ??= new TagSet();
+        ev.Tags.Add("1");
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task Validate_WhenTagIsEmpty_ReturnsError(string? tag)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Tags ??= new TagSet();
+        ev.Tags.Add(tag);
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+    }
+
+    [Fact]
+    public async Task Validate_WhenTagExceedsMaxLength_ReturnsError()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Tags ??= new TagSet();
+        ev.Tags.Add(new string('a', 256));
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task ValidateAsync_WhenTagIsEmpty_ReturnsError(string? tag)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Tags ??= new TagSet();
+        ev.Tags.Add(tag);
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("1234567890123456")]
+    public async Task Validate_WhenReferenceIdIsValid_ReturnsSuccess(string? referenceId)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.ReferenceId = referenceId;
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Fact]
+    public async Task Validate_WhenReferenceIdIsTooShort_ReturnsError()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.ReferenceId = "1234567";
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+    }
+
+    [Fact]
+    public async Task Validate_WhenReferenceIdIsTooLong_ReturnsError()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.ReferenceId = new string('1', 321);
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+    }
+
+    [Theory]
+    [InlineData(-60d)]
+    [InlineData(0d)]
+    [InlineData(60d)]
+    public async Task Validate_WhenDateIsWithinRange_ReturnsSuccess(double minutes)
+    {
+        // Arrange
+        var date = DateTimeOffset.Now.AddMinutes(minutes);
+        var ev = CreateValidEvent();
+        ev.Date = date;
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        _logger.LogInformation("Date {Date} isValid={IsValid} errors={Errors}", date, isValid, errors.SelectMany(e => e.Value));
+        Assert.True(isValid);
+    }
+
+    [Fact]
+    public async Task Validate_WhenDateIsMinValue_ReturnsError()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Date = DateTimeOffset.MinValue;
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+    }
+
+    [Fact]
+    public async Task Validate_WhenDateIsTooFarInFuture_ReturnsError()
+    {
+        // Arrange
+        var date = DateTimeOffset.Now.AddMinutes(61);
+        var ev = CreateValidEvent();
+        ev.Date = date;
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        _logger.LogInformation("Date {Date} isValid={IsValid} errors={Errors}", date, isValid, errors.SelectMany(e => e.Value));
+        Assert.False(isValid);
+    }
+
+    [Theory]
+    [InlineData(Event.KnownTypes.Error)]
+    [InlineData(Event.KnownTypes.FeatureUsage)]
+    [InlineData(Event.KnownTypes.Log)]
+    [InlineData(Event.KnownTypes.NotFound)]
+    [InlineData(Event.KnownTypes.SessionEnd)]
+    [InlineData(Event.KnownTypes.Session)]
+    public async Task Validate_WhenTypeIsValid_ReturnsSuccess(string type)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Type = type;
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Fact]
+    public async Task Validate_WhenTypeExceedsMaxLength_ReturnsError()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Type = new string('x', 101);
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task Validate_WhenTypeIsNullOrEmpty_ReturnsError(string? type)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Type = type!;
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+        Assert.Contains(errors.Keys, k => String.Equals(k, nameof(PersistentEvent.Type)));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("Valid message")]
+    public async Task Validate_WhenMessageIsValid_ReturnsSuccess(string? message)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Message = message;
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Fact]
+    public async Task Validate_WhenMessageIsEmpty_ReturnsError()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Message = String.Empty;
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+        Assert.Contains(errors.Keys, k => String.Equals(k, nameof(PersistentEvent.Message)));
+    }
+
+    [Fact]
+    public async Task Validate_WhenMessageExceedsMaxLength_ReturnsError()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Message = new string('x', 2001);
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+        Assert.Contains(errors.Keys, k => String.Equals(k, nameof(PersistentEvent.Message)));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("Valid source")]
+    public async Task Validate_WhenSourceIsValid_ReturnsSuccess(string? source)
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Source = source;
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Fact]
+    public async Task Validate_WhenSourceIsEmpty_ReturnsError()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Source = String.Empty;
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+        Assert.Contains(errors.Keys, k => String.Equals(k, nameof(PersistentEvent.Source)));
+    }
+
+    [Fact]
+    public async Task Validate_WhenSourceExceedsMaxLength_ReturnsError()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+        ev.Source = new string('x', 2001);
+
+        // Act
+        var (isValid, errors) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.False(isValid);
+        Assert.Contains(errors.Keys, k => String.Equals(k, nameof(PersistentEvent.Source)));
+    }
+
+    [Fact]
+    public async Task Validate_WhenEventIsValid_ReturnsSuccess()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
+    }
+
+    [Fact]
+    public async Task ValidateAsync_WhenEventIsValid_ReturnsSuccess()
+    {
+        // Arrange
+        var ev = CreateValidEvent();
+
+        // Act
+        var (isValid, _) = await _validator.ValidateAsync(ev);
+
+        // Assert
+        Assert.True(isValid);
     }
 }

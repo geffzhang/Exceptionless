@@ -1,0 +1,28 @@
+# Manual Elasticsearch inspection and snapshot restore examples for a local instance.
+@elasticsearchUrl = http://localhost:9200
+@repository = replace-with-snapshot-repository
+@snapshot = replace-with-snapshot-name
+@sourceIndices = replace-with-source-index-pattern
+
+### Inspect development indexes
+GET {{elasticsearchUrl}}/_cat/indices/dev-*?v
+
+### List snapshots in an existing repository
+GET {{elasticsearchUrl}}/_cat/snapshots/{{repository}}?v
+
+### Inspect a snapshot before choosing sourceIndices
+GET {{elasticsearchUrl}}/_snapshot/{{repository}}/{{snapshot}}
+
+### Restore selected indexes with a dev- prefix
+POST {{elasticsearchUrl}}/_snapshot/{{repository}}/{{snapshot}}/_restore?wait_for_completion=false
+Content-Type: application/json
+
+{
+    "include_global_state": false,
+    "indices": "{{sourceIndices}}",
+    "rename_pattern": "(.+)",
+    "rename_replacement": "dev-$1",
+    "index_settings": {
+        "index.number_of_replicas": 0
+    }
+}

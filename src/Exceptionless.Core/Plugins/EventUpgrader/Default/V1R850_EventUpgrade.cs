@@ -1,32 +1,38 @@
-﻿using System;
-using System.Linq;
-using Exceptionless.Core.Pipeline;
+﻿using System.Text.Json.Nodes;
 using Exceptionless.Core.Extensions;
-using Newtonsoft.Json.Linq;
+using Exceptionless.Core.Pipeline;
+using Microsoft.Extensions.Logging;
 
-namespace Exceptionless.Core.Plugins.EventUpgrader {
-    [Priority(850)]
-    public class V1R850EventUpgrade : PluginBase, IEventUpgraderPlugin {
-        public void Upgrade(EventUpgraderContext ctx) {
-            if (ctx.Version > new Version(1, 0, 0, 850))
-                return;
+namespace Exceptionless.Core.Plugins.EventUpgrader;
 
-            foreach (var doc in ctx.Documents.OfType<JObject>()) {
-                var current = doc;
-                while (current != null) {
-                    if (doc["ExtendedData"] is JObject extendedData) {
-                        if (extendedData["ExtraExceptionProperties"] != null)
-                            extendedData.Rename("ExtraExceptionProperties", "__ExceptionInfo");
+[Priority(850)]
+public class V1R850EventUpgrade : PluginBase, IEventUpgraderPlugin
+{
+    public V1R850EventUpgrade(AppOptions options, ILoggerFactory loggerFactory) : base(options, loggerFactory) { }
 
-                        if (extendedData["ExceptionInfo"] != null)
-                            extendedData.Rename("ExceptionInfo", "__ExceptionInfo");
+    public void Upgrade(EventUpgraderContext ctx)
+    {
+        if (ctx.Version > new Version(1, 0, 0, 850))
+            return;
 
-                        if (extendedData["TraceInfo"] != null)
-                            extendedData.Rename("TraceInfo", "TraceLog");
-                    }
+        foreach (var doc in ctx.Documents.OfType<JsonObject>())
+        {
+            var current = doc;
+            while (current is not null)
+            {
+                if (current["ExtendedData"] is JsonObject extendedData)
+                {
+                    if (extendedData["ExtraExceptionProperties"] is not null)
+                        extendedData.Rename("ExtraExceptionProperties", "__ExceptionInfo");
 
-                    current = current["Inner"] as JObject;
+                    if (extendedData["ExceptionInfo"] is not null)
+                        extendedData.Rename("ExceptionInfo", "__ExceptionInfo");
+
+                    if (extendedData["TraceInfo"] is not null)
+                        extendedData.Rename("TraceInfo", "TraceLog");
                 }
+
+                current = current["Inner"] as JsonObject;
             }
         }
     }

@@ -1,49 +1,67 @@
-﻿using System;
+﻿using System.ComponentModel.DataAnnotations;
 using Exceptionless.Core.Extensions;
 
-namespace Exceptionless.Core.Models.Data {
-    public class UserDescription : IData {
-        public UserDescription() {
-            Data = new DataDictionary();
-        }
+namespace Exceptionless.Core.Models.Data;
 
-        public UserDescription(string emailAddress, string description) : this() {
-            if (!String.IsNullOrWhiteSpace(emailAddress))
-                EmailAddress = emailAddress.Trim();
+public class UserDescription : IData, IValidatableObject
+{
+    public UserDescription()
+    {
+        Data = new DataDictionary();
+    }
 
-            if (!String.IsNullOrWhiteSpace(description))
-                Description = description.Trim();
-        }
+    public UserDescription(string emailAddress, string description) : this()
+    {
+        if (!String.IsNullOrWhiteSpace(emailAddress))
+            EmailAddress = emailAddress.Trim();
 
-        public string EmailAddress { get; set; }
-        public string Description { get; set; }
+        if (!String.IsNullOrWhiteSpace(description))
+            Description = description.Trim();
+    }
 
-        /// <summary>
-        /// Extended data entries for this user description.
-        /// </summary>
-        public DataDictionary Data { get; set; }
+    [EmailAddress]
+    public string? EmailAddress { get; set; }
 
-        protected bool Equals(UserDescription other) {
-            return String.Equals(EmailAddress, other.EmailAddress) && String.Equals(Description, other.Description) && Equals(Data, other.Data);
-        }
+    public string? Description { get; set; }
 
-        public override bool Equals(object obj) {
-            if (obj is null)
-                return false;
-            if (ReferenceEquals(this, obj))
-                return true;
-            if (obj.GetType() != GetType())
-                return false;
-            return Equals((UserDescription)obj);
-        }
+    /// <summary>
+    /// Extended data entries for this user description.
+    /// </summary>
+    [MiniValidation.SkipRecursion]
+    public DataDictionary? Data { get; set; }
 
-        public override int GetHashCode() {
-            unchecked {
-                int hashCode = EmailAddress?.GetHashCode() ?? 0;
-                hashCode = (hashCode * 397) ^ (Description?.GetHashCode() ?? 0);
-                hashCode = (hashCode * 397) ^ (Data?.GetCollectionHashCode() ?? 0);
-                return hashCode;
-            }
+    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        // Mirrors client-side guard: SetUserDescription returns early when both are empty.
+        // A UserDescription object with neither field set is meaningless.
+        if (String.IsNullOrWhiteSpace(EmailAddress) && String.IsNullOrWhiteSpace(Description))
+            yield return new ValidationResult("Please specify an email address or description.", [nameof(EmailAddress), nameof(Description)]);
+    }
+
+    protected bool Equals(UserDescription other)
+    {
+        return String.Equals(EmailAddress, other.EmailAddress) && String.Equals(Description, other.Description) && Equals(Data, other.Data);
+    }
+
+    public override bool Equals(object? obj)
+    {
+        if (obj is null)
+            return false;
+        if (ReferenceEquals(this, obj))
+            return true;
+        if (obj.GetType() != GetType())
+            return false;
+        return Equals((UserDescription)obj);
+    }
+
+    public override int GetHashCode()
+    {
+        unchecked
+        {
+            int hashCode = EmailAddress?.GetHashCode() ?? 0;
+            hashCode = (hashCode * 397) ^ (Description?.GetHashCode() ?? 0);
+            hashCode = (hashCode * 397) ^ (Data?.GetCollectionHashCode() ?? 0);
+            return hashCode;
         }
     }
 }

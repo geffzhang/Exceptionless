@@ -1,0 +1,84 @@
+<script lang="ts">
+    import type { ProblemDetails } from '@foundatiofx/fetchclient';
+
+    import { onDestroy } from 'svelte';
+
+    import type { IFilter } from '#comp/faceted-filter/index.ts';
+
+    import DetailSheet from '#comp/detail-sheet.svelte';
+    import { assistantPageContext } from '#features/assistant/page-context.svelte.ts';
+
+    import type { PersistentEvent } from '../models';
+
+    import EventsOverview from './events-overview.svelte';
+    import { buildEventDetailsHref } from './summary';
+
+    interface Props {
+        detailsHref?: string;
+        eventId: null | string;
+        filterChanged: (filter: IFilter) => void;
+        onClose: () => void;
+        onError?: (problem: ProblemDetails) => void;
+    }
+
+    let { detailsHref, eventId = $bindable(), filterChanged, onClose, onError }: Props = $props();
+
+    let currentEventDetails = $state<{ eventId: string; stackId: string }>();
+    let lastEventId = $state<null | string>(null);
+    const assistantContextOwner = Symbol('event-detail-sheet');
+
+    const resolvedHref = $derived(
+        detailsHref ?? (eventId ? buildEventDetailsHref(eventId, currentEventDetails?.eventId === eventId ? currentEventDetails.stackId : undefined) : '#')
+    );
+
+    function handleClose(): void {
+        assistantPageContext.clearOverlay(assistantContextOwner);
+        onClose();
+    }
+
+    function handleEventLoaded(event: PersistentEvent): void {
+        currentEventDetails = {
+            eventId: event.id,
+            stackId: event.stack_id
+        };
+        assistantPageContext.setOverlayEvent(assistantContextOwner, event);
+    }
+
+    $effect(() => {
+        if (eventId !== lastEventId) {
+            lastEventId = eventId;
+            currentEventDetails = undefined;
+            if (eventId) {
+                assistantPageContext.setOverlay(assistantContextOwner, {
+                    eventId
+                });
+            } else {
+                assistantPageContext.clearOverlay(assistantContextOwner);
+            }
+        }
+    });
+
+    onDestroy(() => assistantPageContext.clearOverlay(assistantContextOwner));
+
+    function handleError(problem: ProblemDetails) {
+        if (onError) {
+            onError(problem);
+        } else {
+            handleClose();
+        }
+    }
+</script>
+
+<DetailSheet
+    detailsHref={resolvedHref}
+    historyKey="event"
+    historyValue={eventId}
+    onClose={handleClose}
+    onOpen={(historyValue) => (eventId = historyValue)}
+    open={!!eventId}
+    title="Event"
+>
+    {#if eventId}
+        <EventsOverview {filterChanged} id={eventId} {handleError} onEventLoaded={handleEventLoaded} onNavigate={(newId) => (eventId = newId)} />
+    {/if}
+</DetailSheet>

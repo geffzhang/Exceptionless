@@ -1,0 +1,75 @@
+namespace Exceptionless.Web.Assistant;
+
+public sealed record AssistantChatRequest(
+    IReadOnlyCollection<AssistantChatMessage> Messages,
+    string? OrganizationId = null,
+    string? ProjectId = null,
+    string? Path = null,
+    string? ConversationId = null,
+    // The browser's IANA time zone, used to resolve "today" and "this week".
+    string? TimeZone = null);
+
+public sealed record AssistantChatMessage(string Role, string Content)
+{
+    public bool? IsSuggestedAction { get; init; }
+    public string? SuggestedActionLabel { get; init; }
+    public string? SuggestedActionPath { get; init; }
+}
+
+// ProjectIds are the projects a result came from. A later turn reuses the result only while all of them still exist
+// in the organization; a successful result with none, such as one recorded before this was tracked, is not reused.
+public sealed record AssistantConversationToolResult(
+    string ToolCallId,
+    string ToolName,
+    string Arguments,
+    string Result,
+    string? Path,
+    DateTimeOffset CapturedAtUtc,
+    IReadOnlyCollection<string>? ProjectIds = null)
+{
+    /// <summary>The cache serializer omits empty collections, so no projects is read back as missing.</summary>
+    public IReadOnlyCollection<string> ProjectIds { get; init; } = ProjectIds ?? [];
+}
+
+public sealed record AssistantConversationState(IReadOnlyCollection<AssistantConversationToolResult> ToolResults)
+{
+    /// <summary>The cache serializer omits empty collections, so an empty history is read back as missing.</summary>
+    public IReadOnlyCollection<AssistantConversationToolResult> ToolResults { get; init; } = ToolResults ?? [];
+
+    public string? TurnId { get; init; }
+
+    /// <summary>The actions the previous turn asked the user to confirm, which this turn may run once each.</summary>
+    public IReadOnlyCollection<AssistantConversationToolResult> PendingConfirmations { get; init; } = [];
+}
+
+public sealed record AssistantAccessResponse(
+    bool Enabled,
+    bool HasAccess,
+    bool UpgradeRequired,
+    string? Message = null,
+    string? MinimumPlanId = null,
+    bool EmailVerificationRequired = false);
+
+public sealed record AssistantSuggestedAction(string Label, string Prompt, string? Href = null);
+
+public sealed record AssistantStreamEvent(
+    string Type,
+    string? Text = null,
+    string? ToolCallId = null,
+    string? ToolName = null,
+    string? Arguments = null,
+    string? Result = null,
+    string? Message = null,
+    IReadOnlyCollection<AssistantSuggestedAction>? SuggestedActions = null)
+{
+    [System.Text.Json.Serialization.JsonIgnore]
+    internal string? FailureCode { get; init; }
+
+    public static AssistantStreamEvent TextDelta(string text) => new("text_delta", Text: text);
+    public static AssistantStreamEvent ToolCall(string id, string name, string arguments) => new("tool_call", ToolCallId: id, ToolName: name, Arguments: arguments);
+    public static AssistantStreamEvent ToolResult(string id, string name, string result) => new("tool_result", ToolCallId: id, ToolName: name, Result: result);
+    public static AssistantStreamEvent Suggestions(IReadOnlyCollection<AssistantSuggestedAction> actions) => new("suggested_actions", SuggestedActions: actions);
+    public static AssistantStreamEvent Error(string message) => new("error", Message: message);
+    internal static AssistantStreamEvent Error(string message, string failureCode) => new("error", Message: message) { FailureCode = failureCode };
+    public static AssistantStreamEvent Done() => new("done");
+}

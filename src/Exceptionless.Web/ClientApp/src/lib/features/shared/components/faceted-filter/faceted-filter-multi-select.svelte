@@ -1,0 +1,191 @@
+<script lang="ts">
+    import type { Snippet } from 'svelte';
+
+    import Check from '@lucide/svelte/icons/check';
+
+    import * as FacetedFilter from '#comp/faceted-filter/index.ts';
+    import { Button } from '#comp/ui/button/index.ts';
+    import * as Command from '#comp/ui/command/index.ts';
+    import * as Popover from '#comp/ui/popover/index.ts';
+    import Separator from '#comp/ui/separator/separator.svelte';
+    import { Spinner } from '#comp/ui/spinner/index.ts';
+    import { cn } from '#lib/utils.ts';
+
+    type Option = {
+        label: string;
+        value: string;
+    };
+
+    interface Props {
+        changed: (values: string[]) => void;
+        createOption?: (search: string) => Option | undefined;
+        emptyText?: string;
+        hidden?: boolean;
+        layout?: 'default' | 'tall';
+        loading?: boolean;
+        noOptionsText?: string;
+        open: boolean;
+        options: Option[];
+        remove: () => void;
+        search?: string;
+        shouldFilter?: boolean;
+        status?: Snippet;
+        title: string;
+        toggleHidden?: () => void;
+        values: string[];
+    }
+
+    let {
+        changed,
+        createOption,
+        emptyText = 'No Value',
+        hidden = false,
+        layout = 'default',
+        loading = false,
+        noOptionsText = 'No results found.',
+        open = $bindable(),
+        options,
+        remove,
+        search = $bindable(''),
+        shouldFilter = true,
+        status,
+        title,
+        toggleHidden,
+        values
+    }: Props = $props();
+
+    const customOption = $derived(createOption?.(search));
+    const showCustomOption = $derived(customOption && !options.some((option) => option.value === customOption.value));
+
+    // eslint-disable-next-line svelte/prefer-writable-derived
+    let updatedValues = $state<string[]>([]);
+    let displayValues = $derived.by(() => {
+        const labelsInOptions = options.filter((o) => values.includes(o.value)).map((o) => o.label);
+        const valuesNotInOptions = values.filter((value) => !options.some((o) => o.value === value));
+        return [...labelsInOptions, ...valuesNotInOptions];
+    });
+
+    $effect.pre(() => {
+        updatedValues = values;
+    });
+
+    $effect(() => {
+        if (!open) {
+            search = '';
+        }
+    });
+
+    export function onClearFilter() {
+        updatedValues = [];
+        changed(updatedValues);
+    }
+
+    export function onValueSelected(currentValue: string) {
+        updatedValues = updatedValues.includes(currentValue) ? updatedValues.filter((v) => v !== currentValue) : [...updatedValues, currentValue];
+        changed(updatedValues);
+    }
+
+    function cancelAndClose() {
+        updatedValues = values;
+        changed(updatedValues);
+        open = false;
+    }
+
+    function filter(value: string, search: string) {
+        search = search.trim().toLowerCase();
+        value = value.toLowerCase();
+        if (value.includes(search)) {
+            return 1;
+        }
+
+        const option = options.find((option) => option.value === value);
+        if (option?.label.toLowerCase().includes(search)) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    function onEscapeKeydown(e: KeyboardEvent) {
+        e.preventDefault();
+        cancelAndClose();
+    }
+
+    function onOpenChange(isOpen: boolean) {
+        if (!isOpen) {
+            open = false;
+        }
+    }
+</script>
+
+<Popover.Root bind:open {onOpenChange}>
+    <Popover.Trigger>
+        {#snippet child({ props })}
+            <Button {...props} class="gap-x-1 px-3" size="lg" variant="outline" aria-describedby={`${title}-help`}>
+                {title}
+                <Separator class="mx-2" orientation="vertical" />
+                {#if loading}
+                    <FacetedFilter.BadgeLoading />
+                {:else if values.length > 0}
+                    <FacetedFilter.BadgeValues values={displayValues}>
+                        {#snippet displayValue(value)}
+                            {value}
+                        {/snippet}
+                    </FacetedFilter.BadgeValues>
+                {:else}
+                    <FacetedFilter.BadgeValue>{emptyText}</FacetedFilter.BadgeValue>
+                {/if}
+            </Button>
+        {/snippet}
+    </Popover.Trigger>
+    <Popover.Content
+        align="start"
+        class={cn('p-0', layout === 'tall' && 'grid max-h-[var(--bits-popover-content-available-height)] min-h-0 grid-rows-[minmax(0,1fr)_auto]')}
+        collisionPadding={layout === 'tall' ? 8 : undefined}
+        side="bottom"
+        trapFocus={false}
+        {onEscapeKeydown}
+        onFocusOutside={(e) => e.preventDefault()}
+    >
+        <Command.Root {filter} {shouldFilter} class={layout === 'tall' ? 'grid h-auto min-h-0 grid-rows-[auto_minmax(0,1fr)]' : undefined}>
+            <Command.Input bind:value={search} placeholder={title} autofocus={open} aria-describedby={`${title}-help`} />
+            <Command.List class={layout === 'tall' ? 'max-h-96 min-h-0' : undefined}>
+                {#if !status}
+                    <Command.Empty>{noOptionsText}</Command.Empty>
+                    {#if loading}
+                        <Command.Loading><div class="flex p-2"><Spinner /> Loading...</div></Command.Loading>
+                    {/if}
+                {/if}
+                {#if showCustomOption && customOption}
+                    <Command.Group>
+                        <Command.Item value={customOption.value} onSelect={() => customOption && onValueSelected(customOption.value)}>
+                            Use {customOption.label}
+                        </Command.Item>
+                    </Command.Group>
+                {/if}
+                {#if options.length > 0}
+                    <Command.Group>
+                        {#each options as option (option.value)}
+                            <Command.Item id={option.value || undefined} onSelect={() => onValueSelected(option.value)} value={option.value || option.label}>
+                                <div
+                                    class={cn(
+                                        'border-primary mr-2 flex size-4 items-center justify-center rounded-sm border',
+                                        updatedValues.includes(option.value) ? 'bg-primary text-primary-foreground' : 'opacity-50 [&_svg]:invisible'
+                                    )}
+                                >
+                                    <Check className={cn('size-4')} />
+                                </div>
+                                <span>
+                                    {option.label}
+                                </span>
+                            </Command.Item>
+                        {/each}
+                    </Command.Group>
+                {/if}
+            </Command.List>
+        </Command.Root>
+        {@render status?.()}
+        <div id={`${title}-help`} class="sr-only">Arrow keys navigate. Space or Enter toggles selection. Escape cancels without saving.</div>
+        <FacetedFilter.Actions clear={onClearFilter} {hidden} {remove} showClear={updatedValues.length > 0} {toggleHidden} />
+    </Popover.Content>
+</Popover.Root>

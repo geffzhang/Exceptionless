@@ -1,0 +1,67 @@
+@apiUrl = http://localhost:7110/api/v2
+@email = admin@exceptionless.test
+@password = tester
+@organizationId = 537650f3b77efe23a47914f3
+
+### login to test account
+# @name login
+POST {{apiUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{email}}",
+  "password": "{{password}}"
+}
+
+###
+
+@token = {{login.response.body.$.token}}
+
+### Get By Organization Id
+GET {{apiUrl}}/organizations/{{organizationId}}/projects
+Authorization: Bearer {{token}}
+
+### Create a project
+# @name newProject
+POST {{apiUrl}}/projects
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "organization_id": "{{organizationId}}",
+  "name": "HTTP sample project"
+}
+
+###
+@projectId = {{newProject.response.body.$.id}}
+
+### Get Default Api Key
+GET {{apiUrl}}/projects/{{projectId}}/tokens/default
+Authorization: Bearer {{token}}
+
+### Get Config
+GET {{apiUrl}}/projects/{{projectId}}/config
+Authorization: Bearer {{token}}
+
+### Set Config
+POST {{apiUrl}}/projects/{{projectId}}/config?key=my-test-key
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "value": "Custom Configuration" }
+
+### Delete Config
+DELETE {{apiUrl}}/projects/{{projectId}}/config?key=my-test-key
+Authorization: Bearer {{token}}
+
+### Generate Sample Data
+POST {{apiUrl}}/projects/{{projectId}}/sample-data
+Authorization: Bearer {{token}}
+
+### Remove all events and stacks from the sample project
+POST {{apiUrl}}/projects/{{projectId}}/reset-data
+Authorization: Bearer {{token}}
+
+### Delete the sample project
+DELETE {{apiUrl}}/projects/{{projectId}}
+Authorization: Bearer {{token}}

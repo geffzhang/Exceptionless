@@ -1,0 +1,1052 @@
+export enum StackStatus {
+  Open = "open",
+  Fixed = "fixed",
+  Regressed = "regressed",
+  Snoozed = "snoozed",
+  Ignored = "ignored",
+  Discarded = "discarded",
+}
+
+export enum BillingStatus {
+  Trialing = 0,
+  Active = 1,
+  PastDue = 2,
+  Canceled = 3,
+  Unpaid = 4,
+}
+
+export interface AdminAssistantOrganizationUsage {
+  organization_id: string;
+  organization_name: string;
+  plan_id: string;
+  /** @format date-time */
+  last_used_utc: string;
+  /** @format int64 */
+  turns: number;
+  /** @format int64 */
+  completed: number;
+  /** @format int64 */
+  failed: number;
+  /** @format int64 */
+  cancelled: number;
+  /** @format int64 */
+  provider_requests: number;
+  /** @format int64 */
+  tool_calls: number;
+  /** @format int64 */
+  prompt_tokens: number;
+  /** @format int64 */
+  completion_tokens: number;
+  /** @format double */
+  cost_usd: number;
+  /** @format int64 */
+  blocked_by_concurrency: number;
+  /** @format int64 */
+  blocked_by_rate_limit: number;
+  /** @format int64 */
+  blocked_by_token_limit: number;
+  /** @format int64 */
+  blocked_by_cost_limit: number;
+  /** @format int64 */
+  monthly_token_limit?: null | number;
+  /** @format double */
+  monthly_cost_limit_usd?: null | number;
+  /** @format double */
+  token_utilization?: null | number;
+  /** @format double */
+  cost_utilization?: null | number;
+}
+
+export interface AdminAssistantUsageResponse {
+  /** @format date-time */
+  month: string;
+  /** @format int64 */
+  active_organizations: number;
+  /** @format int64 */
+  turns: number;
+  /** @format int64 */
+  prompt_tokens: number;
+  /** @format int64 */
+  completion_tokens: number;
+  /** @format double */
+  cost_usd: number;
+  organizations: AdminAssistantOrganizationUsage[];
+}
+
+export interface AssistantAccessResponse {
+  enabled: boolean;
+  has_access: boolean;
+  upgrade_required: boolean;
+  message?: null | string;
+  minimum_plan_id?: null | string;
+  email_verification_required: boolean;
+}
+
+export interface AssistantChatMessage {
+  role: string;
+  content: string;
+  is_suggested_action?: null | boolean;
+  suggested_action_label?: null | string;
+  suggested_action_path?: null | string;
+}
+
+export interface AssistantChatRequest {
+  messages: AssistantChatMessage[];
+  organization_id?: null | string;
+  project_id?: null | string;
+  path?: null | string;
+  conversation_id?: null | string;
+  time_zone?: null | string;
+}
+
+export interface AssistantConversationSharingSettings {
+  enabled: boolean;
+  default_enabled: boolean;
+  is_overridden: boolean;
+}
+
+export interface AssistantModelSettings {
+  model: string;
+  configured_model: string;
+  is_overridden: boolean;
+  enabled: boolean;
+  configured_enabled: boolean;
+  is_enabled_overridden: boolean;
+  is_configured: boolean;
+  conversation_sharing_default_enabled: boolean;
+}
+
+export interface BillingPlan {
+  id: string;
+  name: string;
+  description: string;
+  /** @format double */
+  price: number;
+  /** @format int32 */
+  max_projects: number;
+  /** @format int32 */
+  max_users: number;
+  /** @format int32 */
+  retention_days: number;
+  /** @format int32 */
+  max_events_per_month: number;
+  has_premium_features: boolean;
+  is_hidden: boolean;
+}
+
+export interface ChangePasswordModel {
+  current_password: string;
+  password: string;
+}
+
+export interface ChangePlanRequest {
+  plan_id: string;
+  stripe_token?: null | string;
+  last4?: null | string;
+  coupon_id?: null | string;
+}
+
+export interface ChangePlanResult {
+  success: boolean;
+  message?: null | string;
+}
+
+export interface ClientConfiguration {
+  /** @format int32 */
+  version: number;
+  settings: Record<string, string>;
+}
+
+export interface CountResult {
+  /** @format int64 */
+  total: number;
+  aggregations?: null | Record<string, IAggregate>;
+  data?: null | object;
+}
+
+export interface EventSubmissionSettings {
+  enabled: boolean;
+  configured_enabled: boolean;
+  is_overridden: boolean;
+}
+
+export interface ExternalAuthInfo {
+  clientId: string;
+  code: string;
+  /** @format uri */
+  redirectUri: string;
+  inviteToken?: null | string;
+}
+
+export interface HttpValidationProblemDetails {
+  type?: null | string;
+  title?: null | string;
+  /** @format int32 */
+  status?: null | number;
+  detail?: null | string;
+  instance?: null | string;
+  errors: Record<string, string[]>;
+}
+
+/** Base interface for aggregation results. Concrete types include ValueAggregate, BucketAggregate, StatsAggregate, etc. See client-side type definitions for full type information. */
+export interface IAggregate {
+  /** Additional data associated with the aggregate. */
+  data: Record<string, unknown>;
+}
+
+export interface Invite {
+  token: string;
+  /** @format email */
+  email_address: string;
+  /** @format date-time */
+  date_added: string;
+}
+
+export interface Invoice {
+  id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  organization_name: string;
+  /** @format date-time */
+  date: string;
+  paid: boolean;
+  status: string;
+  /** @format double */
+  total: number;
+  items: InvoiceLineItem[];
+}
+
+export interface InvoiceGridModel {
+  id: string;
+  /** @format date-time */
+  date: string;
+  paid: boolean;
+  status: string;
+  /** @format double */
+  total: number;
+}
+
+export interface InvoiceLineItem {
+  description: string;
+  date?: null | string;
+  /** @format double */
+  amount: number;
+}
+
+export type JsonElement = any;
+
+export interface Login {
+  /** The email address or domain username */
+  email: string;
+  password: string;
+  invite_token?: null | string;
+}
+
+export interface NewOrganization {
+  name: string;
+}
+
+export interface NewProject {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  name: string;
+  delete_bot_data_enabled: boolean;
+  promoted_tabs?: string[] | null;
+}
+
+export interface NewSavedView {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  name: string;
+  filter?: null | string;
+  time?: null | string;
+  sort?: null | string;
+  /** @pattern ^(?![a-f0-9]{24}$)[a-z0-9]+(?:-[a-z0-9]+)*$ */
+  slug?: null | string;
+  view_type: string;
+  filter_definitions?: null | string;
+  columns?: null | Record<string, SavedViewColumnSettings>;
+  show_stats?: null | boolean;
+  show_chart?: null | boolean;
+  /** If true, the view will only be visible to the current user. Defaults to false. */
+  is_private?: null | boolean;
+}
+
+export interface NewToken {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  project_id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  default_project_id?: null | string;
+  scopes: string[];
+  /** @format date-time */
+  expires_utc?: null | string;
+  notes?: null | string;
+}
+
+export interface NewWebHook {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  project_id: string;
+  /** @format uri */
+  url: string;
+  event_types: string[];
+  /**
+   * The schema version that should be used.
+   * @pattern ^\d+(\.\d+){1,3}$
+   */
+  version?: null | string;
+}
+
+export interface NotificationSettings {
+  send_daily_summary: boolean;
+  report_new_errors: boolean;
+  report_critical_errors: boolean;
+  report_event_regressions: boolean;
+  report_new_events: boolean;
+  report_critical_events: boolean;
+}
+
+export interface OAuthAccount {
+  provider: string;
+  provider_user_id: string;
+  username: string;
+  extra_data: Record<string, string>;
+}
+
+export interface OAuthAuthorizationServerMetadata {
+  issuer: string;
+  authorization_endpoint: string;
+  token_endpoint: string;
+  registration_endpoint: string;
+  revocation_endpoint: string;
+  grant_types_supported: string[];
+  response_types_supported: string[];
+  code_challenge_methods_supported: string[];
+  token_endpoint_auth_methods_supported: string[];
+  scopes_supported: string[];
+  resource_documentation: string;
+  client_id_metadata_document_supported: boolean;
+  authorization_response_iss_parameter_supported: boolean;
+}
+
+export interface OAuthAuthorizeConsentResponse {
+  client_id: string;
+  client_name: string;
+  redirect_uri: string;
+  resource: string;
+  scopes: string[];
+  required_scopes: string[];
+}
+
+export interface OAuthAuthorizeForm {
+  client_id: string;
+  response_type: string;
+  redirect_uri: string;
+  scope?: null | string;
+  state?: null | string;
+  code_challenge: string;
+  code_challenge_method: string;
+  resource?: null | string;
+  organization_ids?: string[] | null;
+}
+
+export interface OAuthAuthorizeResponse {
+  redirect_uri: string;
+}
+
+export interface OAuthClientRegistrationRequest {
+  redirect_uris?: string[] | null;
+  client_name?: null | string;
+  scope?: null | string;
+  grant_types?: string[] | null;
+  response_types?: string[] | null;
+  token_endpoint_auth_method?: null | string;
+}
+
+export interface OAuthClientRegistrationResponse {
+  client_id: string;
+  client_name: string;
+  redirect_uris: string[];
+  grant_types: string[];
+  response_types: string[];
+  scope: string;
+  token_endpoint_auth_method: string;
+  /** @format int64 */
+  client_id_issued_at: number;
+}
+
+export interface OAuthErrorResponse {
+  error: string;
+  error_description?: null | string;
+}
+
+export interface OAuthProtectedResourceMetadata {
+  resource: string;
+  authorization_servers: string[];
+  scopes_supported: string[];
+  bearer_methods_supported: string[];
+  resource_documentation: string;
+}
+
+export interface OAuthRevokeForm {
+  token?: null | string;
+  client_id?: null | string;
+}
+
+export interface OAuthTokenForm {
+  grant_type: string;
+  code?: null | string;
+  redirect_uri?: null | string;
+  client_id?: null | string;
+  code_verifier?: null | string;
+  refresh_token?: null | string;
+  resource?: null | string;
+}
+
+export interface OAuthTokenResponse {
+  access_token: string;
+  token_type: string;
+  /** @format int32 */
+  expires_in: number;
+  refresh_token?: null | string;
+  scope?: null | string;
+  resource?: null | string;
+}
+
+export interface PersistentEvent {
+  /**
+   * Unique id that identifies an event.
+   * @pattern ^[a-fA-F0-9]{24}$
+   */
+  id: string;
+  /**
+   * The organization that the event belongs to.
+   * @pattern ^[a-fA-F0-9]{24}$
+   */
+  organization_id: string;
+  /**
+   * The project that the event belongs to.
+   * @pattern ^[a-fA-F0-9]{24}$
+   */
+  project_id: string;
+  /**
+   * The stack that the event belongs to.
+   * @pattern ^[a-fA-F0-9]{24}$
+   */
+  stack_id: string;
+  /** Whether the event resulted in the creation of a new stack. */
+  is_first_occurrence: boolean;
+  /**
+   * The date that the event was created in the system.
+   * @format date-time
+   */
+  created_utc: string;
+  /** Used to store primitive data type custom data values for searching the event. */
+  idx?: null | Record<string, unknown>;
+  /**
+   * The deployment environment, such as production, staging, or development.
+   * Missing or invalid names remain unspecified. Machine and runtime information is stored separately in data.@environment.
+   */
+  environment?: null | string;
+  /**
+   * The event type (ie. error, log message, feature usage). Check KnownTypes for standard event types.
+   * Nullable in transit; the pipeline infers a default before save. Validated as required on repository save.
+   */
+  type?: null | string;
+  /** The event source (ie. machine name, log name, feature name). */
+  source?: null | string;
+  /**
+   * The date that the event occurred on.
+   * @format date-time
+   */
+  date: string;
+  /** A list of tags used to categorize this event. */
+  tags?: string[] | null;
+  /** The event message. */
+  message?: null | string;
+  /** The geo coordinates where the event happened. */
+  geo?: null | string;
+  /**
+   * The value of the event if any.
+   * @format double
+   */
+  value?: null | number;
+  /**
+   * The number of duplicated events.
+   * @format int32
+   */
+  count?: null | number;
+  /** Optional data entries that contain additional information about this event. */
+  data?: null | Record<string, unknown>;
+  /** An optional identifier to be used for referencing this event instance at a later time. */
+  reference_id?: null | string;
+}
+
+export interface PredefinedSavedViewDefinition {
+  key: string;
+  name: string;
+  slug: string;
+  viewType: string;
+  filter?: null | string;
+  time?: null | string;
+  sort?: null | string;
+  filterDefinitions?: null | JsonElement;
+  columns?: null | Record<string, SavedViewColumnSettings>;
+  showStats?: null | boolean;
+  showChart?: null | boolean;
+}
+
+export interface ProblemDetails {
+  type?: null | string;
+  title?: null | string;
+  /** @format int32 */
+  status?: null | number;
+  detail?: null | string;
+  instance?: null | string;
+}
+
+export interface RecordProductTourResult {
+  /** @format date-time */
+  recorded_utc: string;
+}
+
+export interface ResetPasswordModel {
+  password_reset_token: string;
+  password: string;
+}
+
+/**
+ * Per-column display settings for a saved view. All properties are optional so new settings can * be added without changing the meaning of existing saved views. */
+export interface SavedViewColumnSettings {
+  /** Whether the column is visible. Null means use the table default. */
+  visible?: null | boolean;
+  /** Whether the column fills the table's remaining width. Null or false means use fixed-width behavior. */
+  auto_fill?: null | boolean;
+  /** Whether cell content wraps onto multiple lines. Null or false means keep content on one line. */
+  wrap?: null | boolean;
+  /**
+   * Zero-based display position. Null means use the table default order.
+   * @format int32
+   * @min 0
+   * @max 49
+   */
+  position?: null | number;
+  /**
+   * Column width in pixels. Null means use the table default width.
+   * @format int32
+   * @min 48
+   * @max 1200
+   */
+  width?: null | number;
+}
+
+export interface Signup {
+  name: string;
+  /** The email address or domain username */
+  email: string;
+  password: string;
+  invite_token?: null | string;
+}
+
+export interface SourceMapArtifact {
+  id: string;
+  generated_file_url: string;
+  source_map_url?: null | string;
+  file_name?: null | string;
+  /** @format int64 */
+  size: number;
+  is_auto_downloaded: boolean;
+  /** @format date-time */
+  created_utc: string;
+  /** @format date-time */
+  last_used_utc?: null | string;
+}
+
+export interface Stack {
+  /**
+   * Unique id that identifies a stack.
+   * @pattern ^[a-fA-F0-9]{24}$
+   */
+  id: string;
+  /**
+   * The organization that the stack belongs to.
+   * @pattern ^[a-fA-F0-9]{24}$
+   */
+  organization_id: string;
+  /**
+   * The project that the stack belongs to.
+   * @pattern ^[a-fA-F0-9]{24}$
+   */
+  project_id: string;
+  /** The stack type (ie. error, log message, feature usage). Check KnownTypes for standard stack types. */
+  type: string;
+  /** The stack status (ie. open, fixed, regressed, */
+  status: StackStatus;
+  /**
+   * The date that the stack should be snoozed until.
+   * @format date-time
+   */
+  snooze_until_utc?: null | string;
+  /** The signature used for stacking future occurrences. */
+  signature_hash: string;
+  /** The collection of information that went into creating the signature hash for the stack. */
+  signature_info: Record<string, string>;
+  /** The version the stack was fixed in. */
+  fixed_in_version?: null | string;
+  /**
+   * The date the stack was fixed.
+   * @format date-time
+   */
+  date_fixed?: null | string;
+  /** The stack title. */
+  title: string;
+  /**
+   * The total number of occurrences in the stack.
+   * @format int32
+   */
+  total_occurrences: number;
+  /**
+   * The date of the 1st occurrence of this stack in UTC time.
+   * @format date-time
+   */
+  first_occurrence: string;
+  /**
+   * The date of the last occurrence of this stack in UTC time.
+   * @format date-time
+   */
+  last_occurrence: string;
+  /** The stack description. */
+  description?: null | string;
+  /** If true, all future occurrences will be marked as critical. */
+  occurrences_are_critical: boolean;
+  /** A list of references. */
+  references: string[];
+  /** A list of tags used to categorize this stack. */
+  tags: string[];
+  /** The signature used for finding duplicate stacks. (ProjectId, SignatureHash) */
+  duplicate_signature: string;
+  /** @format date-time */
+  created_utc: string;
+  /** @format date-time */
+  updated_utc: string;
+  is_deleted: boolean;
+  allow_notifications: boolean;
+}
+
+export interface StringValueFromBody {
+  value?: null | string;
+}
+
+export interface TokenResult {
+  token: string;
+}
+
+export interface TrialSettings {
+  blocked_email_domains: string[];
+  default_blocked_email_domains: string[];
+  is_default: boolean;
+}
+
+export interface UpdateAssistantConversationSharing {
+  enabled?: null | boolean;
+}
+
+export interface UpdateAssistantConversationSharingSettings {
+  enabled: boolean;
+}
+
+export interface UpdateAssistantEnabledSettings {
+  enabled?: null | boolean;
+}
+
+export interface UpdateAssistantSettings {
+  model?: null | string;
+}
+
+export interface UpdateEmailAddressResult {
+  is_verified: boolean;
+}
+
+/** A class the tracks changes (i.e. the Delta) for a particular TEntityType. */
+export interface UpdateEvent {
+  /** @format email */
+  email_address?: null | string;
+  description?: null | string;
+}
+
+export interface UpdateEventSubmissionSettings {
+  enabled?: null | boolean;
+}
+
+/** A class the tracks changes (i.e. the Delta) for a particular TEntityType. */
+export interface UpdateProject {
+  name: string;
+  delete_bot_data_enabled: boolean;
+  promoted_tabs?: string[] | null;
+}
+
+/** A class the tracks changes (i.e. the Delta) for a particular TEntityType. */
+export interface UpdateSavedView {
+  name?: null | string;
+  filter?: null | string;
+  time?: null | string;
+  sort?: null | string;
+  slug?: null | string;
+  filter_definitions?: null | string;
+  columns?: null | Record<string, SavedViewColumnSettings>;
+  show_stats?: null | boolean;
+  show_chart?: null | boolean;
+}
+
+export interface UpdateSavedViewDefault {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  saved_view_id?: null | string;
+}
+
+export interface UpdateSavedViewOrder {
+  saved_view_ids: string[];
+}
+
+/** A class the tracks changes (i.e. the Delta) for a particular TEntityType. */
+export interface UpdateToken {
+  is_disabled: boolean;
+  notes?: null | string;
+}
+
+export interface UpdateTrialSettings {
+  /** Email domains that can't start a free trial. Subdomains are blocked too. Null restores the built-in list. */
+  blocked_email_domains?: string[] | null;
+}
+
+/** A class the tracks changes (i.e. the Delta) for a particular TEntityType. */
+export interface UpdateUser {
+  full_name: string;
+  email_notifications_enabled: boolean;
+}
+
+export interface UsageHourInfo {
+  /** @format date-time */
+  date: string;
+  /** @format int32 */
+  total: number;
+  /** @format int32 */
+  blocked: number;
+  /** @format int32 */
+  discarded: number;
+  /** @format int32 */
+  too_big: number;
+  /** @format int32 */
+  deleted: number;
+}
+
+export interface UsageInfo {
+  /** @format date-time */
+  date: string;
+  /** @format int32 */
+  limit: number;
+  /** @format int32 */
+  total: number;
+  /** @format int32 */
+  blocked: number;
+  /** @format int32 */
+  discarded: number;
+  /** @format int32 */
+  too_big: number;
+  /** @format int32 */
+  deleted: number;
+}
+
+export interface User {
+  /**
+   * Unique id that identifies an user.
+   * @pattern ^[a-fA-F0-9]{24}$
+   */
+  id: string;
+  /** The organizations that the user has access to. */
+  organization_ids: string[];
+  /**
+   * Session revocation generation, rotated when a password changes or resets, or an external login is removed or transferred away.
+   * Remains null until rotation; active users with a null generation accept only matching legacy null token generations.
+   * This value does not describe the password hashing format.
+   */
+  authentication_version?: null | string;
+  password?: null | string;
+  salt?: null | string;
+  password_reset_token?: null | string;
+  /** @format date-time */
+  password_reset_token_expiration: string;
+  o_auth_accounts: OAuthAccount[];
+  organization_preferences: UserOrganizationPreference[];
+  saved_view_orders: UserSavedViewOrderPreference[];
+  product_tours: object;
+  /** Gets or sets the users Full Name. */
+  full_name: string;
+  /** @format email */
+  email_address: string;
+  avatar_file_name?: null | string;
+  email_notifications_enabled: boolean;
+  assistant_conversation_sharing_enabled?: null | boolean;
+  is_email_address_verified: boolean;
+  verify_email_address_token?: null | string;
+  /** @format date-time */
+  verify_email_address_token_expiration: string;
+  /**
+   * Date the user started their one no-card trial.
+   * @format date-time
+   */
+  trial_started_utc?: null | string;
+  /** Gets or sets the users active state. */
+  is_active: boolean;
+  roles: string[];
+  /** @format date-time */
+  created_utc: string;
+  /** @format date-time */
+  updated_utc: string;
+}
+
+export interface UserDescription {
+  /** @format email */
+  email_address?: null | string;
+  description?: null | string;
+  /** Extended data entries for this user description. */
+  data?: null | Record<string, unknown>;
+}
+
+export interface UserOrganizationPreference {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  default_saved_view_id: string;
+}
+
+export interface UserSavedViewOrderPreference {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  view_type: string;
+  saved_view_ids: string[];
+}
+
+/** The account whose email address the link verified, which may not be the account that's signed in. */
+export interface VerifyEmailAddressResult {
+  email_address: string;
+}
+
+export interface ViewCurrentUser {
+  hash?: null | string;
+  has_local_account: boolean;
+  o_auth_accounts: OAuthAccount[];
+  organization_preferences: UserOrganizationPreference[];
+  saved_view_orders: UserSavedViewOrderPreference[];
+  product_tours: object;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  id: string;
+  organization_ids: string[];
+  full_name: string;
+  /** @format email */
+  email_address: string;
+  avatar_url?: null | string;
+  email_notifications_enabled: boolean;
+  is_email_address_verified: boolean;
+  is_active: boolean;
+  is_invite: boolean;
+  roles: string[];
+}
+
+export interface ViewOAuthGrant {
+  id: string;
+  client_id: string;
+  application_name: string;
+  is_application_disabled: boolean;
+  scopes: string[];
+  organization_ids: string[];
+  resources: ViewOAuthGrantResource[];
+  /** @format date-time */
+  created_utc: string;
+  /** @format date-time */
+  updated_utc: string;
+  /** @format date-time */
+  expires_utc?: null | string;
+  /** @format date-time */
+  refresh_expires_utc?: null | string;
+}
+
+export interface ViewOAuthGrantResource {
+  resource: string;
+  scopes: string[];
+  organization_ids: string[];
+}
+
+export interface ViewOrganization {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  id: string;
+  /** @format date-time */
+  created_utc: string;
+  /** @format date-time */
+  updated_utc: string;
+  name: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  default_saved_view_id?: null | string;
+  icon_url?: null | string;
+  plan_id: string;
+  plan_name: string;
+  plan_description: string;
+  card_last4?: null | string;
+  /** @format date-time */
+  subscribe_date?: null | string;
+  /** @format date-time */
+  billing_change_date?: null | string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  billing_changed_by_user_id?: null | string;
+  billing_status: BillingStatus;
+  /** @format double */
+  billing_price: number;
+  /** @format date-time */
+  trial_ends_utc?: null | string;
+  /** @format int32 */
+  max_events_per_month: number;
+  /** @format int32 */
+  bonus_events_per_month: number;
+  /** @format date-time */
+  bonus_expiration?: null | string;
+  /** @format int32 */
+  retention_days: number;
+  is_suspended: boolean;
+  suspension_code?: null | string;
+  suspension_notes?: null | string;
+  /** @format date-time */
+  suspension_date?: null | string;
+  has_premium_features: boolean;
+  features: string[];
+  /** @format int32 */
+  max_users: number;
+  /** @format int32 */
+  max_projects: number;
+  /** @format int64 */
+  project_count: number;
+  /** @format int64 */
+  stack_count: number;
+  /** @format int64 */
+  event_count: number;
+  invites: Invite[];
+  usage_hours: UsageHourInfo[];
+  usage: UsageInfo[];
+  data?: null | Record<string, unknown>;
+  is_throttled: boolean;
+  is_over_monthly_limit: boolean;
+  is_over_request_limit: boolean;
+}
+
+export interface ViewProject {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  id: string;
+  /** @format date-time */
+  created_utc: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  organization_name: string;
+  name: string;
+  delete_bot_data_enabled: boolean;
+  data?: null | Record<string, unknown>;
+  promoted_tabs: string[];
+  is_configured?: null | boolean;
+  /** @format int64 */
+  stack_count: number;
+  /** @format int64 */
+  event_count: number;
+  has_premium_features: boolean;
+  has_slack_integration: boolean;
+  usage_hours: UsageHourInfo[];
+  usage: UsageInfo[];
+}
+
+export interface ViewSavedView {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  user_id?: null | string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  created_by_user_id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  updated_by_user_id?: null | string;
+  predefined_key?: null | string;
+  filter?: null | string;
+  filter_definitions?: null | string;
+  columns?: null | Record<string, SavedViewColumnSettings>;
+  show_stats?: null | boolean;
+  show_chart?: null | boolean;
+  name: string;
+  slug: string;
+  time?: null | string;
+  sort?: null | string;
+  /** @format int32 */
+  version: number;
+  view_type: string;
+  /** @format date-time */
+  created_utc: string;
+  /** @format date-time */
+  updated_utc: string;
+}
+
+export interface ViewToken {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  project_id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  user_id?: null | string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  default_project_id?: null | string;
+  scopes: string[];
+  /** @format date-time */
+  expires_utc?: null | string;
+  notes?: null | string;
+  is_disabled: boolean;
+  is_suspended: boolean;
+  /** @format date-time */
+  created_utc: string;
+  /** @format date-time */
+  updated_utc: string;
+}
+
+export interface ViewUser {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  id: string;
+  organization_ids: string[];
+  full_name: string;
+  /** @format email */
+  email_address: string;
+  avatar_url?: null | string;
+  email_notifications_enabled: boolean;
+  is_email_address_verified: boolean;
+  is_active: boolean;
+  is_invite: boolean;
+  roles: string[];
+}
+
+export interface WebHook {
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  organization_id: string;
+  /** @pattern ^[a-fA-F0-9]{24}$ */
+  project_id: string;
+  /** @format uri */
+  url: string;
+  event_types: string[];
+  is_enabled: boolean;
+  /** The schema version that should be used. */
+  version: string;
+  /** @format date-time */
+  created_utc: string;
+}
+
+export interface WorkInProgressResult {
+  workers: string[];
+}

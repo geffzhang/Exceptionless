@@ -1,4 +1,3 @@
-﻿using System;
-using Xunit;
+﻿using Xunit.v3;
 
-[assembly: CollectionBehavior(DisableTestParallelization = true)]
+[assembly: Parallelization(MaxThreads = 6)]

@@ -1,0 +1,81 @@
+{
+    "name": "Exceptionless Aspire Dev Container",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    "remoteEnv": {
+        "PATH": "${containerEnv:PATH}:/home/vscode/.aspire/bin",
+        "SSL_CERT_DIR": "/home/vscode/.aspnet/dev-certs/trust:/etc/ssl/certs",
+        "ASPIRE_CLI_NOLOGO": "true"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                // ms-dotnettools.csdevkit and microsoft-aspire.aspire-vscode are already
+                // declared by the aspire feature and don't need to be listed here.
+                "bradlc.vscode-tailwindcss",
+                "dbaeumer.vscode-eslint",
+                "esbenp.prettier-vscode",
+                "humao.rest-client",
+                "ms-kubernetes-tools.vscode-kubernetes-tools",
+                "ms-playwright.playwright",
+                "selemondev.vscode-shadcn-svelte",
+                "streetsidesoftware.code-spell-checker",
+                "svelte.svelte-vscode",
+                "tintoy.msbuild-project-tools",
+                "vitest.explorer"
+            ]
+        }
+    },
+    "forwardPorts": [5601, 7101, 7111, 7131, 8026],
+    "otherPortsAttributes": {
+        "onAutoForward": "ignore"
+    },
+    "portsAttributes": {
+        "5601": {
+            "label": "Kibana"
+        },
+        "7101": {
+            "label": "Aspire Dashboard",
+            "protocol": "https"
+        },
+        "7111": {
+            "label": "API",
+            "protocol": "https"
+        },
+        "7131": {
+            "label": "App",
+            "protocol": "https"
+        },
+        "8026": {
+            "label": "Mail UI"
+        }
+    },
+    "hostRequirements": {
+        "cpus": 4,
+        "memory": "16gb",
+        "storage": "32gb"
+    },
+    "postCreateCommand": "bash .devcontainer/postCreateCommand.sh",
+    "postStartCommand": "dotnet dev-certs https --trust",
+    "features": {
+        "ghcr.io/microsoft/aspire-devcontainer-feature/aspire:2": {},
+        "ghcr.io/devcontainers/features/powershell:1": {
+            "version": "latest"
+        },
+        "ghcr.io/devcontainers/features/dotnet:2": {
+            "version": "11.0"
+        },
+        "ghcr.io/devcontainers/features/node:1": {
+            "nodeGypDependencies": true,
+            "version": "lts"
+        },
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {
+            "version": "latest",
+            "enableNonRootDocker": true,
+            "moby": true
+        }
+    }
+}

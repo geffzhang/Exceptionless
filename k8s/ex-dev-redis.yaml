@@ -1,0 +1,53 @@
+apiVersion: apps.kubeblocks.io/v1
+kind: Cluster
+metadata:
+  name: ex-dev
+  namespace: ex-dev
+spec:
+  terminationPolicy: Delete
+  clusterDef: redis
+  topology: replication
+  componentSpecs:
+    - name: redis
+      serviceVersion: "8.4.0"
+      disableExporter: false
+      replicas: 2
+      systemAccounts:
+        - name: default
+          secretRef:
+            name: ex-dev-redis-password
+      resources:
+        requests:
+          cpu: "100m"
+          memory: 128Mi
+        limits:
+          cpu: "200m"
+          memory: 256Mi
+      volumeClaimTemplates:
+        - name: data
+          spec:
+            storageClassName: managed-csi-premium
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+    - name: redis-sentinel
+      serviceVersion: "8.4.0"
+      replicas: 3
+      resources:
+        requests:
+          cpu: "50m"
+          memory: 64Mi
+        limits:
+          cpu: "100m"
+          memory: 128Mi
+      volumeClaimTemplates:
+        - name: data
+          spec:
+            storageClassName: managed-csi-premium
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
